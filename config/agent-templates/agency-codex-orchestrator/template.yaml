@@ -1,0 +1,73 @@
+name: agency-codex-orchestrator
+display_name: "Agency Orchestrator (Codex)"
+description: Coordinates end-to-end agency client onboarding across intake, comms, access, Ads, LSA, website/SEO, maintenance, reconciliation, and QA agents.
+tagline: Owns the onboarding pipeline and human gates
+version: "1.0.0"
+author: Trinity Platform
+
+resources:
+  cpu: "2"
+  memory: "4g"
+
+capabilities:
+  - pipeline-coordination
+  - operator-escalation
+  - drift-detection
+  - multi-agent-delegation
+  - evidence-review
+
+use_cases:
+  - "/onboard-client - Start or continue a client onboarding pipeline"
+  - "/status - Summarize onboarding state, blockers, and gates"
+  - "/reconcile - Check shared files for drift and missing evidence"
+
+shared_folders:
+  expose: true
+  consume: true
+
+commands:
+  - name: onboard-client
+    description: Start or continue a client onboarding workflow
+  - name: status
+    description: Summarize onboarding state
+  - name: reconcile
+    description: Inspect shared outputs for drift and missing evidence
+
+schedules:
+  - name: coordination-sweep
+    cron: "0 */2 * * *"
+    message: "/status"
+    timezone: "America/Los_Angeles"
+    description: Review active onboarding state and escalate blockers
+
+metrics:
+  - name: active_clients
+    type: gauge
+    label: "Active Clients"
+  - name: gated_actions
+    type: gauge
+    label: "Gates"
+  - name: drift_items
+    type: gauge
+    label: "Drift"
+  - name: onboarding_status
+    type: status
+    label: "Status"
+    values:
+      - value: "active"
+        color: "blue"
+        label: "Active"
+      - value: "gated"
+        color: "yellow"
+        label: "Gated"
+      - value: "blocked"
+        color: "red"
+        label: "Blocked"
+      - value: "complete"
+        color: "green"
+        label: "Complete"
+
+
+runtime:
+  type: codex-cli
+  model: gpt-5.5

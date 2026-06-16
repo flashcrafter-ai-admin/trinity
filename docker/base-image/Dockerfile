@@ -50,6 +50,9 @@ RUN npm install -g @anthropic-ai/claude-code@latest
 # Install Gemini CLI for multi-runtime support
 RUN npm install -g @google/gemini-cli
 
+# Install OpenAI Codex CLI for ChatGPT/Codex subscription-backed runtime support.
+RUN npm install -g @openai/codex@latest
+
 RUN useradd -m -s /bin/bash -u 1000 developer && \
     echo "developer:developer" | chpasswd && \
     usermod -aG sudo developer && \
@@ -133,4 +136,3 @@ RUN mkdir -p /tmp/secure && \
 USER developer
 
 CMD ["/app/startup.sh"]
-

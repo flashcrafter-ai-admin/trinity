@@ -517,6 +517,13 @@ async def create_agent_internal(
             env_vars['GEMINI_API_KEY'] = google_api_key  # Gemini CLI expects this name
         else:
             logger.warning("Gemini runtime selected but GOOGLE_API_KEY not configured")
+    elif config.runtime in ('codex-cli', 'codex', 'openai-codex'):
+        env_vars['CODEX_HOME'] = '/home/developer/.codex'
+        codex_access_token = os.getenv('CODEX_ACCESS_TOKEN', '')
+        if codex_access_token:
+            env_vars['CODEX_ACCESS_TOKEN'] = codex_access_token
+        else:
+            logger.warning("Codex runtime selected but CODEX_ACCESS_TOKEN is not configured; container must provide ~/.codex/auth.json")
 
     # OpenTelemetry Configuration (enabled by default)
     # Claude Code has built-in OTel support - these vars enable metrics export

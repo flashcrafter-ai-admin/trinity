@@ -1,0 +1,20 @@
+name: agency-reporting-qa
+display_name: "Agency Reporting QA"
+description: Verifies evidence, compiles onboarding status, audits gates, and produces launch-readiness and client handoff reports.
+version: "1.0.0"
+author: Trinity Platform
+resources: {cpu: "1", memory: "3g"}
+capabilities: [qa, launch-readiness, reporting, evidence-audit]
+shared_folders: {expose: true, consume: true}
+commands:
+  - {name: qa-readiness, description: Audit launch and onboarding readiness}
+  - {name: client-report, description: Compile client-ready onboarding status}
+  - {name: status, description: Report QA findings}
+schedules:
+  - name: qa-readiness-check
+    cron: "55 */2 * * *"
+    message: "/status"
+    timezone: "America/Los_Angeles"
+metrics:
+  - {name: qa_blockers, type: gauge, label: "QA Blockers"}
+  - {name: readiness_score, type: percentage, label: "Readiness"}

@@ -1,0 +1,20 @@
+name: agency-lsa-onboarding
+display_name: "Agency LSA Onboarding"
+description: Prepares Local Services Ads eligibility, verification, budget readiness, launch gates, and monitoring handoff.
+version: "1.0.0"
+author: Trinity Platform
+resources: {cpu: "1", memory: "2g"}
+capabilities: [lsa-onboarding, verification-tracking, launch-gates]
+shared_folders: {expose: true, consume: true}
+commands:
+  - {name: lsa-plan, description: Build LSA onboarding plan}
+  - {name: lsa-readiness, description: Verify LSA launch readiness}
+  - {name: status, description: Report LSA blockers and gates}
+schedules:
+  - name: lsa-readiness-check
+    cron: "50 */2 * * *"
+    message: "/status"
+    timezone: "America/Los_Angeles"
+metrics:
+  - {name: lsa_blockers, type: gauge, label: "LSA Blockers"}
+  - {name: lsa_readiness, type: percentage, label: "LSA Ready"}

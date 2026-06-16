@@ -86,15 +86,21 @@ const isGeminiRuntime = computed(() => {
   return props.runtime === 'gemini-cli' || props.runtime === 'gemini'
 })
 
+const isCodexRuntime = computed(() => {
+  return props.runtime === 'codex-cli' || props.runtime === 'codex' || props.runtime === 'openai-codex'
+})
+
 const label = computed(() => {
   if (isClaudeRuntime.value) return 'Claude'
   if (isGeminiRuntime.value) return 'Gemini'
+  if (isCodexRuntime.value) return 'Codex'
   return props.runtime
 })
 
 const tooltipText = computed(() => {
   if (isClaudeRuntime.value) return 'Anthropic Claude Code Runtime'
   if (isGeminiRuntime.value) return 'Google Gemini CLI Runtime'
+  if (isCodexRuntime.value) return 'OpenAI Codex CLI Runtime'
   return `Runtime: ${props.runtime}`
 })
 
@@ -105,7 +111,9 @@ const badgeClasses = computed(() => {
   if (isGeminiRuntime.value) {
     return 'bg-brand-gemini-50 dark:bg-brand-gemini-950/50 text-brand-gemini-700 dark:text-brand-gemini-300 border border-brand-gemini-200 dark:border-brand-gemini-800'
   }
+  if (isCodexRuntime.value) {
+    return 'bg-emerald-50 dark:bg-emerald-950/50 text-emerald-700 dark:text-emerald-300 border border-emerald-200 dark:border-emerald-800'
+  }
   return 'bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 border border-gray-200 dark:border-gray-600'
 })
 </script>
-

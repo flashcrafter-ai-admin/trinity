@@ -1,0 +1,25 @@
+name: agency-codex-website-seo-maintenance
+display_name: "Agency Website SEO Maintenance (Codex)"
+description: Owns post-launch website, local SEO, GBP/reviews, content, and tracking maintenance.
+version: "1.0.0"
+author: Trinity Platform
+resources: {cpu: "1", memory: "3g"}
+capabilities: [website-maintenance, seo-monitoring, review-sync, tracking-checks]
+shared_folders: {expose: true, consume: true}
+commands:
+  - {name: web-seo-scan, description: Run website/SEO maintenance scan}
+  - {name: content-plan, description: Draft SEO/content next actions}
+  - {name: status, description: Report website/SEO maintenance state}
+schedules:
+  - name: website-seo-weekly-scan
+    cron: "30 10 * * 1"
+    message: "/web-seo-scan"
+    timezone: "America/Los_Angeles"
+metrics:
+  - {name: seo_alerts, type: gauge, label: "SEO Alerts"}
+  - {name: review_assets_synced, type: counter, label: "Reviews Synced"}
+
+
+runtime:
+  type: codex-cli
+  model: gpt-5.5

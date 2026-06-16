@@ -189,7 +189,14 @@ async def get_model():
     """Get the current model being used"""
     runtime = agent_state.agent_runtime
 
-    if runtime == "gemini-cli" or runtime == "gemini":
+    if runtime in ("codex-cli", "codex", "openai-codex"):
+        return {
+            "model": agent_state.current_model,
+            "runtime": runtime,
+            "available_models": ["gpt-5.5", "gpt-5.4", "gpt-5.4-mini"],
+            "note": "OpenAI Codex models via Codex CLI ChatGPT/Codex authentication."
+        }
+    elif runtime == "gemini-cli" or runtime == "gemini":
         return {
             "model": agent_state.current_model,
             "runtime": runtime,
@@ -213,7 +220,21 @@ async def set_model(request: ModelRequest):
     runtime = agent_state.agent_runtime
 
     # Validate based on runtime
-    if runtime == "gemini-cli" or runtime == "gemini":
+    if runtime in ("codex-cli", "codex", "openai-codex"):
+        if request.model.startswith("gpt-") or request.model.startswith("codex-"):
+            agent_state.current_model = request.model
+            logger.info(f"Model changed to: {request.model}")
+            return {
+                "status": "success",
+                "model": agent_state.current_model,
+                "note": "Model will be used for subsequent messages"
+            }
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid Codex model. Use OpenAI/Codex model ids such as gpt-5.5."
+            )
+    elif runtime == "gemini-cli" or runtime == "gemini":
         valid_models = ["gemini-3-pro", "gemini-3-flash", "gemini-2.5-pro", "gemini-2.5-flash"]
         if request.model in valid_models or request.model.startswith("gemini-"):
             agent_state.current_model = request.model

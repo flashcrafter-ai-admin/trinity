@@ -1,0 +1,24 @@
+name: agency-codex-state-reconciliation
+display_name: "Agency State Reconciliation (Codex)"
+description: Detects and reports drift between pipeline state, shared projections, external evidence, and client-facing artifacts.
+version: "1.0.0"
+author: Trinity Platform
+resources: {cpu: "1", memory: "2g"}
+capabilities: [state-reconciliation, drift-detection, projection-audit]
+shared_folders: {expose: true, consume: true}
+commands:
+  - {name: reconcile-state, description: Compare onboarding surfaces and classify drift}
+  - {name: status, description: Report drift and unresolved authority conflicts}
+schedules:
+  - name: reconciliation-sweep
+    cron: "45 */3 * * *"
+    message: "/reconcile-state"
+    timezone: "America/Los_Angeles"
+metrics:
+  - {name: drift_items, type: gauge, label: "Drift Items"}
+  - {name: authority_conflicts, type: gauge, label: "Authority Conflicts"}
+
+
+runtime:
+  type: codex-cli
+  model: gpt-5.5

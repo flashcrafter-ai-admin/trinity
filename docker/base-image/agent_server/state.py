@@ -91,15 +91,33 @@ class AgentState:
 
     def _get_default_context_window(self) -> int:
         """Get default context window based on runtime"""
+        if self.agent_runtime in ("codex-cli", "codex", "openai-codex"):
+            return 400000
         if self.agent_runtime == "gemini-cli" or self.agent_runtime == "gemini":
             return 1000000  # 1M tokens for Gemini
         return 200000  # 200K for Claude Code
 
     def _check_runtime_available(self) -> bool:
         """Check if the configured runtime CLI is available"""
+        if self.agent_runtime in ("codex-cli", "codex", "openai-codex"):
+            return self._check_codex_cli()
         if self.agent_runtime == "gemini-cli" or self.agent_runtime == "gemini":
             return self._check_gemini_cli()
         return self._check_claude_code()
+
+    def _check_codex_cli(self) -> bool:
+        """Check if Codex CLI is available"""
+        try:
+            result = subprocess.run(
+                ["codex", "--version"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            return result.returncode == 0
+        except Exception as e:
+            logger.error(f"Codex CLI check failed: {e}")
+            return False
 
     def _check_gemini_cli(self) -> bool:
         """Check if Gemini CLI is available"""

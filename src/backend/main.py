@@ -1172,7 +1172,7 @@ def _build_version_payload(voice_enabled: bool) -> dict:
             "agent_server": version,
             "base_image": f"trinity-agent-base:{version}"
         },
-        "runtimes": ["claude-code", "gemini-cli"],
+        "runtimes": ["claude-code", "gemini-cli", "codex-cli"],
         "build_date": os.getenv("BUILD_DATE", "unknown"),
         "git_commit": git_commit,
         "git_commit_short": git_commit_short,

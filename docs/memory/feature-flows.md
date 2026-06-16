@@ -11,6 +11,7 @@
 
 | Date | ID | Feature | Flow |
 |------|-----|---------|------|
+| 2026-06-16 | AGENCY-001 | feat(templates): Trinity-native agency client onboarding system — bundled local agent templates + deployable system manifest for intake, comms, access/readiness, Ads, LSA, website/SEO, maintenance, reconciliation, and reporting/QA. Ports fc-agency principles as agent-owned workflow state, shared-folder contracts, evidence-first gates, idempotency keys, and operator approvals without adding a platform DAG engine. | [agency-client-onboarding-system.md](feature-flows/agency-client-onboarding-system.md), [system-manifest.md](feature-flows/system-manifest.md) |
 | 2026-06-10 | #1130 | fix: retired `gemini-2.0-flash` replaced with env-configurable models — `GEMINI_TEXT_MODEL` (image-gen prompt refinement) + `GEMINI_TRANSCRIPTION_MODEL` (Telegram voice), both default `gemini-3.5-flash`, defined in `config.py`, empty-string-safe wiring in both compose files (#1076 pattern). | [image-generation.md](feature-flows/image-generation.md), [telegram-integration.md](feature-flows/telegram-integration.md) |
 | 2026-06-10 | #1108 | feat(ui): Agent Detail **Guardrails** tab renamed to **Settings** — sectioned config home. New `components/settings/SettingsPanel.vue` renders `GuardrailsPanel` unchanged as section #1; future per-agent settings land as additive sections, not new tabs. `?tab=guardrails` deep links alias to `settings` via `TAB_ALIASES`. Pure frontend. | [agent-guardrails.md](feature-flows/agent-guardrails.md) |
 | 2026-06-10 | #1114 | feat(ui): Agent Detail tabs overflow into a **"More ▾"** dropdown instead of horizontal scroll. New reusable `components/OverflowTabs.vue` ("priority+" pattern): a hidden, zero-layout mirror row measures every `{id,label,badge?}` tab's width (+ a worst-case "More" button) so the visible row renders as many tabs as fit and collapses the trailing remainder into a right-aligned disclosure menu. Re-measures on container resize (`ResizeObserver` on the outer wrapper, width-diff-guarded + rAF-debounced) and after `document.fonts.ready`; re-measures on tab/label/badge changes via a derived-signature `watch` (`flush:'post'`). Defaults to all-inline before the first measure (no first-paint snap; no "More" when everything fits). Active-in-overflow reflected on the trigger (active underline + dot), tab order never reshuffled. Plain `<button>` disclosure (NOT `role="menu"`): Tab traverses, Escape closes + returns focus, outside-`pointerdown` closes; dark-mode aware. `v-model` over `AgentDetail`'s `activeTab` string ref, so `?tab=` deep-linking is unaffected. Pure frontend; no backend/store changes. Generic enough for `Operations.vue` to adopt next. 6 Playwright e2e behaviors. | [agent-detail-tab-overflow.md](feature-flows/agent-detail-tab-overflow.md), [agent-overview-dashboard.md](feature-flows/agent-overview-dashboard.md) |
@@ -344,6 +345,7 @@
 |------|----------|-------------|
 | Internal System Agent | [internal-system-agent.md](feature-flows/internal-system-agent.md) | Platform operations manager (trinity-system) |
 | System Manifest | [system-manifest.md](feature-flows/system-manifest.md) | Recipe-based multi-agent deployment |
+| Agency Client Onboarding System | [agency-client-onboarding-system.md](feature-flows/agency-client-onboarding-system.md) | Trinity-native multi-agent agency onboarding templates and manifest (AGENCY-001) |
 | System-Wide Trinity Prompt | [system-wide-trinity-prompt.md](feature-flows/system-wide-trinity-prompt.md) | Admin-configurable prompt injection |
 | Vector Logging | [vector-logging.md](feature-flows/vector-logging.md) | Centralized log aggregation |
 | OpenTelemetry Integration | [opentelemetry-integration.md](feature-flows/opentelemetry-integration.md) | OTel metrics export |
@@ -411,6 +413,7 @@ Preserved in `feature-flows/archive/` for historical reference.
 | [EXTERNAL_PUBLIC_URL.md](../requirements/EXTERNAL_PUBLIC_URL.md) | ✅ | External URL for public links |
 | [EXECUTION_ORIGIN_TRACKING.md](../requirements/EXECUTION_ORIGIN_TRACKING.md) | ✅ | Track who triggered executions |
 | [AGENT_SYSTEMS_AND_TAGS.md](../requirements/AGENT_SYSTEMS_AND_TAGS.md) | ✅ | Tags and System Views |
+| [AGENCY_CLIENT_ONBOARDING_SYSTEM.md](../requirements/AGENCY_CLIENT_ONBOARDING_SYSTEM.md) | ✅ | Trinity-native agency client onboarding system |
 | [NEVERMINED_PAYMENT_INTEGRATION.md](../requirements/NEVERMINED_PAYMENT_INTEGRATION.md) | ✅ | Per-agent x402 payment monetization |
 
 ### Pending

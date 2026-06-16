@@ -155,7 +155,12 @@ def get_runtime() -> AgentRuntime:
     """
     runtime_type = os.getenv("AGENT_RUNTIME", "claude-code").lower()
 
-    if runtime_type == "gemini-cli" or runtime_type == "gemini":
+    if runtime_type in ("codex-cli", "codex", "openai-codex"):
+        from .codex_runtime import get_codex_runtime
+        runtime = get_codex_runtime()
+        logger.info("Using OpenAI Codex CLI runtime")
+        return runtime
+    elif runtime_type == "gemini-cli" or runtime_type == "gemini":
         from .gemini_runtime import get_gemini_runtime
         runtime = get_gemini_runtime()
         logger.info("Using Gemini CLI runtime")
@@ -166,4 +171,3 @@ def get_runtime() -> AgentRuntime:
         runtime = get_claude_runtime()
         logger.info("Using Claude Code runtime")
         return runtime
-

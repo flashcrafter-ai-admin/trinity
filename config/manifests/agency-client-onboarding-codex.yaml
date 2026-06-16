@@ -1,0 +1,276 @@
+# Agency Client Onboarding System (AGENCY-001)
+#
+# Deploy with:
+#   curl -sS -X POST http://localhost:8000/api/systems/deploy \
+#     -H "Authorization: Bearer <admin-token>" \
+#     -H "Content-Type: application/x-yaml" \
+#     --data-binary @config/manifests/agency-client-onboarding.yaml
+#
+# This manifest intentionally uses only currently-supported system manifest
+# fields: name, description, prompt, agents, permissions, default_tags, and
+# system_view. Agents are started by the deploy route after creation.
+
+name: agency-client-onboarding-codex
+description: Trinity-native end-to-end agency client onboarding fleet backed by Codex CLI
+
+prompt: |
+  You are part of the Agency Client Onboarding System. Work as a coordinated
+  Trinity agent fleet that can onboard a new agency client end to end.
+
+  Operating principles:
+  - Treat shared folders as projections and handoffs, not as casual shared
+    mutable state.
+  - Every artifact has one writer and named readers.
+  - Runtime workflow state belongs under ~/.trinity/pipeline-state/.
+  - Evidence is mandatory for state changes and readiness claims.
+  - External side effects require stable effect keys and operator approval.
+  - Never send client communications, alter spend, publish/launch assets, or
+    change admin/credential access without explicit approval.
+  - If projections, platform data, or client-facing artifacts disagree, surface
+    the drift instead of silently overwriting either side.
+
+default_tags:
+  - agency-onboarding
+  - client-ops
+  - gated-automation
+
+system_view:
+  name: "Agency Client Onboarding (Codex)"
+  icon: "briefcase"
+  color: "#2563eb"
+  shared: true
+
+agents:
+  orchestrator:
+    template: local:agency-codex-orchestrator
+    resources:
+      cpu: "2"
+      memory: "4g"
+    folders:
+      expose: true
+      consume: true
+    tags:
+      - orchestrator
+      - client-state
+    schedules:
+      - name: coordination-sweep
+        cron: "15 */2 * * *"
+        message: "/status"
+        timezone: UTC
+        description: Review active onboarding state and escalate blockers
+
+  intake:
+    template: local:agency-codex-intake
+    resources:
+      cpu: "1"
+      memory: "2g"
+    folders:
+      expose: true
+      consume: true
+    tags:
+      - intake
+      - client-brief
+    schedules:
+      - name: intake-check
+        cron: "10 */4 * * *"
+        message: "/status"
+        timezone: UTC
+        description: Check whether intake has enough evidence for downstream work
+
+  comms:
+    template: local:agency-codex-comms
+    resources:
+      cpu: "1"
+      memory: "2g"
+    folders:
+      expose: true
+      consume: true
+    tags:
+      - communications
+      - approval-gate
+    schedules:
+      - name: comms-check
+        cron: "25 */4 * * *"
+        message: "/status"
+        timezone: UTC
+        description: Check drafts, replies, and communication blockers
+
+  access:
+    template: local:agency-codex-access
+    resources:
+      cpu: "1"
+      memory: "2g"
+    folders:
+      expose: true
+      consume: true
+    tags:
+      - access
+      - approval-gate
+    schedules:
+      - name: access-check
+        cron: "40 */4 * * *"
+        message: "/status"
+        timezone: UTC
+        description: Check missing access and admin-level blockers
+
+  ads-onboarding:
+    template: local:agency-codex-ads-onboarding
+    resources:
+      cpu: "1"
+      memory: "2g"
+    folders:
+      expose: true
+      consume: true
+    tags:
+      - google-ads
+      - launch-readiness
+    schedules:
+      - name: ads-readiness-check
+        cron: "5 */6 * * *"
+        message: "/ads-readiness"
+        timezone: UTC
+        description: Verify Google Ads launch readiness and blockers
+
+  lsa-onboarding:
+    template: local:agency-codex-lsa-onboarding
+    resources:
+      cpu: "1"
+      memory: "2g"
+    folders:
+      expose: true
+      consume: true
+    tags:
+      - lsa
+      - launch-readiness
+    schedules:
+      - name: lsa-readiness-check
+        cron: "20 */6 * * *"
+        message: "/lsa-readiness"
+        timezone: UTC
+        description: Verify LSA launch readiness and blockers
+
+  website-seo-onboarding:
+    template: local:agency-codex-website-seo-onboarding
+    resources:
+      cpu: "1"
+      memory: "2g"
+    folders:
+      expose: true
+      consume: true
+    tags:
+      - website-seo
+      - launch-readiness
+    schedules:
+      - name: website-seo-check
+        cron: "35 */6 * * *"
+        message: "/launch-readiness"
+        timezone: UTC
+        description: Verify website, tracking, SEO, GBP, and reviews readiness
+
+  ads-maintenance:
+    template: local:agency-codex-ads-maintenance
+    resources:
+      cpu: "1"
+      memory: "2g"
+    folders:
+      expose: true
+      consume: true
+    tags:
+      - google-ads
+      - maintenance
+    schedules:
+      - name: ads-maintenance-scan
+        cron: "0 15 * * 1-5"
+        message: "/ads-scan"
+        timezone: UTC
+        description: Read-only Google Ads and LSA maintenance scan
+
+  website-seo-maintenance:
+    template: local:agency-codex-website-seo-maintenance
+    resources:
+      cpu: "1"
+      memory: "2g"
+    folders:
+      expose: true
+      consume: true
+    tags:
+      - website-seo
+      - maintenance
+    schedules:
+      - name: website-seo-weekly-scan
+        cron: "30 15 * * 1"
+        message: "/web-seo-scan"
+        timezone: UTC
+        description: Weekly website, SEO, GBP, reviews, and tracking scan
+
+  state-reconciliation:
+    template: local:agency-codex-state-reconciliation
+    resources:
+      cpu: "1"
+      memory: "2g"
+    folders:
+      expose: true
+      consume: true
+    tags:
+      - reconciliation
+      - drift
+    schedules:
+      - name: reconciliation-sweep
+        cron: "50 */3 * * *"
+        message: "/reconcile-state"
+        timezone: UTC
+        description: Compare onboarding surfaces and classify drift
+
+  reporting-qa:
+    template: local:agency-codex-reporting-qa
+    resources:
+      cpu: "1"
+      memory: "2g"
+    folders:
+      expose: true
+      consume: true
+    tags:
+      - reporting
+      - qa
+    schedules:
+      - name: qa-readiness-check
+        cron: "45 */6 * * *"
+        message: "/qa-readiness"
+        timezone: UTC
+        description: Verify evidence, gates, and launch/readiness report state
+
+permissions:
+  explicit:
+    orchestrator:
+      - intake
+      - comms
+      - access
+      - ads-onboarding
+      - lsa-onboarding
+      - website-seo-onboarding
+      - ads-maintenance
+      - website-seo-maintenance
+      - state-reconciliation
+      - reporting-qa
+    state-reconciliation:
+      - orchestrator
+      - intake
+      - comms
+      - access
+      - ads-onboarding
+      - lsa-onboarding
+      - website-seo-onboarding
+      - ads-maintenance
+      - website-seo-maintenance
+      - reporting-qa
+    reporting-qa:
+      - orchestrator
+      - intake
+      - comms
+      - access
+      - ads-onboarding
+      - lsa-onboarding
+      - website-seo-onboarding
+      - ads-maintenance
+      - website-seo-maintenance
+      - state-reconciliation

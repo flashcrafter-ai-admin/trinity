@@ -1296,6 +1296,16 @@ Trinity is autonomous agent orchestration and infrastructure — sovereign infra
 - **Key Features**: Permission presets, shared folders, schedules, auto-start
 - **Flow**: `docs/memory/feature-flows/system-manifest.md`
 
+### 16.5a Agency Client Onboarding System (AGENCY-001)
+- **Status**: ✅ Implemented (2026-06-16)
+- **Description**: Trinity-native multi-agent system manifest and bundled local
+  templates for end-to-end agency client onboarding. Builds on System Manifest,
+  schedules, shared folders, operator queue, tags/system views, and template
+  processing.
+- **Spec**: `docs/requirements/AGENCY_CLIENT_ONBOARDING_SYSTEM.md`
+- **Flow**: `docs/memory/feature-flows/agency-client-onboarding-system.md`
+- **Canonical Requirement**: Section 40.
+
 ### 16.6 Local Agent Deployment via MCP
 - **Status**: ✅ Implemented
 - **Description**: Deploy local agents via MCP tool
@@ -2873,6 +2883,81 @@ Standalone mobile-friendly admin page for managing agents on the go. Designed as
   allowlist (Phase 2); UI config surface, schedule-action trigger, and
   call cost/duration observability (Phase 3). Real PSTN path is
   manual-verify (needs a live Twilio voice number).
+
+---
+
+## 40. Trinity-Native Agency Client Onboarding System (AGENCY-001)
+
+### 40.1 End-to-End Client Onboarding Agent Fleet
+- **Status**: ✅ Implemented
+- **Requirement ID**: AGENCY-001
+- **Description**: Provide a bundled, Trinity-native multi-agent system for
+  onboarding a new agency client end to end. The system ports the portable
+  automation principles from fc-agency while staying inside Trinity's platform
+  boundary: Trinity owns deployment, schedules, permissions, credentials,
+  execution history, audit trail, shared folders, and operator queue;
+  agents own domain workflow state, client context, judgment, and runtime
+  pipeline files.
+- **Core agent roster**:
+  - `agency-orchestrator` — owns the onboarding pipeline definition, stage
+    transitions, drift detection, operator escalations, and final handoff.
+  - `agency-intake` — normalizes the client brief, service scope, evidence,
+    missing inputs, and initial onboarding record.
+  - `agency-comms` — drafts client-facing email/SMS updates, checks inbound
+    messages, and never sends externally without exact operator approval.
+  - `agency-access` — tracks required access grants for Google Ads, Google
+    Business Profile, Analytics/Search Console, site hosting, CRM, domains,
+    and billing/admin surfaces.
+  - `agency-ads-onboarding` — prepares Google Ads onboarding, tracking checks,
+    campaign readiness, dry-run plans, and launch gates.
+  - `agency-lsa-onboarding` — prepares LSA eligibility, verification, budget
+    readiness, and launch gates.
+  - `agency-website-seo-onboarding` — prepares website, landing page,
+    tracking, local SEO, GBP/reviews evidence, and launch readiness.
+  - `agency-ads-maintenance` — owns post-launch Google Ads and LSA monitoring,
+    read-only scans, and gated optimization plans.
+  - `agency-website-seo-maintenance` — owns post-launch website, local SEO,
+    GBP/reviews, content, and tracking maintenance.
+  - `agency-state-reconciliation` — detects drift between pipeline state,
+    shared projections, external evidence, and client-facing artifacts.
+  - `agency-reporting-qa` — audits evidence, compiles client-ready status,
+    verifies gates, and produces launch/readiness reports.
+- **System manifest**: a deployable YAML recipe MUST instantiate the full
+  fleet with explicit permissions, shared folder exposure/consumption,
+  tags, system view metadata, and staggered schedules for coordination,
+  intake, access checks, comms checks, domain-track work, and QA.
+- **Source-of-truth boundary**:
+  - Agent-authored pipeline definitions live in template files and are copied
+    or referenced by the agent during execution.
+  - Runtime pipeline state lives in agent-owned files under
+    `~/.trinity/pipeline-state/` and is append-only where practical.
+  - Shared folders are projection and handoff surfaces with one writer per
+    file contract; they are not an ungoverned shared database.
+  - Trinity core does not execute stage transitions or become a generic DAG
+    engine for this system.
+- **Approval gates**: any external-send, spend/bidding change, launch,
+  DNS/hosting change, credential/admin action, or ambiguous authority conflict
+  MUST stop at an operator gate. Agents draft the exact action and context;
+  operators approve/reject through Trinity's operator queue or the current
+  chat thread before execution.
+- **Evidence contract**: every stage decision MUST record evidence, actor,
+  timestamp, source surface, and next action. Missing evidence is a blocker,
+  not a reason to guess.
+- **Idempotency contract**: every external side effect plan MUST include a
+  stable effect key such as `{client}:{surface}:{action}:{target}:{version}`.
+  Repeated executions must check prior evidence before applying or requesting
+  the same action again.
+- **Drift contract**: if client state, shared folder projection, external
+  system evidence, and pipeline state disagree, the detecting agent MUST
+  surface the drift and ask for reconciliation rather than silently patching
+  one side.
+- **Self-improvement contract**: agents capture manual touches, rejected
+  drafts, operator feedback, recurring blockers, and evidence gaps as
+  improvement notes for later skill/template updates. Captured feedback must
+  point to a concrete future behavior change.
+- **Out of scope**: fc-agency-specific Trello/GHL/Google Ads business data,
+  direct import of `agency-os.ts`, a platform-owned workflow executor, a
+  visual workflow builder, or any real credential values.
 
 ---
 

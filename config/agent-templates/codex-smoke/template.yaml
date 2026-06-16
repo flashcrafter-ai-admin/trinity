@@ -1,0 +1,16 @@
+name: codex-smoke
+display_name: "Codex Smoke"
+description: Minimal Trinity agent for validating the OpenAI Codex CLI runtime.
+version: "1.0.0"
+author: Trinity Platform
+runtime:
+  type: codex-cli
+  model: gpt-5.5
+resources:
+  cpu: "1"
+  memory: "2g"
+capabilities:
+  - codex-runtime-smoke
+shared_folders:
+  expose: false
+  consume: false

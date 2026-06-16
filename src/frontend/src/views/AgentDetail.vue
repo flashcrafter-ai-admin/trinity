@@ -542,6 +542,9 @@ async function renameAgent(newName) {
 // Default model based on runtime
 const defaultModel = computed(() => {
   const runtime = agent.value?.runtime || 'claude-code'
+  if (runtime === 'codex-cli' || runtime === 'codex' || runtime === 'openai-codex') {
+    return 'gpt-5.5'
+  }
   if (runtime === 'gemini-cli' || runtime === 'gemini') {
     return 'gemini-2.5-flash'
   }

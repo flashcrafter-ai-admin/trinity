@@ -1,7 +1,8 @@
 """
 Trinity MCP injection service for agent-to-agent collaboration.
 
-Supports both Claude Code (.mcp.json) and Gemini CLI (gemini mcp add).
+Supports Claude Code (.mcp.json), Gemini CLI (settings.json), and Codex CLI
+(config.toml).
 """
 import os
 import json
@@ -21,6 +22,7 @@ def inject_trinity_mcp_if_configured() -> bool:
 
     For Claude Code: Writes to ~/.mcp.json
     For Gemini CLI: Writes to ~/.gemini/settings.json
+    For Codex CLI: Writes to ~/.codex/config.toml
     """
     trinity_mcp_url = os.getenv("TRINITY_MCP_URL")
     trinity_mcp_api_key = os.getenv("TRINITY_MCP_API_KEY")
@@ -33,6 +35,8 @@ def inject_trinity_mcp_if_configured() -> bool:
 
     if runtime == "gemini-cli":
         return _inject_gemini_mcp(trinity_mcp_url, trinity_mcp_api_key)
+    elif runtime in ("codex-cli", "codex", "openai-codex"):
+        return _inject_codex_mcp(trinity_mcp_url)
     else:
         return _inject_claude_mcp(trinity_mcp_url, trinity_mcp_api_key)
 
@@ -130,6 +134,58 @@ def _inject_gemini_mcp(trinity_mcp_url: str, trinity_mcp_api_key: str) -> bool:
         return False
 
 
+def _toml_string(value: str) -> str:
+    """Return a TOML-safe quoted string for simple generated config values."""
+    return json.dumps(value)
+
+
+def _inject_codex_mcp(trinity_mcp_url: str) -> bool:
+    """
+    Inject Trinity MCP into Codex CLI's config.toml.
+
+    Codex supports streamable HTTP MCP servers with bearer tokens sourced from
+    environment variables, so the MCP API key stays in TRINITY_MCP_API_KEY and
+    is not written into config.toml.
+    """
+    try:
+        home_dir = Path("/home/developer")
+        codex_dir = home_dir / ".codex"
+        config_file = codex_dir / "config.toml"
+
+        codex_dir.mkdir(parents=True, exist_ok=True)
+
+        managed_start = "# BEGIN TRINITY MANAGED MCP"
+        managed_end = "# END TRINITY MANAGED MCP"
+        managed_block = "\n".join([
+            managed_start,
+            "[mcp_servers.trinity]",
+            f"url = {_toml_string(trinity_mcp_url)}",
+            'bearer_token_env_var = "TRINITY_MCP_API_KEY"',
+            "enabled = true",
+            "startup_timeout_sec = 20",
+            "tool_timeout_sec = 120",
+            'default_tools_approval_mode = "auto"',
+            managed_end,
+            "",
+        ])
+
+        existing = config_file.read_text() if config_file.exists() else ""
+        if managed_start in existing and managed_end in existing:
+            before, rest = existing.split(managed_start, 1)
+            _, after = rest.split(managed_end, 1)
+            content = before.rstrip() + "\n\n" + managed_block + after.lstrip()
+        else:
+            content = existing.rstrip() + ("\n\n" if existing.strip() else "") + managed_block
+
+        config_file.write_text(content)
+        logger.info(f"Injected Trinity MCP server into {config_file} (Codex CLI)")
+        return True
+
+    except Exception as e:
+        logger.warning(f"Failed to inject Trinity MCP for Codex CLI: {e}")
+        return False
+
+
 def configure_mcp_servers(mcp_servers: dict) -> bool:
     """
     Configure additional MCP servers for the agent - runtime aware.
@@ -145,6 +201,8 @@ def configure_mcp_servers(mcp_servers: dict) -> bool:
 
     if runtime == "gemini-cli":
         return _configure_gemini_mcp_servers(mcp_servers)
+    elif runtime in ("codex-cli", "codex", "openai-codex"):
+        return _configure_codex_mcp_servers(mcp_servers)
     else:
         return _configure_claude_mcp_servers(mcp_servers)
 
@@ -211,3 +269,63 @@ def _configure_gemini_mcp_servers(mcp_servers: dict) -> bool:
 
     logger.info(f"Configured {success_count}/{len(mcp_servers)} MCP servers for Gemini CLI")
     return success_count > 0 or len(mcp_servers) == 0
+
+
+def _configure_codex_mcp_servers(mcp_servers: dict) -> bool:
+    """Configure additional MCP servers for Codex CLI via config.toml."""
+    home_dir = Path("/home/developer")
+    codex_dir = home_dir / ".codex"
+    config_file = codex_dir / "config.toml"
+
+    try:
+        codex_dir.mkdir(parents=True, exist_ok=True)
+        existing = config_file.read_text() if config_file.exists() else ""
+
+        blocks = []
+        for server_name, config in mcp_servers.items():
+            safe_name = str(server_name).replace('"', '\\"')
+            lines = [f'[mcp_servers."{safe_name}"]']
+            if config.get("url"):
+                lines.append(f"url = {_toml_string(config['url'])}")
+                headers = config.get("headers") or {}
+                auth = headers.get("Authorization")
+                if auth and auth.startswith("Bearer "):
+                    env_name = f"MCP_{str(server_name).upper().replace('-', '_')}_TOKEN"
+                    os.environ[env_name] = auth[len("Bearer "):]
+                    lines.append(f"bearer_token_env_var = {_toml_string(env_name)}")
+            elif config.get("command"):
+                lines.append(f"command = {_toml_string(config['command'])}")
+                args = config.get("args") or []
+                if args:
+                    lines.append("args = [" + ", ".join(_toml_string(str(arg)) for arg in args) + "]")
+                env = config.get("env") or {}
+                if env:
+                    lines.append(f'[mcp_servers."{safe_name}".env]')
+                    for key, value in env.items():
+                        lines.append(f"{key} = {_toml_string(str(value))}")
+            else:
+                logger.warning(f"Skipping MCP server '{server_name}': no url or command specified")
+                continue
+            blocks.append("\n".join(lines))
+
+        if not blocks:
+            return True
+
+        managed_start = "# BEGIN TRINITY MANAGED EXTRA MCP"
+        managed_end = "# END TRINITY MANAGED EXTRA MCP"
+        managed_block = managed_start + "\n" + "\n\n".join(blocks) + "\n" + managed_end + "\n"
+
+        if managed_start in existing and managed_end in existing:
+            before, rest = existing.split(managed_start, 1)
+            _, after = rest.split(managed_end, 1)
+            content = before.rstrip() + "\n\n" + managed_block + after.lstrip()
+        else:
+            content = existing.rstrip() + ("\n\n" if existing.strip() else "") + managed_block
+
+        config_file.write_text(content)
+        logger.info(f"Configured {len(blocks)} MCP servers for Codex CLI")
+        return True
+
+    except Exception as e:
+        logger.warning(f"Failed to configure MCP servers for Codex CLI: {e}")
+        return False

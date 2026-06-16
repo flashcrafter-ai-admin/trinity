@@ -113,6 +113,47 @@ def _compute_context_used(metadata: dict) -> Optional[int]:
     return input_tokens if input_tokens > 0 else None
 
 
+_BILLING_ERROR_INDICATORS = (
+    "credit balance",
+    "add credits",
+    "billing",
+    "rate limit",
+    "rate-limit",
+    "too many requests",
+    "out of usage",
+)
+
+
+def _provider_error_code_from_response(response_text: Optional[str]) -> Optional[TaskExecutionErrorCode]:
+    """Classify provider/runtime failures that arrived as a normal agent reply.
+
+    The agent server should normally surface Claude runtime failures through
+    non-2xx HTTP responses. In practice some subprocess failures can be
+    returned as the task ``response`` with HTTP 200. Treating those as success
+    corrupts schedule history and can advance workflows that did no work.
+    Keep this classifier intentionally narrow: it only catches provider auth,
+    billing, and rate-limit failures, not agent-authored business failures.
+    """
+    if not response_text:
+        return None
+
+    text = response_text.strip().lower()
+    if not text:
+        return None
+
+    if any(indicator in text for indicator in _BILLING_ERROR_INDICATORS):
+        return TaskExecutionErrorCode.BILLING
+
+    try:
+        from services.subscription_auto_switch import is_auth_failure
+        if is_auth_failure(text):
+            return TaskExecutionErrorCode.AUTH
+    except Exception as e:
+        logger.debug(f"[TaskExecService] provider error classification skipped: {e}")
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Reader-race signature (Issue #678 auto-retry)
 # ---------------------------------------------------------------------------
@@ -890,6 +931,73 @@ class TaskExecutionService:
                 total_cost: Optional[float] = base + previous_attempt_cost
             else:
                 total_cost = retry_cost
+
+            provider_error_code = _provider_error_code_from_response(sanitized_resp)
+            if provider_error_code:
+                error_msg = sanitized_resp or "Provider runtime failure"
+                logger.warning(
+                    f"[TaskExecService] Demoting provider failure response on "
+                    f"{agent_name} to FAILED ({provider_error_code.value}): "
+                    f"{error_msg[:200]}"
+                )
+
+                try:
+                    from services.subscription_auto_switch import handle_subscription_failure
+                    failure_kind = (
+                        "rate_limit"
+                        if provider_error_code == TaskExecutionErrorCode.BILLING
+                        and "rate" in error_msg.lower()
+                        else "auth"
+                    )
+                    await handle_subscription_failure(
+                        agent_name=agent_name,
+                        error_message=error_msg,
+                        failure_kind=failure_kind,
+                    )
+                except Exception as switch_err:
+                    logger.error(f"[SUB-003] Auto-switch check failed for '{agent_name}': {switch_err}")
+
+                if execution_id:
+                    existing = db.get_execution(execution_id)
+                    if not existing or existing.status != TaskExecutionStatus.CANCELLED:
+                        db.update_execution_status(
+                            execution_id=execution_id,
+                            status=TaskExecutionStatus.FAILED,
+                            response=sanitized_resp,
+                            error=error_msg,
+                            context_used=context_used if context_used > 0 else None,
+                            context_max=metadata.get("context_window") or 200000,
+                            cost=total_cost,
+                            tool_calls=tool_calls_json,
+                            execution_log=execution_log_json,
+                            claude_session_id=claude_session_id,
+                            compact_metadata=compact_metadata_json,
+                            retry_count=retry_count or None,
+                        )
+
+                if activity_id:
+                    await activity_service.complete_activity(
+                        activity_id=activity_id,
+                        status=ActivityState.FAILED,
+                        error=error_msg,
+                    )
+
+                if provider_error_code == TaskExecutionErrorCode.AUTH:
+                    await _record_dispatch_terminal(agent_name, breaker_enabled, provider_error_code)
+
+                return TaskExecutionResult(
+                    execution_id=execution_id or "",
+                    status=TaskExecutionStatus.FAILED,
+                    response=sanitized_resp or "",
+                    cost=total_cost,
+                    context_used=context_used if context_used > 0 else None,
+                    context_max=metadata.get("context_window") or 200000,
+                    session_id=claude_session_id,
+                    execution_log=execution_log_json,
+                    raw_response=response_data,
+                    error=error_msg,
+                    error_code=provider_error_code,
+                )
 
             # ---- 6. Update execution record ------------------------------
             if execution_id:

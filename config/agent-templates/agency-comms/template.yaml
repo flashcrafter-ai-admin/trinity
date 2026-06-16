@@ -1,0 +1,22 @@
+name: agency-comms
+display_name: "Agency Communications"
+description: Drafts client-facing messages, checks communication context, and gates all outbound sends.
+version: "1.0.0"
+author: Trinity Platform
+resources: {cpu: "1", memory: "2g"}
+capabilities: [client-comms, draft-review, approval-gates]
+shared_folders: {expose: true, consume: true}
+commands:
+  - {name: draft-client-message, description: Draft an exact client-facing message for approval}
+  - {name: check-comms, description: Check recent communication context}
+  - {name: status, description: Report open communication gates}
+schedules:
+  - name: comms-check
+    cron: "20 */2 * * *"
+    message: "/status"
+    timezone: "America/Los_Angeles"
+    description: Check drafts, replies, and communication blockers
+metrics:
+  - {name: pending_drafts, type: gauge, label: "Drafts"}
+  - {name: approved_sends, type: counter, label: "Approved Sends"}
+  - {name: rejected_drafts, type: counter, label: "Rejected Drafts"}
