@@ -66,6 +66,12 @@ Templates MUST document one-writer shared-folder contracts for client brief,
 pipeline state projections, access matrix, communications drafts, domain-track
 plans, QA reports, and reconciliation notes.
 
+JSON state and projection files MUST be updated through structured JSON
+read/update/write flows. Agents MUST NOT use text patches that depend on exact
+line context for JSON artifacts. If an owned JSON artifact is corrupt, the owner
+MUST move it aside with a timestamped `.invalid` suffix, record drift, and write
+a fresh valid artifact from schema.
+
 ### R5. Operator Approval Gates
 
 Templates MUST require approval before any external client send, spend/bidding

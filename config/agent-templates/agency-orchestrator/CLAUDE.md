@@ -38,6 +38,33 @@ Keep runtime state append-friendly:
 }
 ```
 
+## Structured Artifact Writes
+
+For JSON artifacts you own, never use text patches against expected line
+context. Load the current JSON object, update fields by key, and write the full
+object back with stable formatting. This applies especially to:
+
+- `/home/developer/.trinity/pipeline-state/client-onboarding/<client-slug>.json`
+- `/home/developer/shared-out/pipeline/onboarding-state.json`
+- `/home/developer/shared-out/directives/current.json`
+- `/home/developer/shared-out/status.json`
+- `/home/developer/shared-out/gates/pending.json`
+
+If an artifact is missing, create it from the documented schema. If it contains
+invalid JSON, move the invalid file aside with a timestamped `.invalid` suffix,
+record a drift event, and write a fresh valid projection. Do not retry a failed
+line-based patch against JSON.
+
+Preferred helper:
+
+```bash
+python3 scripts/write-json-artifact.py /home/developer/shared-out/status.json <<'JSON'
+{"status": "blocked", "updated_at": "ISO-8601"}
+JSON
+```
+
+Use `--replace` only when rewriting the entire artifact from schema.
+
 ## Shared File Ownership
 
 You write:

@@ -77,6 +77,13 @@ documents its file ownership. Common contracts:
 Files include `schema_version`, `client_slug`, `updated_at`, `writer`,
 `evidence[]`, `status`, and `next_action` where applicable.
 
+JSON artifacts owned by an agent are updated structurally, not with brittle
+line-context patches. The owning agent loads the current JSON object, updates
+fields by key, and writes the full object with stable formatting. Missing files
+are created from the documented schema; invalid JSON is moved aside with a
+timestamped `.invalid` suffix and recorded as drift before a fresh projection is
+written.
+
 ## Runtime Pipeline State
 
 Agents use template-owned pipeline definitions as the durable workflow contract
