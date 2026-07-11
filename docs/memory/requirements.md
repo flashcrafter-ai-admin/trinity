@@ -2876,6 +2876,44 @@ Standalone mobile-friendly admin page for managing agents on the go. Designed as
 
 ---
 
+## 51. Immutable Platform Packages (PKG-001)
+
+- **Status**: ✅ Implemented (2026-07-11)
+- **Description**: Administrators can publish immutable, content-addressed
+  platform packages for agents to consume as read-only files. Agent templates
+  select packages with only `package_id` and an exact lowercase SHA-256 digest.
+- **Template contract**: `platform_packages` is a list of exact objects with
+  only `package_id` and `sha256`. A missing key means no packages. Empty lists
+  are valid. Unknown fields, duplicate package IDs, missing/invalid digests,
+  and moving labels such as `latest` are rejected before container creation.
+- **Authority boundary**: Templates cannot name host paths, Docker volume
+  names, container destinations, mount modes, or archive sources. The backend
+  resolves a registered package to a Docker named volume and the fixed
+  destination `/opt/trinity/platform-packages/{package_id}`.
+- **Admin publish API**: `POST /api/admin/platform-packages` accepts only an
+  immutable `package_id`, declared SHA-256 digest, and a bounded base64 tar.gz
+  archive. It safely extracts regular files/directories, verifies the digest
+  over the archive bytes, materializes a fresh Docker named volume, and writes
+  immutable registry metadata. Same-ID/same-digest retries are idempotent;
+  same-ID/different-digest attempts conflict. A deterministic package volume
+  that exists before its registry record is committed is treated as an
+  untrusted collision and rejected; publication never adopts pre-existing
+  volume contents based only on their name or labels.
+- **Container lifecycle**: Create, deploy-local, start/readiness checks, and
+  recreation resolve selections against the registry and require the exact
+  digest. Package volumes are always mounted with Docker `RW=false`. Recreation
+  rebuilds package mounts from trusted registry metadata rather than copying
+  caller-controlled mount attributes.
+- **Observability**: Agent status and deploy-local responses expose only the
+  resolved package IDs, SHA-256 digests, and fixed destinations. They never
+  expose host paths or Docker volume names.
+- **Security**: Package archives are bounded in encoded size and file count;
+  path traversal, links, devices, FIFOs, and sockets are rejected. Package
+  selections never reuse writable shared-folder plumbing. Undeclared packages
+  are absent, and writes through a mounted package path fail.
+
+---
+
 ## Out of Scope
 
 - Multi-tenant deployment (single org only)
