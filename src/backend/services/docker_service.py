@@ -7,6 +7,7 @@ from typing import List, Optional
 import docker
 from models import AgentStatus
 from utils.helpers import parse_iso_timestamp, utc_now
+from services.platform_package_service import PLATFORM_PACKAGES_LABEL, parse_platform_package_label
 
 logger = logging.getLogger(__name__)
 
@@ -114,7 +115,8 @@ def get_agent_status_from_container(container) -> AgentStatus:
         container_id=container.id,
         template=labels.get("trinity.template", None) or None,
         runtime=runtime,
-        base_image_version=base_image_version
+        base_image_version=base_image_version,
+        platform_packages=parse_platform_package_label(labels.get(PLATFORM_PACKAGES_LABEL)),
     )
 
 
@@ -190,6 +192,7 @@ def list_all_agents_fast() -> List[AgentStatus]:
                 # in every fast-path view (#1187 review I6).
                 runtime=labels.get("trinity.agent-runtime", "claude-code"),
                 base_image_version=labels.get("trinity.base-image-version"),  # Label only, no image lookup
+                platform_packages=parse_platform_package_label(labels.get(PLATFORM_PACKAGES_LABEL)),
             )
             agents.append(agent)
 

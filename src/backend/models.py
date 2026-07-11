@@ -97,6 +97,7 @@ class AgentStatus(BaseModel):
     template: Optional[str] = None
     runtime: Optional[str] = "claude-code"  # "claude-code" or "gemini-cli"
     base_image_version: Optional[str] = None  # Version of trinity-agent-base image
+    platform_packages: List[Dict[str, str]] = Field(default_factory=list)  # Resolved immutable package IDs/digests/destinations
 
     class Config:
         json_encoders = {
