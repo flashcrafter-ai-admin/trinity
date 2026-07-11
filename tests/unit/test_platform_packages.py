@@ -175,6 +175,28 @@ class TestRegistryAndMounts:
 
 
 class TestPublishing:
+    def test_preexisting_unregistered_volume_is_rejected_without_registry_commit(
+        self, tmp_path
+    ):
+        archive = archive_with()
+        digest = hashlib.sha256(archive).hexdigest()
+        client = Mock()
+        client.volumes.get.return_value = Mock()
+
+        with pytest.raises(packages.PlatformPackageError) as collision:
+            packages.publish_platform_package(
+                "policy-bundle",
+                digest,
+                base64.b64encode(archive).decode(),
+                root=tmp_path,
+                docker_client=client,
+            )
+
+        assert collision.value.code == "PLATFORM_PACKAGE_VOLUME_COLLISION"
+        assert not (tmp_path / "registry.json").exists()
+        client.volumes.create.assert_not_called()
+        client.containers.create.assert_not_called()
+
     def test_publish_verifies_digest_materializes_once_and_is_immutable(
         self, tmp_path, monkeypatch
     ):

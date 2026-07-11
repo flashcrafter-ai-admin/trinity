@@ -375,9 +375,18 @@ def _materialize_volume(client: Any, record: dict[str, str], source: Path) -> No
     volume_name = record["volume_name"]
     try:
         client.volumes.get(volume_name)
-        return
     except docker.errors.NotFound:
         pass
+    else:
+        # There is no registry record yet on this path. Adopting an existing
+        # deterministic volume would bind unverified contents to the caller's
+        # digest. Only an already-registered retry may reuse a volume, and that
+        # branch is handled before materialization.
+        raise PlatformPackageError(
+            "PLATFORM_PACKAGE_VOLUME_COLLISION",
+            "Unregistered platform package volume already exists",
+            409,
+        )
     client.volumes.create(
         name=volume_name,
         labels={
@@ -483,6 +492,8 @@ def publish_platform_package(
             client = docker_client or docker.from_env()
             try:
                 _materialize_volume(client, record, extracted)
+            except PlatformPackageError:
+                raise
             except Exception as exc:
                 raise PlatformPackageError(
                     "PLATFORM_PACKAGE_MATERIALIZATION_FAILED",

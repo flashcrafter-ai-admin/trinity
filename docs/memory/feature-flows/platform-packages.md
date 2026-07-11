@@ -19,6 +19,11 @@ mount configuration.
 5. Repeating the exact publish is idempotent. Reusing a package ID with a
    different digest returns a conflict.
 
+If the deterministic Docker volume already exists but no immutable registry
+record exists, publication fails closed. Trinity does not adopt or relabel that
+volume because its content did not pass the current publish transaction. An
+administrator must investigate and remove the orphan before retrying.
+
 Example request (placeholders only):
 
 ```json

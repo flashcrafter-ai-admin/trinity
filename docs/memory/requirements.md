@@ -2895,7 +2895,10 @@ Standalone mobile-friendly admin page for managing agents on the go. Designed as
   archive. It safely extracts regular files/directories, verifies the digest
   over the archive bytes, materializes a fresh Docker named volume, and writes
   immutable registry metadata. Same-ID/same-digest retries are idempotent;
-  same-ID/different-digest attempts conflict.
+  same-ID/different-digest attempts conflict. A deterministic package volume
+  that exists before its registry record is committed is treated as an
+  untrusted collision and rejected; publication never adopts pre-existing
+  volume contents based only on their name or labels.
 - **Container lifecycle**: Create, deploy-local, start/readiness checks, and
   recreation resolve selections against the registry and require the exact
   digest. Package volumes are always mounted with Docker `RW=false`. Recreation
