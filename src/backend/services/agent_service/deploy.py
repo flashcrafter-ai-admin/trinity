@@ -34,6 +34,11 @@ from services.docker_utils import container_stop
 from utils.helpers import sanitize_agent_name
 from services.settings_service import get_agent_quota_for_role
 from .helpers import get_agents_by_prefix, get_next_version_name, get_latest_version
+from services.platform_package_service import (
+    PlatformPackageError,
+    resolve_platform_packages,
+    verify_platform_package_volumes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -392,6 +397,20 @@ async def deploy_local_agent_logic(
                     "code": "NOT_TRINITY_COMPATIBLE"
                 }
             )
+
+        # PKG-001: validate and resolve package selections before versioning,
+        # stopping a previous agent, copying files, or creating volumes.
+        try:
+            deploy_packages = resolve_platform_packages(
+                template_data.get("platform_packages")
+            )
+            if deploy_packages:
+                verify_platform_package_volumes(deploy_packages, docker.from_env())
+        except PlatformPackageError as exc:
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail={"code": exc.code, "error": str(exc)},
+            ) from exc
 
         # 6. Determine agent name
         base_name = body.name or template_data.get("name")

@@ -36,6 +36,14 @@ from utils.helpers import sanitize_agent_name, utc_now_iso
 from .helpers import validate_base_image
 from .lifecycle import RESTRICTED_CAPABILITIES, FULL_CAPABILITIES
 from .capabilities import AGENT_TMPFS_MOUNT, AGENT_DEFAULT_TMPDIR
+from services.platform_package_service import (
+    PLATFORM_PACKAGES_LABEL,
+    PlatformPackageError,
+    platform_package_label,
+    platform_package_volumes,
+    resolve_platform_packages,
+    verify_platform_package_volumes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -236,6 +244,7 @@ async def create_agent_internal(
             if gh_template:
                 # Pre-defined GitHub template from config.py
                 github_repo = gh_template["github_repo"]
+                template_data = gh_template
 
                 # Get system GitHub PAT from settings (SQLite) or env var
                 github_pat = get_github_pat()
@@ -375,6 +384,23 @@ async def create_agent_internal(
                             }
                 except Exception as e:
                     logger.warning(f"Error loading template config: {e}")
+
+    try:
+        resolved_platform_packages = resolve_platform_packages(
+            template_data.get("platform_packages") if isinstance(template_data, dict) else None
+        )
+    except PlatformPackageError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "error": str(exc)},
+        ) from exc
+    try:
+        verify_platform_package_volumes(resolved_platform_packages, docker_client)
+    except PlatformPackageError as exc:
+        raise HTTPException(
+            status_code=exc.status_code,
+            detail={"code": exc.code, "error": str(exc)},
+        ) from exc
 
     if config.port is None:
         config.port = get_next_available_port()
@@ -606,6 +632,10 @@ async def create_agent_internal(
             if cred_files_volume:
                 volumes.update(cred_files_volume)
 
+            # PKG-001: platform packages are distinct from rw shared folders.
+            # Registry metadata is authoritative for volume and destination.
+            volumes.update(platform_package_volumes(resolved_platform_packages))
+
             # Phase 9.11: Agent Shared Folders - mount shared volumes based on config
             # First, write template-defined shared folder config to DB (if defined)
             if template_shared_folders:
@@ -721,7 +751,8 @@ async def create_agent_internal(
                     'trinity.template': config.template or '',
                     'trinity.agent-runtime': config.runtime or 'claude-code',
                     'trinity.full-capabilities': str(full_capabilities).lower(),
-                    'trinity.base-image-version': get_platform_version()
+                    'trinity.base-image-version': get_platform_version(),
+                    PLATFORM_PACKAGES_LABEL: platform_package_label(resolved_platform_packages),
                 },
                 # Always apply AppArmor for additional sandboxing
                 security_opt=['apparmor:docker-default'],

@@ -28,6 +28,15 @@ from services.skill_service import skill_service
 from .helpers import check_shared_folder_mounts_match, check_api_key_env_matches, check_github_pat_env_matches, check_resource_limits_match, check_full_capabilities_match, check_guardrails_env_matches
 from .file_sharing import check_public_folder_mount_matches
 from .read_only import inject_read_only_hooks, remove_read_only_hooks
+from services.platform_package_service import (
+    PLATFORM_PACKAGES_LABEL,
+    PlatformPackageError,
+    platform_package_mounts_match,
+    platform_package_selections_from_label,
+    platform_package_volumes,
+    resolve_platform_packages,
+    verify_platform_package_volumes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -263,6 +272,7 @@ async def start_agent_internal(agent_name: str) -> dict:
         not check_resource_limits_match(container, agent_name) or
         not check_full_capabilities_match(container, agent_name) or
         not check_guardrails_env_matches(container, agent_name)
+        or not platform_package_mounts_match(container, client=docker_client)
     )
 
     if needs_recreation:
@@ -420,6 +430,23 @@ async def recreate_container_with_updated_config(agent_name: str, old_container,
     # Update label to reflect current setting
     labels["trinity.full-capabilities"] = str(full_capabilities).lower()
 
+    # Resolve packages before removing the old container. A stale or damaged
+    # registry must fail closed without taking a currently-running agent down.
+    try:
+        selected_packages = platform_package_selections_from_label(
+            labels.get(PLATFORM_PACKAGES_LABEL, "[]")
+        )
+        package_records = resolve_platform_packages(selected_packages)
+        verify_platform_package_volumes(package_records, docker_client)
+    except PlatformPackageError as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "PLATFORM_PACKAGE_RECONCILIATION_FAILED",
+                "error": "Agent platform packages cannot be resolved safely",
+            },
+        ) from exc
+
     # Stop and remove old container
     try:
         await container_stop(old_container)
@@ -436,6 +463,9 @@ async def recreate_container_with_updated_config(agent_name: str, old_container,
 
     for m in old_mounts:
         dest = m.get("Destination", "")
+        # Package mounts are rebuilt only from the trusted registry below.
+        if dest.startswith("/opt/trinity/platform-packages/"):
+            continue
         # Skip shared folder mounts - we'll add the correct ones
         if dest == "/home/developer/shared-out" or dest.startswith("/home/developer/shared-in/"):
             continue
@@ -449,6 +479,10 @@ async def recreate_container_with_updated_config(agent_name: str, old_container,
             vol_name = m.get("Name")
             if vol_name:
                 volumes[vol_name] = {"bind": dest, "mode": "rw" if m.get("RW", True) else "ro"}
+
+    # Re-resolve immutable package selections stored in the platform-owned
+    # label. Never trust old mount source/destination/mode attributes.
+    volumes.update(platform_package_volumes(package_records))
 
     # Add shared folder mounts based on current config
     shared_config = db.get_shared_folder_config(agent_name)
