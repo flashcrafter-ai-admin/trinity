@@ -404,6 +404,12 @@ def test_auto_switch_restart_chain_does_not_invoke_credential_import():
         stack.enter_context(patch.object(
             _mod, "wait_for_agent_ready", AsyncMock(return_value=True)
         ))
+        # Platform-package mount reconciliation is orthogonal to SUB-003.
+        # Keep this chain focused on the subscription credential short-circuit;
+        # the MagicMock container intentionally has no real Docker labels.
+        stack.enter_context(patch.object(
+            _mod, "platform_package_mounts_match", Mock(return_value=True)
+        ))
         stack.enter_context(patch.object(
             _mod, "inject_assigned_credentials", recording_inject
         ))

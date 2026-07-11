@@ -32,8 +32,6 @@ import pytest
 _THIS = Path(__file__).resolve()
 _BACKEND = _THIS.parent.parent.parent / "src" / "backend"
 _BACKEND_STR = str(_BACKEND)
-for _shadow in ("utils", "utils.api_client", "utils.assertions", "utils.cleanup"):
-    sys.modules.pop(_shadow, None)
 while _BACKEND_STR in sys.path:
     sys.path.remove(_BACKEND_STR)
 sys.path.insert(0, _BACKEND_STR)
@@ -44,18 +42,16 @@ from db_harness import db_backend, run as _hrun  # noqa: E402
 pytestmark = pytest.mark.unit
 
 
-# Modules this test mutates in sys.modules — the import-time shadow cleanup
-# above and the per-test ``tmp_db`` fixture both pop cached ``database`` /
-# ``db.*`` (and shadow ``utils*``) modules so production code re-resolves
+# Modules this test mutates in sys.modules. The per-test ``tmp_db`` fixture
+# pops cached ``database`` / ``db.*`` modules so production code re-resolves
 # against the test engine. They are snapshotted and restored after each test so
 # the mutation can't leak into unrelated test files in the same pytest session
 # (#762 lint pattern; precedent: tests/unit/test_telegram_webhook_backfill.py).
+# The unit conftest preloads the canonical backend ``utils`` package. Do not
+# evict it at collection time: fixtures cannot restore it until test execution,
+# and later test modules would resolve the shadowing ``tests/utils`` package.
 _STUBBED_MODULE_NAMES = [
     "database",
-    "utils",
-    "utils.api_client",
-    "utils.assertions",
-    "utils.cleanup",
 ]
 
 
@@ -65,7 +61,7 @@ def _is_managed_module(name: str) -> bool:
 
 @pytest.fixture(autouse=True)
 def _restore_sys_modules():
-    """Snapshot the db/utils sys.modules entries before each test and restore
+    """Snapshot the managed database modules before each test and restore
     them after, so popped modules don't leak across the session."""
     saved = {name: mod for name, mod in sys.modules.items() if _is_managed_module(name)}
     try:
