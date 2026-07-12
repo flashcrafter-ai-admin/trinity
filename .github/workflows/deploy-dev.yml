@@ -3,180 +3,57 @@ name: Deploy to Dev
 on:
   push:
     branches: [dev]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never cancel an upgrade after its backup/build sequence has started.
+concurrency:
+  group: trinity-dev-deploy
+  cancel-in-progress: false
 
 jobs:
   deploy:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 35
 
     steps:
       - name: Connect to Tailscale
-        # SHA-pinned to mitigate supply-chain hijack of the v2 floating tag.
+        # SHA-pinned to mitigate supply-chain hijack of a floating tag.
         uses: tailscale/github-action@780049a30b6ff5c378a9e7b389d15ece7a204888 # v4.1.3
         with:
-          authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: ${{ secrets.TS_TAGS }}
 
-      - name: Deploy
-        # SHA-pinned to mitigate supply-chain hijack of the v1 floating tag.
-        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1
-        with:
-          # Host + username come from repo secrets so this public workflow file
-          # doesn't disclose the Tailscale topology of the dev environment.
-          host: ${{ secrets.DEV_HOST }}
-          username: ${{ secrets.DEV_USER }}
-          key: ${{ secrets.DEV_SSH_KEY }}
-          command_timeout: 25m
-          script: |
-            set -e
-            cd ~/trinity
+      - name: Configure deploy SSH identity
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEV_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEV_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          umask 077
+          mkdir -p "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$HOME/.ssh/trinity-deploy"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$HOME/.ssh/known_hosts"
 
-            echo "=== Pull ==="
-            git fetch origin dev
-            git checkout dev
-            # The dev VM has a persistent checkout that may carry hand-applied
-            # fixes (e.g. docker-compose.prod.yml tweaks). `git pull` aborts on
-            # dirty tree, blocking every deploy. Stash with a deploy-run-keyed
-            # message so the changes are recoverable via `git stash list` (and
-            # survive in the reflog for ~90 days) without polluting history.
-            # If the working tree is clean, stash is a no-op (exit 0).
-            #
-            # Long-term fix is to move the build to CI + push images to a
-            # registry so the dev VM is stateless (see #942). Until then, this
-            # keeps deploys unblocked while preserving the audit trail.
-            # Workflow-syntax interpolation: GitHub expands `${{ github.run_id }}`
-            # at YAML render time so the literal run id is baked into the script
-            # before it ships over SSH. Using `$GITHUB_RUN_ID` here would fail
-            # silently — that env var lives on the GH Actions runner, not on
-            # the dev VM where this script actually executes.
-            #
-            # NO `-u`: the dev VM has Docker-volume directories (trinity-data/,
-            # archives/, avatars/) owned by root inside containers. The trinity
-            # user can't `rm` those, so `git stash -u` aborts mid-cleanup with
-            # "Permission denied", leaves the stash entry created but the
-            # working tree UNREVERTED, returns non-zero, our `|| echo` masks
-            # the failure as "no changes" — and the subsequent pull aborts on
-            # the still-dirty tracked file. Tracked-only stash is what actually
-            # blocks the pull; untracked Docker-owned files don't block git.
-            STASH_MSG="auto-stash-deploy-${{ github.run_id }}"
-            git stash push -m "${STASH_MSG}" || echo "No local changes to stash"
-            git pull --ff-only origin dev
-            echo "Version: $(git log -1 --oneline)"
+          test -s "$HOME/.ssh/trinity-deploy"
+          test -s "$HOME/.ssh/known_hosts"
+          ssh-keygen -y -f "$HOME/.ssh/trinity-deploy" >/dev/null
 
-            echo "=== Submodule (enterprise) ==="
-            # #847 — try to init the private trinity-enterprise submodule
-            # so the dev deploy lights up enterprise features (audit
-            # dashboard, etc.). If the VM lacks read access to the private
-            # repo, this is a non-fatal warning — the conditional import
-            # in main.py falls back to OSS-only mode and the deploy
-            # continues. Enterprise UI surfaces simply stay hidden.
-            #
-            # #1443 — .gitmodules now sets `update = none` on this
-            # submodule (OSS clones skip it). A skipped submodule exits 0,
-            # so (a) persist a local `update = checkout` override so this
-            # and every future plain `git submodule update` on the VM
-            # actually syncs it, and (b) judge success by the populated
-            # marker file, never the exit code.
-            git config submodule.src/backend/enterprise.update checkout
-            git submodule update --init --recursive src/backend/enterprise || true
-            if [ -f src/backend/enterprise/backend/__init__.py ]; then
-              ENT_SHA=$(git -C src/backend/enterprise rev-parse --short HEAD 2>/dev/null || echo "unknown")
-              echo "ENTERPRISE: initialized at ${ENT_SHA}"
-              # A populated marker only proves the tree exists — a failed
-              # update on a previously-mounted VM leaves the OLD checkout in
-              # place. Compare against the recorded gitlink and warn on
-              # drift so a stale enterprise tree can't ship under a green
-              # log line (#1443 review F2).
-              WANT=$(git rev-parse HEAD:src/backend/enterprise 2>/dev/null || echo "none")
-              HAVE=$(git -C src/backend/enterprise rev-parse HEAD 2>/dev/null || echo "none")
-              if [ "$WANT" != "$HAVE" ]; then
-                echo "::warning::Enterprise submodule STALE: checked out ${HAVE}, dev records ${WANT} — update failed; deploying the old enterprise tree"
-              fi
-            else
-              echo "::warning::Enterprise submodule init failed — deploying in OSS-only mode"
-              echo "ENTERPRISE: confirm the dev VM has read access to Abilityai/trinity-enterprise"
-              echo "ENTERPRISE: (deploy key, PAT in a credential helper, or org membership all work)"
-            fi
-
-            # Compose file list: base prod + enterprise overlay. The
-            # overlay bind-mounts ./src/backend/enterprise into
-            # /app/enterprise inside the backend container. If the
-            # submodule init above failed, the host directory will be
-            # empty (or contain just .git), and the conditional import
-            # in main.py will fall through to OSS-only mode — same
-            # outcome as if the overlay weren't applied.
-            COMPOSE_FILES="-f docker-compose.prod.yml -f docker-compose.prod.enterprise.yml"
-
-            echo "=== Volume ownership (#874 / #958) ==="
-            # Backend + scheduler run as UID 1000 (issue #874). Existing
-            # deployments rolled before #874 still have data paths owned by
-            # root from the prior root-container era. The first migration to
-            # actually UPDATE existing rows (#922's null_legacy_schedule_
-            # timeouts) hits "attempt to write a readonly database" on
-            # startup, /health returns 503 forever, deploy times out.
-            # Canonical recipe: docs/migrations/NON_ROOT_CONTAINERS_2026-05.md.
-            # Both checks are idempotent — silent no-ops on healthy VMs.
-            TRINITY_DATA_PATH="${TRINITY_DATA_PATH:-./trinity-data}"
-            if [ -d "$TRINITY_DATA_PATH" ]; then
-              DATA_UID=$(stat -c %u "$TRINITY_DATA_PATH")
-              if [ "$DATA_UID" != "1000" ]; then
-                echo "Re-owning $TRINITY_DATA_PATH from UID=$DATA_UID to UID=1000"
-                sudo chown -R 1000:1000 "$TRINITY_DATA_PATH"
-              fi
-            fi
-            # agent-configs is a named volume; check + chown via ephemeral
-            # alpine container running as root.
-            PROJECT=$(basename "$PWD")
-            VOL_NAME="${PROJECT}_agent-configs"
-            if sudo docker volume inspect "$VOL_NAME" >/dev/null 2>&1; then
-              VOL_UID=$(sudo docker run --rm -v "$VOL_NAME:/v" alpine stat -c %u /v 2>/dev/null || echo "0")
-              if [ "$VOL_UID" != "1000" ]; then
-                echo "Re-owning volume $VOL_NAME from UID=$VOL_UID to UID=1000"
-                sudo docker run --rm -v "$VOL_NAME:/v" --user 0 alpine chown -R 1000:1000 /v
-              fi
-            fi
-
-            echo "=== Build ==="
-            # Build-time provenance (#926 / #958 / #993). docker-compose.prod.yml
-            # backend.build.args reads these env vars; absent them, the
-            # Dockerfile defaults to "unknown" and Build Info in the UI
-            # shows a wall of unknown values. Mirrors scripts/deploy/start.sh.
-            #
-            # #993: pass via `sudo env VAR=val …` — NOT `sudo VAR=val …`.
-            # Under default Ubuntu sudoers (env_reset on, setenv off), env
-            # assignments placed before the command are filtered out, so the
-            # prior form silently dropped every var and compose fell back to
-            # ${VAR:-unknown}. `env` is the program sudo execs, so the
-            # assignments are its arguments and reach docker compose intact.
-            GIT_COMMIT=$(git rev-parse HEAD)
-            GIT_COMMIT_SUBJECT=$(git log -1 --pretty=%s)
-            GIT_COMMIT_TIMESTAMP=$(git log -1 --pretty=%cI)
-            GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-            BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-            # #993: dynamic version = VERSION file + git short sha (+ .dirty).
-            BASE_VER=$(cat VERSION 2>/dev/null || echo unknown)
-            SHORT_SHA=$(git rev-parse --short=8 HEAD)
-            git diff --quiet HEAD 2>/dev/null || SHORT_SHA="${SHORT_SHA}.dirty"
-            VERSION="${BASE_VER}+g${SHORT_SHA}"
-            sudo env \
-              VERSION="${VERSION}" \
-              GIT_COMMIT="${GIT_COMMIT}" \
-              GIT_COMMIT_SUBJECT="${GIT_COMMIT_SUBJECT}" \
-              GIT_COMMIT_TIMESTAMP="${GIT_COMMIT_TIMESTAMP}" \
-              GIT_BRANCH="${GIT_BRANCH}" \
-              BUILD_DATE="${BUILD_DATE}" \
-              docker compose ${COMPOSE_FILES} build --no-cache backend frontend mcp-server scheduler
-
-            echo "=== Restart ==="
-            sudo docker compose ${COMPOSE_FILES} up -d backend frontend mcp-server scheduler
-
-            echo "=== Health ==="
-            sleep 10
-            curl -sf http://localhost:8000/health && echo "Backend: OK"
-            SCHED=$(sudo docker inspect trinity-scheduler --format='{{.State.Health.Status}}')
-            echo "Scheduler: $SCHED"
-            [ "$SCHED" = "healthy" ] || echo "WARNING: scheduler not healthy yet"
-
-            echo "=== Error check ==="
-            sudo docker logs trinity-backend --tail 50 2>&1 | grep -iE 'error|exception|failed' | head -10 || echo "No errors"
-
-            echo "=== Done ==="
+      - name: Deploy pushed revision safely
+        env:
+          DEV_HOST: ${{ secrets.DEV_HOST }}
+          DEV_USER: ${{ secrets.DEV_USER }}
+        run: |
+          set -euo pipefail
+          test -n "$DEV_HOST"
+          test -n "$DEV_USER"
+          ssh \
+            -i "$HOME/.ssh/trinity-deploy" \
+            -o BatchMode=yes \
+            -o IdentitiesOnly=yes \
+            -o StrictHostKeyChecking=yes \
+            "$DEV_USER@$DEV_HOST" \
+            "deploy $GITHUB_SHA"

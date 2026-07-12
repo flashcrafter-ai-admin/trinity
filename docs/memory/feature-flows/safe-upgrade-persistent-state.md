@@ -21,12 +21,13 @@ Trinity upgrades must preserve the operator's work before changing code or conta
 ```mermaid
 flowchart TD
   A["Operator requests upgrade"] --> B["Use same compose project name"]
-  B --> C["Run backup-persistent-state.sh"]
-  C --> D["Write manifest and backup bundle"]
-  D --> E["Build platform images"]
-  E --> F["docker compose up platform services"]
-  F --> G["Backend /health passes"]
-  G --> H["/api/version reports target build"]
+  B --> C["Validate exact dev SHA and acquire deploy lock"]
+  C --> D["Run backup-persistent-state.sh"]
+  D --> E["Write manifest and backup bundle"]
+  E --> F["Build platform images"]
+  F --> G["docker compose up platform services"]
+  G --> H["Backend /health passes"]
+  H --> I["Running commit and worktree match target"]
 ```
 
 ## Invariants
@@ -36,10 +37,14 @@ flowchart TD
 - A routine upgrade does not silently change the compose project name, because that creates a second set of compose volumes.
 - Agent containers are not removed as part of a platform upgrade. If the agent base image changes, recreate only after a persistent-state backup exists.
 - External PostgreSQL requires a managed snapshot or operator-provided dump; a backup bundle without the DB is incomplete unless explicitly allowed.
+- Automated deploy credentials are least-privilege: Tailscale access is tag-scoped, SSH host identity is pinned, and the deploy key is restricted to `deploy <40-character SHA>`.
+- Concurrent deploys serialize through a host lock and are never cancelled mid-upgrade.
 
 ## Entry Points
 
 - `scripts/deploy/backup-persistent-state.sh`
 - `scripts/deploy/safe-upgrade.sh`
+- `scripts/deploy/github-actions-safe-deploy.sh`
+- `.github/workflows/deploy-dev.yml`
 - `docs/user-docs/guides/deploying/upgrading.md`
 - `docs/user-docs/guides/deploying/backup-and-restore.md`

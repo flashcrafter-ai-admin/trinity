@@ -124,6 +124,7 @@
 - **Key Features**:
   - `scripts/deploy/backup-persistent-state.sh` discovers the compose project by Docker labels, writes a PostgreSQL custom-format dump for bundled PostgreSQL deployments, archives SQLite files when SQLite is active, archives backend `/data`, copies `.env` when present, and archives every `agent-*-workspace` volume.
   - `scripts/deploy/safe-upgrade.sh` keeps the compose project name stable, runs the backup first, rebuilds platform services, starts only platform services, waits for backend health, and reports `/api/version`.
+  - `.github/workflows/deploy-dev.yml` connects with a tag-scoped Tailscale OAuth client and a pinned SSH host key, then requests deployment of the exact pushed SHA. The host key is restricted to `scripts/deploy/github-actions-safe-deploy.sh`, which rejects arbitrary commands, serializes deploys, verifies the remote `dev` head, invokes `safe-upgrade.sh`, verifies runtime provenance, and prunes only superseded clean deployment worktrees.
   - Routine upgrades do not remove agent containers, Docker volumes, or the agent network. Destructive operations such as `docker compose down -v` and `docker volume rm` are explicit reset operations, not upgrade steps.
 - **Flow**: `docs/memory/feature-flows/safe-upgrade-persistent-state.md`
 
