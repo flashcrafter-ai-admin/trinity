@@ -45,13 +45,16 @@ jobs:
       - name: Deploy pushed revision safely
         env:
           DEV_HOST: ${{ secrets.DEV_HOST }}
+          DEV_PORT: ${{ secrets.DEV_PORT }}
           DEV_USER: ${{ secrets.DEV_USER }}
         run: |
           set -euo pipefail
           test -n "$DEV_HOST"
+          test -n "$DEV_PORT"
           test -n "$DEV_USER"
           ssh \
             -i "$HOME/.ssh/trinity-deploy" \
+            -p "$DEV_PORT" \
             -o BatchMode=yes \
             -o IdentitiesOnly=yes \
             -o StrictHostKeyChecking=yes \

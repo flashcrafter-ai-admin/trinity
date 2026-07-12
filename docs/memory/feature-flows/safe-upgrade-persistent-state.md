@@ -37,7 +37,7 @@ flowchart TD
 - A routine upgrade does not silently change the compose project name, because that creates a second set of compose volumes.
 - Agent containers are not removed as part of a platform upgrade. If the agent base image changes, recreate only after a persistent-state backup exists.
 - External PostgreSQL requires a managed snapshot or operator-provided dump; a backup bundle without the DB is incomplete unless explicitly allowed.
-- Automated deploy credentials are least-privilege: Tailscale access is tag-scoped, SSH host identity is pinned, and the deploy key is restricted to `deploy <40-character SHA>`.
+- Automated deploy credentials are least-privilege: Tailscale access is tag-scoped to a dedicated OpenSSH port, SSH host identity is pinned, and the deploy key is restricted to `deploy <40-character SHA>`.
 - Concurrent deploys serialize through a host lock and are never cancelled mid-upgrade.
 
 ## Entry Points

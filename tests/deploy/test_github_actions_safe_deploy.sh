@@ -26,6 +26,8 @@ done
 
 grep -q 'oauth-client-id:.*TS_OAUTH_CLIENT_ID' "$ROOT/.github/workflows/deploy-dev.yml"
 grep -q 'tags:.*TS_TAGS' "$ROOT/.github/workflows/deploy-dev.yml"
+grep -q 'DEV_PORT:.*DEV_PORT' "$ROOT/.github/workflows/deploy-dev.yml"
+grep -q -- '-p "$DEV_PORT"' "$ROOT/.github/workflows/deploy-dev.yml"
 grep -q 'StrictHostKeyChecking=yes' "$ROOT/.github/workflows/deploy-dev.yml"
 grep -q 'deploy \$GITHUB_SHA' "$ROOT/.github/workflows/deploy-dev.yml"
 ! grep -q 'git stash' "$ROOT/.github/workflows/deploy-dev.yml"
