@@ -3,7 +3,7 @@ Pydantic models for the Trinity backend API.
 """
 import re
 
-from pydantic import BaseModel, EmailStr, Field, SecretStr, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, SecretStr, field_validator, model_validator
 from typing import Dict, List, Literal, Optional
 from datetime import datetime
 from enum import Enum
@@ -18,6 +18,16 @@ from db_models import WebFileUpload  # noqa: F401 — re-exported for router imp
 _FORK_DESTINATION_RE = re.compile(
     r"^[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?/[A-Za-z0-9._-]+$"
 )
+
+
+class PublishPlatformPackageRequest(BaseModel):
+    """Strict administrator request for an immutable platform package."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    package_id: str
+    sha256: str
+    archive: str
 
 
 class ForkToOwnRequest(BaseModel):

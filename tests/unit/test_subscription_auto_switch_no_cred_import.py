@@ -347,6 +347,7 @@ def test_auto_switch_restart_chain_does_not_invoke_credential_import():
     # `container_reload` runs inside `start_agent_internal` — so
     # `was_already_running` is False and the #421 skip path does NOT fire.
     mock_container = MagicMock()
+    mock_container.attrs = {"Config": {"Labels": {}}, "Mounts": []}
     mock_container.status = "running"
 
     async def reload_side_effect(c):
@@ -397,6 +398,9 @@ def test_auto_switch_restart_chain_does_not_invoke_credential_import():
         # Stubs the chain through start_agent_internal needs. These are
         # patched on the loaded ``_mod`` directly because lifecycle.py
         # captures these names into its module globals at import time.
+        stack.enter_context(patch.object(
+            _mod, "get_agent_container", Mock(return_value=mock_container)
+        ))
         stack.enter_context(patch.object(
             _mod, "container_reload", AsyncMock(side_effect=reload_side_effect)
         ))

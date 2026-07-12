@@ -1,10 +1,8 @@
 """Administrator API for immutable platform packages."""
 
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, ConfigDict
-
 from dependencies import require_role
-from models import User
+from models import PublishPlatformPackageRequest, User
 from services.platform_package_service import (
     PlatformPackageError,
     publish_platform_package,
@@ -12,14 +10,6 @@ from services.platform_package_service import (
 
 
 router = APIRouter(prefix="/api/admin/platform-packages", tags=["platform-packages"])
-
-
-class PublishPlatformPackageRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
-    package_id: str
-    sha256: str
-    archive: str
 
 
 @router.post("")
