@@ -401,3 +401,19 @@
   commit metadata. Follow-ups if useful.
 
 ---
+
+## Immutable Platform Packages (PKG-001)
+
+- **Status**: ✅ Implemented (2026-07-11)
+- **Contract**: administrators publish immutable, content-addressed packages;
+  templates select them using only `package_id` and an exact lowercase
+  SHA-256 digest. Unknown fields, duplicate IDs, invalid digests, and moving
+  labels are rejected before container creation.
+- **Authority**: templates cannot name host paths, volume names, destinations,
+  mount modes, or archives. Registered volumes mount read-only at
+  `/opt/trinity/platform-packages/{package_id}`.
+- **Lifecycle**: create, deploy-local, start, and recreation require the exact
+  registered digest. Recreation rebuilds mounts from trusted registry metadata.
+- **Security and visibility**: bounded archives reject traversal, links, and
+  special files. Responses expose IDs, digests, and fixed destinations, never
+  host paths or Docker volume names.
