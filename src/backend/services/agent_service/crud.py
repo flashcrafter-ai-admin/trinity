@@ -21,6 +21,7 @@ from services.docker_service import (
     docker_client,
     get_agent_by_name,
     get_next_available_port,
+    get_agent_ssh_port_binding,
     get_agent_status_from_container,
 )
 from services.docker_utils import (
@@ -955,7 +956,7 @@ async def create_agent_internal(
                 config.base_image,
                 detach=True,
                 name=f"agent-{config.name}",
-                ports={'22/tcp': config.port},
+                ports={'22/tcp': get_agent_ssh_port_binding(config.port)},
                 volumes=volumes,
                 environment=env_vars,
                 labels={

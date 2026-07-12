@@ -2,6 +2,7 @@
 Docker service for managing agent containers.
 """
 import logging
+import os
 import time
 from typing import List, Optional
 import docker
@@ -29,6 +30,16 @@ try:
 except Exception as e:
     print(f"Warning: Could not connect to Docker: {e}")
     docker_client = None
+
+
+def get_agent_ssh_port_binding(port: int):
+    """Return host-bound Docker SDK port binding for agent SSH.
+
+    VPS deployments should bind agent SSH to a private interface, not 0.0.0.0.
+    Set AGENT_SSH_BIND_HOST to the Tailscale IP when remote SSH access is needed.
+    """
+    bind_host = os.getenv("AGENT_SSH_BIND_HOST", "").strip() or "127.0.0.1"
+    return (bind_host, port)
 
 
 def get_agent_container(name: str):
