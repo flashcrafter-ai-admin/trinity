@@ -47,7 +47,8 @@ def wait_for_agent_ready(monkeypatch):
     stubs = {
         "database": types.SimpleNamespace(db=None),
         "services.docker_service": types.SimpleNamespace(
-            docker_client=None, get_agent_container=lambda _n: None
+            docker_client=None, get_agent_container=lambda _n: None,
+            get_agent_ssh_port_binding=lambda port: port,
         ),
         "services.docker_utils": types.SimpleNamespace(
             container_stop=None, container_remove=None, container_start=None,
@@ -71,6 +72,15 @@ def wait_for_agent_ready(monkeypatch):
             get_agent_default_resources=None,  # added to lifecycle.py import (#725)
         ),
         "services.skill_service": types.SimpleNamespace(skill_service=None),
+        "services.platform_package_service": types.SimpleNamespace(
+            PLATFORM_PACKAGES_LABEL="trinity.platform-packages",
+            PlatformPackageError=Exception,
+            platform_package_mounts_match=lambda *_a, **_kw: True,
+            platform_package_selections_from_label=lambda _value: [],
+            platform_package_volumes=lambda _records: {},
+            resolve_platform_packages=lambda _selected: [],
+            verify_platform_package_volumes=lambda *_a, **_kw: None,
+        ),
     }
     for name, mod in stubs.items():
         monkeypatch.setitem(sys.modules, name, mod)

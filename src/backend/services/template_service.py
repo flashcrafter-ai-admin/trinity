@@ -170,6 +170,9 @@ def _build_template(repo: str, metadata: dict, admin_override: dict = None) -> d
         "skills": metadata.get("skills", []),
         "mcp_servers": metadata.get("mcp_servers", []),
         "required_credentials": metadata.get("required_credentials", []),
+        # PKG-001: preserve only the declarative selection for server-side
+        # closed-schema validation during agent creation.
+        "platform_packages": metadata.get("platform_packages", []),
         # Surface `persistent_state` from template.yaml so crud.py can
         # materialize `.trinity/persistent-state.yaml` at creation. Falls
         # back to the global default list when the template omits the key.
@@ -252,6 +255,7 @@ def _build_local_template(template_dir: Path) -> Optional[dict]:
         "mcp_servers": list(data.get("credentials", {}).get("mcp_servers", {}).keys())
             or data.get("mcp_servers", []),
         "required_credentials": data.get("required_credentials", []),
+        "platform_packages": data.get("platform_packages", []),
         # Local templates surface their full capabilities/use-cases so the
         # frontend can preview them without a second round-trip.
         "capabilities": data.get("capabilities", []),

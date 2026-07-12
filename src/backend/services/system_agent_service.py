@@ -19,6 +19,7 @@ from services.docker_service import (
     docker_client,
     get_agent_container,
     get_next_available_port,
+    get_agent_ssh_port_binding,
 )
 from services.docker_utils import container_reload, container_start, containers_run
 from services.settings_service import get_anthropic_api_key
@@ -240,7 +241,7 @@ class SystemAgentService:
             name=f"agent-{SYSTEM_AGENT_NAME}",
             detach=True,
             network='trinity-agent-network',
-            ports={'22/tcp': ssh_port},
+            ports={'22/tcp': get_agent_ssh_port_binding(ssh_port)},
             volumes=volumes,
             environment=env_vars,
             labels=labels,

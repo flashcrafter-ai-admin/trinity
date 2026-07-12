@@ -2,11 +2,13 @@
 Docker service for managing agent containers.
 """
 import logging
+import os
 import time
 from typing import List, Optional
 import docker
 from models import AgentStatus
 from utils.helpers import parse_iso_timestamp, utc_now
+from services.platform_package_service import PLATFORM_PACKAGES_LABEL, parse_platform_package_label
 
 logger = logging.getLogger(__name__)
 
@@ -28,6 +30,16 @@ try:
 except Exception as e:
     print(f"Warning: Could not connect to Docker: {e}")
     docker_client = None
+
+
+def get_agent_ssh_port_binding(port: int):
+    """Return host-bound Docker SDK port binding for agent SSH.
+
+    VPS deployments should bind agent SSH to a private interface, not 0.0.0.0.
+    Set AGENT_SSH_BIND_HOST to the Tailscale IP when remote SSH access is needed.
+    """
+    bind_host = os.getenv("AGENT_SSH_BIND_HOST", "").strip() or "127.0.0.1"
+    return (bind_host, port)
 
 
 def get_agent_container(name: str):
@@ -114,7 +126,8 @@ def get_agent_status_from_container(container) -> AgentStatus:
         container_id=container.id,
         template=labels.get("trinity.template", None) or None,
         runtime=runtime,
-        base_image_version=base_image_version
+        base_image_version=base_image_version,
+        platform_packages=parse_platform_package_label(labels.get(PLATFORM_PACKAGES_LABEL)),
     )
 
 
@@ -190,6 +203,7 @@ def list_all_agents_fast() -> List[AgentStatus]:
                 # in every fast-path view (#1187 review I6).
                 runtime=labels.get("trinity.agent-runtime", "claude-code"),
                 base_image_version=labels.get("trinity.base-image-version"),  # Label only, no image lookup
+                platform_packages=parse_platform_package_label(labels.get(PLATFORM_PACKAGES_LABEL)),
             )
             agents.append(agent)
 

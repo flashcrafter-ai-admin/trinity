@@ -28,9 +28,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-server \
     jq \
     unzip \
+    chromium \
+    fonts-liberation \
+    fonts-noto-color-emoji \
+    xdg-utils \
     && rm -rf /var/lib/apt/lists/*
 
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && \
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y nodejs && \
     rm -rf /var/lib/apt/lists/*
 
@@ -55,7 +59,14 @@ RUN npm install -g @google/gemini-cli
 # breaking Codex release can't silently change the agent runtime. The npm
 # package resolves the platform-specific Rust binary via optional deps;
 # the linux-x64 build lands here. Bump deliberately after testing.
-RUN npm install -g @openai/codex@0.139.0
+RUN npm install -g @openai/codex@latest
+
+# Browser automation support for Tom: Playwright uses the system Chromium
+# package above so rebuilds do not download a second browser binary.
+ENV NODE_PATH=/usr/lib/node_modules
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
+ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
+RUN npm install -g playwright@latest
 
 RUN useradd -m -s /bin/bash -u 1000 developer && \
     echo "developer:developer" | chpasswd && \
@@ -67,7 +78,8 @@ RUN mkdir /var/run/sshd && \
     sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config && \
     sed -i 's/#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
 
-RUN mkdir -p /home/developer/.ssh /home/developer/.config /home/developer/mcp-servers && \
+RUN mkdir -p /home/developer/.ssh /home/developer/.config /home/developer/mcp-servers \
+    /home/developer/.agent-browser/profiles/fc-agency-tom && \
     chown -R developer:developer /home/developer
 
 ENV PATH="/usr/local/go/bin:$PATH"
