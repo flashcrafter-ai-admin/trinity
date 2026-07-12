@@ -2383,6 +2383,30 @@ async def terminate_agent_execution(
         execution_id: The execution ID to terminate (same as database execution ID)
         task_execution_id: Optional override for database execution ID (defaults to execution_id)
     """
+    connector_agent = (
+        current_user.connector_agent
+        if isinstance(getattr(current_user, "connector_agent", None), str)
+        else None
+    )
+    connector_execution = None
+    if connector_agent:
+        if connector_agent != name:
+            raise HTTPException(
+                status_code=403,
+                detail="Connector key is scoped to a different agent",
+            )
+        if task_execution_id is not None and task_execution_id != execution_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Connector cancellation requires matching execution identifiers",
+            )
+        try:
+            connector_execution = db.get_execution(execution_id)
+        except Exception:
+            connector_execution = None
+        if not connector_execution or getattr(connector_execution, "agent_name", None) != name:
+            raise HTTPException(status_code=404, detail="Execution not found")
+
     # execution_id is now the database execution ID (passed through to agent process registry)
     # Fall back to using execution_id for DB update if task_execution_id not separately provided
     if not task_execution_id:
@@ -2391,7 +2415,7 @@ async def terminate_agent_execution(
     # BACKLOG-001: If the execution is still queued in the backlog, cancel it
     # directly — no container interaction needed, no slot to release.
     try:
-        _exec_row = db.get_execution(task_execution_id)
+        _exec_row = connector_execution or db.get_execution(task_execution_id)
     except Exception:
         _exec_row = None
     if _exec_row and _exec_row.status == TaskExecutionStatus.QUEUED:
