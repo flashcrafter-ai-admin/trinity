@@ -105,6 +105,16 @@ class TestCentralGuard:
         u = self._call(patched, _fake_request("POST", "/api/agents/agent-1/chat"))
         assert u.connector_agent == "agent-1"
 
+    def test_allows_bound_agent_execution_terminate(self, patched):
+        u = self._call(
+            patched,
+            _fake_request(
+                "POST",
+                "/api/agents/agent-1/executions/execution-123/terminate",
+            ),
+        )
+        assert u.connector_agent == "agent-1"
+
     def test_allows_bound_agent_playbooks(self, patched):
         u = self._call(patched, _fake_request("GET", "/api/agents/agent-1/connector/playbooks"))
         assert u.connector_agent == "agent-1"
@@ -115,12 +125,45 @@ class TestCentralGuard:
             self._call(patched, _fake_request("POST", "/api/agents/agent-2/chat"))
         assert exc.value.status_code == 403
 
-    def test_blocks_owner_endpoint_on_bound_agent(self, patched):
+    def test_blocks_other_agent_execution_terminate(self, patched):
         from fastapi import HTTPException
-        # An inline-checked endpoint on the bound agent (e.g. loops) is refused
-        # at the auth layer before any handler runs.
         with pytest.raises(HTTPException) as exc:
-            self._call(patched, _fake_request("POST", "/api/agents/agent-1/loops"))
+            self._call(
+                patched,
+                _fake_request(
+                    "POST",
+                    "/api/agents/agent-2/executions/execution-123/terminate",
+                ),
+            )
+        assert exc.value.status_code == 403
+
+    @pytest.mark.parametrize(
+        "method,path",
+        [
+            ("GET", "/api/agents/agent-1/executions/execution-123/terminate"),
+            ("POST", "/api/agents/agent-1/executions//terminate"),
+            ("POST", "/api/agents/agent-1/executions/execution-123/terminate/extra"),
+        ],
+    )
+    def test_blocks_non_exact_execution_terminate_shape(self, patched, method, path):
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as exc:
+            self._call(patched, _fake_request(method, path))
+        assert exc.value.status_code == 403
+
+    @pytest.mark.parametrize(
+        "method,path",
+        [
+            ("POST", "/api/agents/agent-1/loops"),
+            ("GET", "/api/users"),
+        ],
+    )
+    def test_blocks_privileged_endpoints(self, patched, method, path):
+        from fastapi import HTTPException
+        # Owner and role-gated endpoints are refused at the auth layer before
+        # any handler runs.
+        with pytest.raises(HTTPException) as exc:
+            self._call(patched, _fake_request(method, path))
         assert exc.value.status_code == 403
 
     def test_blocks_wrong_method(self, patched):

@@ -331,7 +331,8 @@ async def get_current_user(request: Request, token: str = Depends(oauth2_scheme)
             connector_agent = mcp_key_info.get("agent_name") if scope == "connector" else None
             if connector_agent:
                 # Central containment (ent#46): a connector key may reach ONLY
-                # its bound agent's chat + connector playbook list. Enforced here
+                # its bound agent's chat, execution termination, and connector
+                # playbook list. Enforced here
                 # at the single auth entry point — NOT only in the agent path-
                 # deps — so the many endpoints that do inline access checks (and
                 # resolve this principal to the owner) can't be reached by a
@@ -341,10 +342,26 @@ async def get_current_user(request: Request, token: str = Depends(oauth2_scheme)
                     ("POST", f"/api/agents/{connector_agent}/chat"),
                     ("GET", f"/api/agents/{connector_agent}/connector/playbooks"),
                 }
-                if (request.method.upper(), request.url.path) not in allowed:
+                path_parts = request.url.path.split("/")
+                is_bound_execution_terminate = (
+                    request.method.upper() == "POST"
+                    and len(path_parts) == 7
+                    and path_parts[1:3] == ["api", "agents"]
+                    and path_parts[3] == connector_agent
+                    and path_parts[4] == "executions"
+                    and bool(path_parts[5])
+                    and path_parts[6] == "terminate"
+                )
+                if (
+                    (request.method.upper(), request.url.path) not in allowed
+                    and not is_bound_execution_terminate
+                ):
                     raise HTTPException(
                         status_code=status.HTTP_403_FORBIDDEN,
-                        detail="Connector keys may only chat their bound agent and list its playbooks",
+                        detail=(
+                            "Connector keys may only chat or terminate executions on their "
+                            "bound agent and list its playbooks"
+                        ),
                     )
             return User(
                 id=user["id"],
