@@ -40,6 +40,11 @@ ensure_hex32_secret() {
 ensure_hex32_secret CREDENTIAL_ENCRYPTION_KEY
 ensure_hex32_secret SECRET_KEY
 ensure_hex32_secret INTERNAL_API_SECRET
+# AGENT_AUTH_SECRET (#1159): stable master from which the backend derives each
+# agent's in-container auth token. Same persist-once, never-rotate contract as
+# the three above — once set it must not change, or every agent's token would
+# shift and the running fleet would 401 until recreated.
+ensure_hex32_secret AGENT_AUTH_SECRET
 
 # ADMIN_PASSWORD has no sensible default — operator must choose. Fail fast
 # rather than booting into a state the operator can't log into. (#443)
@@ -128,24 +133,59 @@ ensure_data_path_ownership() {
 
 ensure_data_path_ownership
 
-# Issue #874: backend joins the host's `docker` group via compose's group_add
-# so UID 1000 can talk to /var/run/docker.sock. The group's GID varies by
-# distro (Debian/Ubuntu: 999, RHEL/Fedora: ~991, Arch: 990). Auto-detect on
-# Linux so RHEL hosts don't silently fail Docker SDK calls. macOS Docker
-# Desktop ignores group_add — fall through with the default.
+# Issue #874 / #1131: backend runs as UID 1000 (non-root) but still needs to
+# talk to /var/run/docker.sock, so compose joins it to the socket's group via
+# `group_add: ["${DOCKER_GID:-999}"]`. The GID it must join is the group that
+# owns the socket *as a container sees it*, which varies by runtime: a Linux
+# bind mount exposes the host `docker` group (Debian/Ubuntu 999, RHEL/Fedora
+# ~991, Arch 990); Docker Desktop / Colima / Rancher present it root-group-owned
+# (GID 0). The old code wrongly assumed Docker Desktop *ignores* group_add and
+# returned early on non-Linux, leaving the default 999 — Docker Desktop does
+# NOT ignore it, so the backend was denied socket access and the Agents page
+# silently showed "No agents" (#1131).
+#
+# So detect the value that is correct everywhere by probing the GID a throwaway
+# container sees on the very socket compose mounts. The probe is the PRIMARY
+# path on every runtime: a host-side `getent group docker` only sees the host
+# docker group and silently mis-detects whenever the in-container socket GID
+# differs from it — not just non-Linux, but Linux Docker Desktop / rootless /
+# Colima too (all present the socket root-group-owned, GID 0, while a `docker`
+# group may still exist on the host at some other GID). On a native Linux daemon
+# the bind mount preserves the host docker-group GID, so the probe returns the
+# same value `getent` would; `getent` survives only as the offline Linux
+# fallback for when the probe can't run (daemon down, alpine unpullable, or
+# SELinux denies the socket bind). An explicit DOCKER_GID=<n> in .env always
+# wins (no probe). Note: by the time this runs the daemon must be up anyway —
+# the base-image check and `compose up` below both require it — so the probe's
+# daemon dependency costs nothing the rest of start.sh doesn't already need.
+_probe_docker_gid() {
+    # GID of /var/run/docker.sock as a container sees it — the value the backend
+    # must join. Uses the same host socket path compose mounts, so it introduces
+    # no new assumption. `stat -c` is supported by both alpine and busybox; tr
+    # strips the trailing newline and any non-digit noise. The pipe makes the
+    # function exit 0 even when the daemon is down, so `set -e` never trips here.
+    docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+        alpine stat -c '%g' /var/run/docker.sock 2>/dev/null | tr -dc '0-9'
+}
 ensure_docker_gid() {
-    if [ "$(uname -s)" != "Linux" ]; then
-        return 0
-    fi
-    if grep -qE '^DOCKER_GID=[0-9]+' .env 2>/dev/null; then
-        return 0
-    fi
+    # Respect an explicit override — any DOCKER_GID=<digits>, including 0.
+    grep -qE '^DOCKER_GID=[0-9]+' .env 2>/dev/null && return 0
+    # Probe FIRST — it reads the GID the backend container will actually see on
+    # the socket compose mounts, so it is correct on every runtime (Docker
+    # Desktop / Colima / rootless → 0; native Linux daemon → host docker GID).
     local detected
-    detected=$(getent group docker 2>/dev/null | cut -d: -f3)
+    detected=$(_probe_docker_gid)
+    # Offline Linux fallback only when the probe couldn't run (daemon down,
+    # alpine unpullable, SELinux denied the bind): on a Linux bind mount the
+    # host docker-group GID is the best available guess. Non-Linux has no
+    # offline fallback — warn below.
+    if [ -z "$detected" ] && [ "$(uname -s)" = "Linux" ]; then
+        detected=$(getent group docker 2>/dev/null | cut -d: -f3)
+    fi
     if [ -z "$detected" ]; then
-        echo "WARNING: no 'docker' group on host. Backend may fail to reach docker.sock."
-        echo "         Add a DOCKER_GID=<gid> override to .env if your daemon socket is"
-        echo "         group-owned by a different group."
+        echo "WARNING: could not determine docker.sock group GID (daemon down or probe"
+        echo "         image unavailable). Set DOCKER_GID=<gid> in .env (Docker Desktop: 0)"
+        echo "         and re-run. Compose falls back to 999 (Debian/Ubuntu default)."
         return 0
     fi
     if grep -qE '^DOCKER_GID=$' .env 2>/dev/null; then
@@ -153,7 +193,7 @@ ensure_docker_gid() {
     else
         echo "DOCKER_GID=${detected}" >> .env
     fi
-    echo "Auto-detected DOCKER_GID=${detected} (Linux docker group)"
+    echo "Set DOCKER_GID=${detected} (docker.sock in-container group)"
 }
 
 ensure_docker_gid
@@ -186,6 +226,31 @@ if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
     export VERSION="${_base_ver}+g${_short_sha}"
 fi
 export BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# --- Docker Desktop Vector log-source fix (#1432) -----------------------------
+# On Docker Desktop / VM-based Docker runtimes, Vector's default `docker_logs`
+# source busy-loops and pegs the Docker VM at ~4 cores. Swap it for an on-disk
+# file source via docker-compose.override.yml (auto-merged by `docker compose up`).
+# Native Linux dockerd is unaffected. Opt out: TRINITY_LOCAL_LOG_SOURCE=docker.
+# Force on: TRINITY_LOCAL_LOG_SOURCE=file. Default: auto-detect Docker Desktop.
+_log_src="${TRINITY_LOCAL_LOG_SOURCE:-auto}"
+if [ "$_log_src" = "auto" ]; then
+    if docker info 2>/dev/null | grep -qi 'Docker Desktop'; then
+        _log_src=file
+    else
+        _log_src=docker
+    fi
+fi
+if [ "$_log_src" = "file" ]; then
+    if [ ! -f docker-compose.override.yml ]; then
+        cp docker-compose.override.example.yml docker-compose.override.yml
+        echo "Docker Desktop detected → using the on-disk Vector log source (#1432)."
+        echo "  Created docker-compose.override.yml. To opt out: delete it, or set"
+        echo "  TRINITY_LOCAL_LOG_SOURCE=docker. Local logs land in /data/logs/local-*.json;"
+        echo "  prefer 'docker compose logs -f <service>' to tail a single service."
+    fi
+fi
+# -----------------------------------------------------------------------------
 
 echo "Starting services..."
 docker compose up -d

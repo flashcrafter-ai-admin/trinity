@@ -20,7 +20,8 @@ import httpx
 
 from database import db
 from models import AgentPropagationStatus, GithubPatPropagationResult
-from services.docker_service import list_all_agents_fast
+from services.agent_auth import build_agent_auth_headers
+from services.docker_service import list_all_agents_fast, get_agent_container
 
 logger = logging.getLogger(__name__)
 
@@ -55,45 +56,106 @@ def _env_has_github_pat(env_content: str) -> bool:
     return bool(_GITHUB_PAT_LINE_RE.search(env_content))
 
 
+async def _apply_pat_to_env(
+    client: httpx.AsyncClient,
+    agent_name: str,
+    base_url: str,
+    pat: str,
+    *,
+    add_if_missing: bool,
+) -> str:
+    """Read an agent's ``.env``, patch the ``GITHUB_PAT`` line, write it back.
+
+    Shared by the global-PAT path (:func:`_propagate_to_agent`, ``add_if_missing
+    =False`` — skip agents that never set up a token) and the per-agent path
+    (:func:`propagate_pat_to_single_agent`, ``add_if_missing=True`` — the #1264
+    case is a container with no ``GITHUB_PAT`` line yet). Returns ``"updated"`` or
+    ``"skipped_no_pat"``; raises httpx errors for the caller to classify.
+    """
+    read_resp = await client.get(
+        f"{base_url}/api/credentials/read",
+        params={"paths": ".env"},
+        timeout=AGENT_HTTP_TIMEOUT_SECONDS,
+        headers=build_agent_auth_headers(agent_name),
+    )
+    read_resp.raise_for_status()
+    env_content = read_resp.json().get("files", {}).get(".env")
+
+    if env_content is None:
+        if not add_if_missing:
+            return "skipped_no_pat"
+        env_content = ""
+    elif not _env_has_github_pat(env_content) and not add_if_missing:
+        return "skipped_no_pat"
+
+    patched = _patch_env_github_pat(env_content, pat)
+    inject_resp = await client.post(
+        f"{base_url}/api/credentials/inject",
+        json={"files": {".env": patched}},
+        timeout=AGENT_HTTP_TIMEOUT_SECONDS,
+        headers=build_agent_auth_headers(agent_name),
+    )
+    inject_resp.raise_for_status()
+    return "updated"
+
+
+async def propagate_pat_to_single_agent(agent_name: str, pat: str) -> dict:
+    """Push a newly-set per-agent PAT into a running container with no restart (#1264).
+
+    Adds the ``GITHUB_PAT`` line when absent (the #1264 case is a container
+    created without any token) and re-templates the live git remote so the frozen
+    empty-password remote is fixed immediately and fetch/push work. The live git
+    process authenticates from the remote URL (not the env var), so
+    ``remote_updated`` is the load-bearing part of the immediate fix; the ``.env``
+    write only takes effect on the next restart.
+
+    Best-effort and non-fatal: a stopped agent picks the PAT up on next start via
+    the relaxed lifecycle injection + the startup.sh self-heal. Returns a small
+    status dict for the set-PAT API response.
+    """
+    from services import git_service
+
+    # #1264 review: query the single container instead of enumerating the fleet.
+    # get_agent_container is a module-level import (above) so it's patchable as a
+    # stable module global, not resolved from sys.modules at call time.
+    container = get_agent_container(agent_name)
+    if container is None or container.status != "running":
+        return {"applied": False, "reason": "agent_not_running"}
+
+    env_updated = False
+    base_url = f"http://agent-{agent_name}:8000"
+    async with httpx.AsyncClient(timeout=AGENT_HTTP_TIMEOUT_SECONDS) as client:
+        try:
+            await _apply_pat_to_env(client, agent_name, base_url, pat, add_if_missing=True)
+            env_updated = True
+        except (httpx.HTTPStatusError, httpx.RequestError) as e:
+            logger.warning("single-agent PAT .env inject failed for %s: %s", agent_name, e)
+
+    # Re-template the live remote so an existing clone picks up the token now.
+    git_config = db.get_git_config(agent_name)
+    github_repo = git_config.github_repo if git_config else None
+    remote_updated = (
+        await git_service.update_remote_pat(agent_name, pat, github_repo)
+        if github_repo else False
+    )
+
+    return {
+        "applied": env_updated or remote_updated,
+        "env_updated": env_updated,
+        "remote_updated": remote_updated,
+    }
+
+
 async def _propagate_to_agent(
     agent_name: str,
     new_pat: str,
     client: httpx.AsyncClient,
 ) -> AgentPropagationStatus:
-    """Read .env from one agent, patch GITHUB_PAT, write it back."""
+    """Read .env from one agent, patch GITHUB_PAT, write it back (global-PAT path)."""
     base_url = f"http://agent-{agent_name}:8000"
     try:
-        read_resp = await client.get(
-            f"{base_url}/api/credentials/read",
-            params={"paths": ".env"},
-            timeout=AGENT_HTTP_TIMEOUT_SECONDS,
-        )
-        read_resp.raise_for_status()
-        env_content = read_resp.json().get("files", {}).get(".env")
-
-        if env_content is None:
-            return AgentPropagationStatus(
-                agent_name=agent_name,
-                status="skipped_no_pat",
-            )
-
-        if not _env_has_github_pat(env_content):
-            return AgentPropagationStatus(
-                agent_name=agent_name,
-                status="skipped_no_pat",
-            )
-
-        patched = _patch_env_github_pat(env_content, new_pat)
-
-        inject_resp = await client.post(
-            f"{base_url}/api/credentials/inject",
-            json={"files": {".env": patched}},
-            timeout=AGENT_HTTP_TIMEOUT_SECONDS,
-        )
-        inject_resp.raise_for_status()
-
-        return AgentPropagationStatus(agent_name=agent_name, status="updated")
-
+        status = await _apply_pat_to_env(client, agent_name, base_url, new_pat, add_if_missing=False)
+        return AgentPropagationStatus(agent_name=agent_name, status=status)
     except httpx.HTTPStatusError as e:
         error = f"agent returned {e.response.status_code}: {e.response.text[:200]}"
         logger.warning("GITHUB_PAT propagation failed for %s: %s", agent_name, error)

@@ -124,7 +124,9 @@ class MonitoringOperations:
         limit: int = 100
     ) -> List[Dict]:
         """Get health check history for an agent."""
-        since = (datetime.utcnow() - timedelta(hours=hours)).isoformat() + "Z"
+        # #1265 / Invariant #16: compare ISO-Z columns against an iso_cutoff()
+        # value, not datetime.utcnow() (whose format breaks lexicographic order).
+        since = iso_cutoff(hours)
 
         stmt = (
             select(agent_health_checks)

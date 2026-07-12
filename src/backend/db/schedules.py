@@ -18,6 +18,7 @@ from sqlalchemy import select, insert, update, delete, and_, or_, func, text, ca
 from sqlalchemy.exc import IntegrityError
 
 from .engine import get_engine
+from .query_helpers import latest_per_group
 from .tables import (
     agent_schedules,
     schedule_executions,
@@ -29,6 +30,20 @@ from models import TaskExecutionStatus
 from utils.helpers import iso_cutoff, utc_now_iso, to_utc_iso, parse_iso_timestamp
 
 logger = logging.getLogger(__name__)
+
+
+def _norm_ts(value: Optional[str]) -> Optional[str]:
+    """Normalize a stored ISO timestamp to UTC with an explicit 'Z' suffix (#1474).
+
+    Summary/list readers return raw ``dict(row)`` values straight from the DB.
+    A scheduler-written naive string (no offset) then serializes naive out of
+    Pydantic, and JS ``new Date(naive)`` parses it as *local* time — shifting
+    the row by the viewer's UTC offset. ``parse_iso_timestamp`` assumes UTC for
+    naive strings (matching every Python read path), and ``to_utc_iso`` re-emits
+    the 'Z' form the already-correct sibling readers produce. None passes through.
+    """
+    return to_utc_iso(parse_iso_timestamp(value)) if value else None
+
 
 # Cap on rows fed into percentile compute and tool-call aggregation
 # (#868). Counts and the daily timeline always use the unsampled rowset;
@@ -64,6 +79,31 @@ _OTHER_BUCKET = "Other"
 def _bucket_for_trigger(trigger: Optional[str]) -> str:
     """Map a raw `triggered_by` value to its user-facing bucket (#1107)."""
     return _TRIGGER_BUCKETS.get(trigger or "", _OTHER_BUCKET)
+
+
+# #1115: max chars for the per-schedule "command" label derived from a
+# schedule's message (the Overview/Schedules-tab scorecard headline).
+_SCHEDULE_LABEL_MAX = 80
+
+
+def _schedule_command_label(message: Optional[str]) -> str:
+    """Short headline for a schedule's scorecard, derived from its message.
+
+    Uses the first non-empty line (the command/intent, e.g. ``/do-something``),
+    collapsed and truncated. Empty when the message is blank — the frontend
+    falls back to the schedule name.
+    """
+    if not message:
+        return ""
+    for line in message.splitlines():
+        stripped = line.strip()
+        if stripped:
+            return (
+                stripped[: _SCHEDULE_LABEL_MAX - 1] + "…"
+                if len(stripped) > _SCHEDULE_LABEL_MAX
+                else stripped
+            )
+    return ""
 
 
 # #73: chunk size for scoped `IN (...)` lookups. SQLite caps host parameters at
@@ -158,6 +198,9 @@ class ScheduleOperations:
             # Webhook trigger (WEBHOOK-001 / #647 follow-up)
             webhook_enabled=bool(row["webhook_enabled"]) if "webhook_enabled" in row_keys and row["webhook_enabled"] is not None else False,
             webhook_token=row["webhook_token"] if "webhook_token" in row_keys else None,
+            # ent#77: signature-auth fields (graceful default for pre-migration rows)
+            webhook_auth_enabled=bool(row["webhook_auth_enabled"]) if "webhook_auth_enabled" in row_keys and row["webhook_auth_enabled"] is not None else False,
+            webhook_secret_encrypted=row["webhook_secret_encrypted"] if "webhook_secret_encrypted" in row_keys else None,
         )
 
     @staticmethod
@@ -254,6 +297,20 @@ class ScheduleOperations:
 
         # Check user has access to this agent
         if not self._agent_ops.can_user_access_agent(username, agent_name):
+            return None
+
+        # #1445: no-orphan invariant enforced at the actual chokepoint.
+        # `can_user_access_agent` returns True unconditionally for admins with
+        # no existence check, so without this guard an admin could mint a
+        # schedule (and a real webhook token) on a never-created agent — whose
+        # token then 404s deterministically at `get_schedule_by_webhook_token`
+        # (INNER JOIN on agent_ownership, #1423). Refuse creation on an agent
+        # with no live ownership row so the invariant holds for every caller
+        # (router, MCP, system-manifest deploy, future/internal). The router
+        # maps this `None` to 403. Safe for the one direct caller today —
+        # system-manifest deploy creates the agent (register_agent_owner)
+        # before its schedules.
+        if not self._agent_ops.is_agent_live(agent_name):
             return None
 
         schedule_id = self._generate_id()
@@ -798,18 +855,45 @@ class ScheduleOperations:
             result = conn.execute(
                 update(agent_schedules)
                 .where(agent_schedules.c.id == schedule_id)
-                .values(webhook_token=token, webhook_enabled=1, updated_at=now)
+                # ent#77: rotating the URL is a credential-rotation event — reset
+                # any prior signing secret so a leaked old secret can't sign for
+                # the new token. The caller re-enables signing explicitly.
+                .values(
+                    webhook_token=token,
+                    webhook_enabled=1,
+                    webhook_secret_encrypted=None,
+                    webhook_auth_enabled=0,
+                    updated_at=now,
+                )
             )
             if result.rowcount == 0:
                 return None
         return token
 
     def get_schedule_by_webhook_token(self, token: str) -> Optional[Schedule]:
-        """Look up a schedule by its webhook token (O(1) via index)."""
-        stmt = select(agent_schedules).where(
-            and_(
-                agent_schedules.c.webhook_token == token,
-                agent_schedules.c.deleted_at.is_(None),
+        """Look up a schedule by its webhook token (O(1) via index).
+
+        Applies the same two soft-delete filters as `list_all_enabled_schedules`
+        (#834, #1423): skip a soft-deleted *schedule* (`agent_schedules.deleted_at`)
+        AND a schedule whose *agent* is soft-deleted (`agent_ownership.deleted_at`).
+        Without the agent join, a webhook could still fire a schedule of a
+        soft-deleted (recoverable) agent during the retention window — the exact
+        hole the cron path guards against.
+        """
+        stmt = (
+            select(agent_schedules)
+            .select_from(
+                agent_schedules.join(
+                    agent_ownership,
+                    agent_ownership.c.agent_name == agent_schedules.c.agent_name,
+                )
+            )
+            .where(
+                and_(
+                    agent_schedules.c.webhook_token == token,
+                    agent_schedules.c.deleted_at.is_(None),
+                    agent_ownership.c.deleted_at.is_(None),
+                )
             )
         )
         with get_engine().connect() as conn:
@@ -830,21 +914,100 @@ class ScheduleOperations:
             return result.rowcount > 0
 
     def revoke_webhook_token(self, schedule_id: str) -> bool:
-        """Revoke a webhook token, immediately invalidating the URL."""
+        """Revoke a webhook token, immediately invalidating the URL.
+
+        ent#77: also clears the signing secret + auth flag — a revoked webhook
+        must not leave a live secret behind, and a re-minted token should start
+        auth-off (the caller re-enables signing explicitly).
+        """
         now = utc_now_iso()
         with get_engine().begin() as conn:
             result = conn.execute(
                 update(agent_schedules)
                 .where(agent_schedules.c.id == schedule_id)
-                .values(webhook_token=None, webhook_enabled=0, updated_at=now)
+                .values(
+                    webhook_token=None,
+                    webhook_enabled=0,
+                    webhook_secret_encrypted=None,
+                    webhook_auth_enabled=0,
+                    updated_at=now,
+                )
+            )
+            return result.rowcount > 0
+
+    # ---- ent#77: webhook signature-auth secret --------------------------------
+
+    @staticmethod
+    def _encrypt_webhook_secret(secret: str) -> str:
+        from services.credential_encryption import get_credential_encryption_service
+        from services.webhook_signature import SECRET_ENVELOPE_KEY
+        return get_credential_encryption_service().encrypt({SECRET_ENVELOPE_KEY: secret})
+
+    @staticmethod
+    def _decrypt_webhook_secret(encrypted: Optional[str]) -> Optional[str]:
+        if not encrypted:
+            return None
+        try:
+            from services.credential_encryption import get_credential_encryption_service
+            from services.webhook_signature import SECRET_ENVELOPE_KEY
+            return get_credential_encryption_service().decrypt(encrypted).get(SECRET_ENVELOPE_KEY)
+        except Exception as e:
+            logger.error(f"Failed to decrypt webhook secret: {e}")
+            return None
+
+    def set_webhook_secret(self, schedule_id: str) -> Optional[str]:
+        """Mint (or rotate) the HMAC signing secret and enable signature auth.
+
+        Returns the PLAINTEXT secret exactly once (the caller surfaces it to the
+        user and never persists it in the clear); only the AES-256-GCM envelope
+        is stored. Returns None if the schedule row is gone. Requires an existing
+        webhook token — signature auth on a schedule with no webhook is a no-op,
+        so the router gates on `has_token` first.
+        """
+        secret = "whsec_" + secrets.token_urlsafe(32)
+        encrypted = self._encrypt_webhook_secret(secret)
+        now = utc_now_iso()
+        with get_engine().begin() as conn:
+            result = conn.execute(
+                update(agent_schedules)
+                .where(
+                    and_(
+                        agent_schedules.c.id == schedule_id,
+                        agent_schedules.c.webhook_token.isnot(None),
+                    )
+                )
+                .values(
+                    webhook_secret_encrypted=encrypted,
+                    webhook_auth_enabled=1,
+                    updated_at=now,
+                )
+            )
+            if result.rowcount == 0:
+                return None
+        return secret
+
+    def clear_webhook_secret(self, schedule_id: str) -> bool:
+        """Disable signature auth and drop the stored secret (webhook stays live)."""
+        now = utc_now_iso()
+        with get_engine().begin() as conn:
+            result = conn.execute(
+                update(agent_schedules)
+                .where(agent_schedules.c.id == schedule_id)
+                .values(
+                    webhook_secret_encrypted=None,
+                    webhook_auth_enabled=0,
+                    updated_at=now,
+                )
             )
             return result.rowcount > 0
 
     def get_webhook_status(self, schedule_id: str) -> Optional[Dict]:
-        """Return webhook configuration for a schedule."""
+        """Return webhook configuration for a schedule (never the secret)."""
         stmt = select(
             agent_schedules.c.webhook_token,
             agent_schedules.c.webhook_enabled,
+            agent_schedules.c.webhook_auth_enabled,
+            agent_schedules.c.webhook_secret_encrypted,
         ).where(
             and_(
                 agent_schedules.c.id == schedule_id,
@@ -859,6 +1022,9 @@ class ScheduleOperations:
             "webhook_token": row["webhook_token"],
             "webhook_enabled": bool(row["webhook_enabled"]),
             "has_token": row["webhook_token"] is not None,
+            # ent#77 — surface the auth STATE only, never the secret material
+            "auth_enabled": bool(row["webhook_auth_enabled"]),
+            "has_secret": row["webhook_secret_encrypted"] is not None,
         }
 
     # =========================================================================
@@ -1000,7 +1166,9 @@ class ScheduleOperations:
             subscription_id=subscription_id,
         )
 
-    def mark_execution_dispatched(self, execution_id: str) -> bool:
+    def mark_execution_dispatched(
+        self, execution_id: str, async_dispatch: bool = False
+    ) -> bool:
         """Mark an execution as dispatched to the agent.
 
         Sets claude_session_id to 'dispatched' so the no-session cleanup
@@ -1008,9 +1176,19 @@ class ScheduleOperations:
         Only executions that never reach dispatch (e.g. backend crash before
         agent call) will have NULL claude_session_id and be caught by cleanup.
 
+        #1083 fire-and-forget: when ``async_dispatch`` is True the sentinel is
+        ``'dispatched_async'`` instead. This is the **durable async marker** the
+        result-callback endpoint gates on (fail-closed): the callback may only
+        finalize a RUNNING row carrying ``'dispatched_async'``, so it can never
+        terminal-write a sync/interactive execution the backend is mid-await on
+        (Codex #3 / decision 2). Both sentinels are non-NULL/non-empty, so the
+        no-session sweep (``mark_no_session_executions_failed``) and the #106 /
+        E-05 "running row has a session" canary treat them identically.
+
         Returns:
             True if execution was updated, False if not found.
         """
+        sentinel = "dispatched_async" if async_dispatch else "dispatched"
         with get_engine().begin() as conn:
             result = conn.execute(
                 update(schedule_executions)
@@ -1021,7 +1199,7 @@ class ScheduleOperations:
                         schedule_executions.c.claude_session_id.is_(None),
                     )
                 )
-                .values(claude_session_id="dispatched")
+                .values(claude_session_id=sentinel)
             )
             return result.rowcount > 0
 
@@ -1044,12 +1222,25 @@ class ScheduleOperations:
             queued_at: ISO timestamp (used as the FIFO ordering key).
 
         Returns:
-            True if the row was updated, False if not found.
+            True if the row was moved to QUEUED, False if it is missing or no
+            longer RUNNING. The ``status == RUNNING`` precondition makes this a
+            CAS-guarded projection write (#1082): a stale or duplicate re-queue
+            against an already-terminal row is rejected, so a terminal row can
+            never be resurrected into QUEUED (the E-02 phantom-reversal class).
         """
         with get_engine().begin() as conn:
             result = conn.execute(
                 update(schedule_executions)
-                .where(schedule_executions.c.id == execution_id)
+                .where(
+                    and_(
+                        schedule_executions.c.id == execution_id,
+                        # Only a currently-running row (the state set by
+                        # create_task_execution before the slot acquire failed)
+                        # may spill into the backlog — mirrors the sibling
+                        # release_claim_to_queued guard (#1082).
+                        schedule_executions.c.status == TaskExecutionStatus.RUNNING,
+                    )
+                )
                 .values(
                     status=TaskExecutionStatus.QUEUED,
                     queued_at=queued_at,
@@ -1390,6 +1581,56 @@ class ScheduleOperations:
                 for row in conn.execute(stmt).mappings()
             ]
 
+    def get_latest_execution_per_schedule(self, schedule_ids: List[str]) -> Dict[str, Dict]:
+        """Return the most-recent execution per schedule, in one query.
+
+        #1265: replaces the per-schedule ``get_schedule_executions(id, limit=5)``
+        fan-out on the /api/ops/schedules dashboard endpoint (one query per
+        schedule -> N+1 that grows with total schedule count). Uses the shared
+        ``latest_per_group`` window helper (partition by schedule_id, order by
+        started_at DESC).
+
+        Projects ONLY the columns the dashboard's ``last_execution`` block needs
+        — never the large TEXT blobs (``response``, ``execution_log``,
+        ``tool_calls``, ``message``) — so the single bulk query stays light even
+        with hundreds of schedules. Returns ``{schedule_id: {id, status,
+        started_at, completed_at, duration_ms, error}}``; ``started_at`` /
+        ``completed_at`` are normalised to ISO strings (matching the prior
+        ``.isoformat()`` API output). Schedules with no executions are absent.
+        """
+        cols = (
+            schedule_executions.c.schedule_id,
+            schedule_executions.c.id,
+            schedule_executions.c.status,
+            schedule_executions.c.started_at,
+            schedule_executions.c.completed_at,
+            schedule_executions.c.duration_ms,
+            schedule_executions.c.error,
+        )
+        rows = latest_per_group(
+            cols,
+            schedule_executions.c.schedule_id,   # partition
+            schedule_executions.c.started_at,    # order (DESC)
+            schedule_executions.c.schedule_id,   # filter IN
+            schedule_ids,
+        )
+
+        def _iso(v):
+            ts = parse_iso_timestamp(v) if v else None
+            return ts.isoformat() if ts else None
+
+        return {
+            row["schedule_id"]: {
+                "id": row["id"],
+                "status": row["status"],
+                "started_at": _iso(row["started_at"]),
+                "completed_at": _iso(row["completed_at"]),
+                "duration_ms": row["duration_ms"],
+                "error": row["error"],
+            }
+            for row in rows
+        }
+
     def get_agent_executions(self, agent_name: str, limit: int = 50) -> List[ScheduleExecution]:
         """Get all executions for an agent across all schedules."""
         stmt = (
@@ -1448,7 +1689,16 @@ class ScheduleOperations:
             .limit(limit)
         )
         with get_engine().connect() as conn:
-            return [dict(row) for row in conn.execute(stmt).mappings()]
+            rows = []
+            for row in conn.execute(stmt).mappings():
+                d = dict(row)
+                # #1474: normalize naive scheduler-written timestamps to UTC 'Z'
+                # so the ExecutionSummary response never serializes naive (the
+                # reported TasksPanel relative-time shift).
+                d["started_at"] = _norm_ts(d.get("started_at"))
+                d["completed_at"] = _norm_ts(d.get("completed_at"))
+                rows.append(d)
+            return rows
 
     def get_execution(self, execution_id: str) -> Optional[ScheduleExecution]:
         """Get a specific execution by ID."""
@@ -1810,6 +2060,170 @@ class ScheduleOperations:
             "sample_size": sample_size,
         }
 
+    def get_agent_schedules_summary(self, agent_name: str, hours: int) -> Dict:
+        """Per-schedule performance rollups for an agent over a window (#1115).
+
+        ONE row per non-deleted schedule (zero-run schedules included, with
+        zeros), so both the Overview "Schedules performance" section and the
+        Schedules-tab inline stats render from a single call — no N per-schedule
+        round-trips. The #868 deep view stays the drill-in target.
+
+        Per schedule: terminal **success_rate** (success / (success + failed
+        [incl. ``error``]); ``None`` when zero terminal runs so the UI shows
+        ``—`` not a false 0%), **avg_duration_ms** (NULL-skipping AVG),
+        **cost_total**, **context_avg** (NULL-skipping), **tool_call_total**,
+        and last-run outcome. Read-only / DB-sourced (renders when stopped).
+
+        Tool-call totals are parsed from the newest ``_PERCENTILE_ROWSET_CAP``
+        rows agent-wide (matches the #868 sampling discipline); ``tool_calls_
+        sampled`` flags when that cap was hit. Window uses ``iso_cutoff``
+        (Invariant #16).
+        """
+        cutoff = iso_cutoff(hours)
+        cap = _PERCENTILE_ROWSET_CAP
+        FAILED_STATES = (TaskExecutionStatus.FAILED, "error")
+
+        # #300/#1115: ported to SQLAlchemy Core so the summary works on both
+        # SQLite and PostgreSQL (the earlier raw-sqlite path NameError'd on the
+        # dropped get_db_connection import, and the bare-column-with-MAX last-run
+        # trick is SQLite-only — replaced by a portable ROW_NUMBER window below).
+        se = schedule_executions.c
+        sch = agent_schedules.c
+        base_where = and_(se.agent_name == agent_name, se.started_at > cutoff)
+
+        # Schedules (non-deleted) — the authoritative row set so a
+        # zero-run schedule still appears.
+        q_sched = (
+            select(sch.id, sch.name, sch.message, sch.cron_expression, sch.enabled)
+            .where(and_(sch.agent_name == agent_name, sch.deleted_at.is_(None)))
+            .order_by(sch.created_at.asc())
+        )
+
+        # One grouped aggregate for every schedule's executions in window.
+        # AVG skips NULLs natively, matching the prior CASE-wrapped AVG.
+        q_agg = (
+            select(
+                se.schedule_id,
+                func.count().label("total"),
+                func.sum(case((se.status == "success", 1), else_=0)).label("success_count"),
+                func.sum(case((se.status.in_(("failed", "error")), 1), else_=0)).label("failed_count"),
+                func.sum(case((se.status == "cancelled", 1), else_=0)).label("cancelled_count"),
+                func.sum(func.coalesce(se.cost, 0)).label("cost_total"),
+                func.avg(se.duration_ms).label("avg_duration_ms"),
+                func.avg(se.context_used).label("context_avg"),
+            )
+            .where(base_where)
+            .group_by(se.schedule_id)
+        )
+
+        # Last-run outcome per schedule — portable ROW_NUMBER window (replaces
+        # SQLite's bare-column-with-MAX, which errors on PostgreSQL) keeping the
+        # in-window semantics of the original query.
+        _last_rn = func.row_number().over(
+            partition_by=se.schedule_id, order_by=se.started_at.desc()
+        ).label("rn")
+        _last_subq = (
+            select(
+                se.schedule_id,
+                se.started_at.label("last_run_at"),
+                se.status.label("last_status"),
+                _last_rn,
+            )
+            .where(base_where)
+            .subquery()
+        )
+        q_last = select(
+            _last_subq.c.schedule_id,
+            _last_subq.c.last_run_at,
+            _last_subq.c.last_status,
+        ).where(_last_subq.c.rn == 1)
+
+        # Tool-call totals — bounded JSON parse over newest rows agent-wide
+        # (cap + 1 to detect sampling), attributed back per schedule.
+        q_tools = (
+            select(se.schedule_id, se.tool_calls)
+            .where(and_(base_where, se.tool_calls.isnot(None)))
+            .order_by(se.started_at.desc())
+            .limit(cap + 1)
+        )
+
+        with get_engine().connect() as conn:
+            schedule_rows = conn.execute(q_sched).mappings().all()
+            agg_by_sched = {r["schedule_id"]: r for r in conn.execute(q_agg).mappings().all()}
+            last_by_sched = {r["schedule_id"]: r for r in conn.execute(q_last).mappings().all()}
+            tool_rows = conn.execute(q_tools).mappings().all()
+
+        tool_calls_sampled = len(tool_rows) > cap
+        tool_total_by_sched: Dict[str, int] = defaultdict(int)
+        for row in tool_rows[:cap]:
+            raw = row["tool_calls"]
+            if not raw:
+                continue
+            try:
+                parsed = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(parsed, list):
+                continue
+            for entry in parsed:
+                if isinstance(entry, dict) and (entry.get("name") or entry.get("tool")):
+                    tool_total_by_sched[row["schedule_id"]] += 1
+
+        schedules: List[Dict] = []
+        for s in schedule_rows:
+            sid = s["id"]
+            agg = agg_by_sched.get(sid)
+            last = last_by_sched.get(sid)
+
+            if agg:
+                total = int(agg["total"] or 0)
+                success_count = int(agg["success_count"] or 0)
+                failed_count = int(agg["failed_count"] or 0)
+                cancelled_count = int(agg["cancelled_count"] or 0)
+                cost_total = round(float(agg["cost_total"] or 0.0), 4)
+                avg_duration_ms = (
+                    int(agg["avg_duration_ms"]) if agg["avg_duration_ms"] is not None else None
+                )
+                context_avg = (
+                    int(agg["context_avg"]) if agg["context_avg"] is not None else None
+                )
+            else:
+                total = success_count = failed_count = cancelled_count = 0
+                cost_total = 0.0
+                avg_duration_ms = context_avg = None
+
+            terminal = success_count + failed_count
+            success_rate = round(success_count / terminal, 4) if terminal else None
+
+            schedules.append({
+                "schedule_id": sid,
+                "name": s["name"],
+                "command": _schedule_command_label(s["message"]),
+                "cron_expression": s["cron_expression"],
+                "enabled": bool(s["enabled"]),
+                "total_executions": total,
+                "success_count": success_count,
+                "failed_count": failed_count,
+                "cancelled_count": cancelled_count,
+                "success_rate": success_rate,
+                "avg_duration_ms": avg_duration_ms,
+                "cost_total": cost_total,
+                "context_avg": context_avg,
+                "tool_call_total": tool_total_by_sched.get(sid, 0),
+                # #1474: normalize to UTC 'Z' — ScheduleSummaryRow.last_run_at is
+                # a str field, so a naive scheduler-written value would pass
+                # through unshifted and render wrong in a non-UTC browser.
+                "last_run_at": _norm_ts(last["last_run_at"]) if last else None,
+                "last_run_status": last["last_status"] if last else None,
+            })
+
+        return {
+            "window_hours": hours,
+            "schedule_count": len(schedules),
+            "tool_calls_sampled": tool_calls_sampled,
+            "schedules": schedules,
+        }
+
     def get_agent_analytics(self, agent_name: str, hours: int) -> Dict:
         """Compute agent-scoped execution analytics over a rolling window (#1107).
 
@@ -2123,6 +2537,24 @@ class ScheduleOperations:
             row = conn.execute(stmt).mappings().first()
         return self._row_to_git_config(row) if row else None
 
+    def get_git_config_agent_names_for_repo(self, github_repo: str) -> List[str]:
+        """Agent names whose git config binds ``github_repo`` (any branch/mode).
+
+        Fork-to-own creation guard (trinity-enterprise#93): source-mode rows
+        bypass the partial UNIQUE(github_repo, working_branch) index, so two
+        auto-pushing agents could otherwise bind the same destination repo.
+        NB: agent delete is a SOFT delete — the git-config row is cascaded only
+        at purge (retention default 180d), so a hit may name a soft-deleted
+        agent. That block is intentional: admin recovery (#834) would resurrect
+        the binding. Comparison is case-insensitive — GitHub repo slugs are.
+        """
+        stmt = select(agent_git_config.c.agent_name).where(
+            func.lower(agent_git_config.c.github_repo) == github_repo.lower()
+        )
+        with get_engine().connect() as conn:
+            rows = conn.execute(stmt).scalars().all()
+        return list(rows)
+
     def update_git_sync(self, agent_name: str, commit_sha: str) -> bool:
         """Update git sync timestamp and commit SHA after successful sync."""
         now = utc_now_iso()
@@ -2273,46 +2705,91 @@ class ScheduleOperations:
         with get_engine().connect() as conn:
             return [dict(row) for row in conn.execute(stmt).mappings()]
 
-    def mark_stale_executions_failed(self, timeout_minutes: int = 30) -> int:
-        """Mark running executions older than timeout as failed.
+    def mark_stale_executions_failed(
+        self,
+        timeout_minutes: int = 30,
+        agent_timeouts: Optional[Dict[str, int]] = None,
+        buffer_seconds: int = 0,
+    ) -> int:
+        """Mark running executions older than their stale window as failed.
 
         Uses TaskExecutionStatus.RUNNING / .FAILED for status values.
 
+        #1083 Finding 1: when ``agent_timeouts`` is provided the stale window is
+        **per agent** — ``agent_timeout + buffer_seconds`` — instead of a single
+        flat ``timeout_minutes``. The old flat 120-min window equalled the MAX
+        agent timeout with NO ``SLOT_TTL_BUFFER``, so this no-CAS/no-registry
+        sweep failed a legitimately-running max-timeout async turn ~5 min before
+        the slot reaper + canary E-01 (which use ``timeout + 300``). Matching the
+        reaper's window closes that early-fail. When ``agent_timeouts`` is None
+        the prior flat behaviour is reproduced exactly.
+
         Args:
-            timeout_minutes: Executions running longer than this are considered stale.
+            timeout_minutes: Flat fallback window (also the default for any agent
+                absent from ``agent_timeouts``).
+            agent_timeouts: ``{agent_name: execution_timeout_seconds}`` (e.g.
+                ``db.get_all_execution_timeouts()``). None → flat behaviour.
+            buffer_seconds: Added to each per-agent timeout (pass ``SLOT_TTL_BUFFER``
+                to match the slot reaper / E-01 window).
 
         Returns:
             Number of executions marked as failed.
         """
         now = utc_now_iso()
-        # Compute threshold in ISO 8601 format to match stored started_at
-        # (SQLite's datetime() returns space-separated format which breaks string comparison)
-        threshold = (datetime.now(timezone.utc) - timedelta(minutes=timeout_minutes)).strftime('%Y-%m-%dT%H:%M:%S')
-        error_msg = f"Marked as failed by cleanup: exceeded {timeout_minutes}-minute timeout"
+        completed_at = parse_iso_timestamp(now)
+        default_threshold_s = timeout_minutes * 60
+
+        # SQL pre-filter uses the SMALLEST per-agent window so no stale row is
+        # missed; Python then applies each row's precise per-agent window. ISO
+        # 8601 format matches stored started_at (SQLite's datetime() differs).
+        if agent_timeouts:
+            min_threshold_s = min(
+                [default_threshold_s] + [t + buffer_seconds for t in agent_timeouts.values()]
+            )
+        else:
+            min_threshold_s = default_threshold_s
+        prefilter = (
+            datetime.now(timezone.utc) - timedelta(seconds=min_threshold_s)
+        ).strftime('%Y-%m-%dT%H:%M:%S')
+
         with get_engine().begin() as conn:
-            # Find stale executions for duration calculation
-            stale_rows = conn.execute(
+            candidate_rows = conn.execute(
                 select(
                     schedule_executions.c.id,
                     schedule_executions.c.started_at,
+                    schedule_executions.c.agent_name,
                 ).where(
                     and_(
                         schedule_executions.c.status == TaskExecutionStatus.RUNNING,
-                        schedule_executions.c.started_at < threshold,
+                        schedule_executions.c.started_at < prefilter,
                     )
                 )
             ).mappings().all()
 
-            if not stale_rows:
+            if not candidate_rows:
                 return 0
 
-            completed_at = parse_iso_timestamp(now)
-            for row in stale_rows:
+            failed = 0
+            for row in candidate_rows:
                 started_at = parse_iso_timestamp(row["started_at"])
-                duration_ms = int((completed_at - started_at).total_seconds() * 1000)
+                age_s = (completed_at - started_at).total_seconds()
+                if agent_timeouts is not None:
+                    at = agent_timeouts.get(row["agent_name"])
+                    effective_s = (at + buffer_seconds) if at is not None else default_threshold_s
+                else:
+                    effective_s = default_threshold_s
+                # Decay-safe boundary: a row exactly AT its window survives; only
+                # strictly past it is swept (mirrors the canary E-01 tolerance).
+                if age_s <= effective_s:
+                    continue
+                duration_ms = int(age_s * 1000)
+                error_msg = (
+                    f"Marked as failed by cleanup: exceeded {int(effective_s)}s "
+                    f"stale timeout"
+                )
                 # RELIABILITY-005: guard the UPDATE so a SUCCESS that arrived
                 # between the SELECT and this UPDATE is never overwritten.
-                conn.execute(
+                result = conn.execute(
                     update(schedule_executions)
                     .where(
                         and_(
@@ -2327,8 +2804,10 @@ class ScheduleOperations:
                         error=error_msg,
                     )
                 )
+                if result.rowcount:
+                    failed += 1
 
-            return len(stale_rows)
+            return failed
 
     def mark_no_session_executions_failed(self, timeout_seconds: int = 60) -> int:
         """Mark running executions with no claude_session_id as failed.
@@ -2648,10 +3127,30 @@ class ScheduleOperations:
             return result.rowcount > 0
 
     def list_git_enabled_agents(self) -> List[AgentGitConfig]:
-        """List all agents with git sync enabled."""
+        """List all agents with git sync enabled.
+
+        Joins `agent_ownership` and excludes soft-deleted agents (#1561).
+        `agent_git_config` rows survive soft delete by design, so without this
+        filter the 60s `SyncHealthService` poller (and `GET /api/fleet/sync-audit`)
+        keeps hitting removed containers forever — each `httpx.ConnectError`
+        poisons the transport circuit breaker and eventually drives it to
+        DORMANT + a bogus `circuit_breaker_dormant` alert for an agent that no
+        longer exists. Mirrors the #834 hardening on `list_all_enabled_schedules()`.
+        """
         stmt = (
             select(agent_git_config)
-            .where(agent_git_config.c.sync_enabled == 1)
+            .select_from(
+                agent_git_config.join(
+                    agent_ownership,
+                    agent_ownership.c.agent_name == agent_git_config.c.agent_name,
+                )
+            )
+            .where(
+                and_(
+                    agent_git_config.c.sync_enabled == 1,
+                    agent_ownership.c.deleted_at.is_(None),
+                )
+            )
             .order_by(agent_git_config.c.agent_name)
         )
         with get_engine().connect() as conn:
@@ -2962,7 +3461,17 @@ class ScheduleOperations:
                 ORDER BY started_at DESC
                 LIMIT :lim OFFSET :off
             """), bind).mappings().all()
-            return [dict(row) for row in rows]
+            out = []
+            for row in rows:
+                d = dict(row)
+                # #1474: normalize naive scheduler-written timestamps to UTC 'Z'
+                # so the FleetExecutionSummary response (ExecutionsPanel) never
+                # serializes naive.
+                d["started_at"] = _norm_ts(d.get("started_at"))
+                d["completed_at"] = _norm_ts(d.get("completed_at"))
+                d["queued_at"] = _norm_ts(d.get("queued_at"))
+                out.append(d)
+            return out
 
     def get_fleet_execution_stats(
         self,

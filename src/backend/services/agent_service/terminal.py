@@ -185,7 +185,8 @@ class TerminalSessionManager:
             session_start = datetime.utcnow()
 
             # Step 5: Create exec with TTY
-            # Support multiple terminal modes: claude (Claude Code), gemini (Gemini CLI), bash
+            # Support multiple terminal modes: claude (Claude Code), gemini
+            # (Gemini CLI), codex (OpenAI Codex CLI, #1187), bash
             if mode == "claude":
                 cmd = ["claude", "--dangerously-skip-permissions"]
                 if model:
@@ -194,6 +195,10 @@ class TerminalSessionManager:
                 cmd = ["gemini"]
                 if model:
                     cmd.extend(["--model", model])
+            elif mode == "codex":
+                cmd = ["codex"]
+                if model:
+                    cmd.extend(["-m", model])
             else:
                 cmd = ["/bin/bash"]
 

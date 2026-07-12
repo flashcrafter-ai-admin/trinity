@@ -68,7 +68,7 @@ User runs `trinity init [--profile name]`
   → If unreachable: prompt for new URL (up to 3 attempts)
   → Derive profile name from hostname (or use --profile)
   → Prompt: email
-  → POST /api/access/request {email}     ← NEW ENDPOINT (auto-whitelist)
+  → POST /api/access/request {email}     ← self-signup (403 unless operator enabled it; ent#10)
   → POST /api/auth/email/request {email} ← existing email auth
   → Prompt: 6-digit code
   → POST /api/auth/email/verify {email, code}
@@ -114,13 +114,15 @@ Instance URL:
 
 ```
 Request:  {"email": "user@example.com"}
-Response: {"success": true, "message": "Access granted", "already_registered": false}
+Response: {"success": true, "message": "Email added to the access whitelist", "already_registered": false}
 ```
 
-- Auto-adds email to whitelist via `db.add_to_whitelist(email, added_by="admin", source="cli", default_role="user")` — #314 defaults public self-signup to `user`; owners promote via `PUT /api/users/{username}/role`.
+- **Disabled by default** (trinity-enterprise#10, secure default): returns **403** unless the operator opts in via `PUBLIC_ACCESS_REQUESTS_ENABLED=true` (env) or the `public_access_requests_enabled` system setting. When off it does NOT whitelist — the email whitelist stays authoritative against self-enrollment. `trinity:connect` frictionless onboarding requires the operator to enable this flag.
+- When enabled, auto-adds email to whitelist via `db.add_to_whitelist(email, added_by="admin", source="cli", default_role="user")` — #314 defaults public self-signup to `user`; owners promote via `PUT /api/users/{username}/role`.
 - Idempotent: returns `already_registered: true` if exists
 - Rate limited: reuses `check_login_rate_limit(client_ip)` — 5 req / 10 min per IP
-- Requires: setup completed, email auth enabled
+- Requires: setup completed, email auth enabled, **and** self-signup flag enabled
+- Login-code requests for already-whitelisted emails (`POST /api/auth/email/request`) are unaffected by the flag.
 
 ## HTTP Client
 

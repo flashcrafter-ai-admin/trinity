@@ -64,6 +64,7 @@ Migration Order (as of 2026-05-07):
 57. canary_violations_table - CANARY-001 / Issue #411 invariant harness violations
 58. execution_retention_index - #772 partial index on schedule_executions(completed_at)
 59. execution_retry_count - #678 retry_count column for reader-race auto-retry
+60. agent_compatibility_results_table - #668 latest-snapshot agent compatibility reports
 """
 import logging
 import sqlite3
@@ -94,6 +95,39 @@ def _safe_add_column(cursor, table: str, column: str, ddl: str, *, log_msg: str 
     except sqlite3.OperationalError as e:
         if "duplicate column name" in str(e).lower():
             return False
+        raise
+
+
+def _atomic_rebuild(cursor, conn, table, create_new_sql, copy_sql, *, indexes=()):
+    """Atomically rebuild ``table`` via rename-swap inside an explicit transaction.
+
+    Closes the DROP-rebuild data-loss window (#1160). Under Python's legacy
+    sqlite3 isolation an *implicit* DDL statement autocommits, so the old code's
+    ``DROP TABLE`` committed before the re-INSERT — a crash in between lost the
+    rows permanently. An *explicit* ``BEGIN`` holds the drop and re-create in one
+    transaction that rolls back cleanly on any failure, so the old table is never
+    gone until the new one is committed in the same unit of work.
+
+    ``create_new_sql`` must create ``{table}_new``; ``copy_sql`` must
+    ``INSERT INTO {table}_new ... SELECT ... FROM {table}`` (copy happens
+    server-side — the rows never live only in a Python list across a commit).
+    ``indexes`` are CREATE INDEX statements re-run after the rename.
+    """
+    new = f"{table}_new"
+    conn.commit()  # clear any pending implicit transaction before BEGIN
+    try:
+        cursor.execute("BEGIN")
+        # Drop an orphan _new from a prior crashed attempt before recreating it.
+        cursor.execute(f"DROP TABLE IF EXISTS {new}")
+        cursor.execute(create_new_sql)
+        cursor.execute(copy_sql)
+        cursor.execute(f"DROP TABLE {table}")
+        cursor.execute(f"ALTER TABLE {new} RENAME TO {table}")
+        for idx_sql in indexes:
+            cursor.execute(idx_sql)
+        conn.commit()
+    except Exception:
+        conn.rollback()
         raise
 
 
@@ -140,10 +174,28 @@ def run_all_migrations(cursor, conn):
                 logger.debug("Migration %s: table not present yet, skipping (fresh install)", name)
             else:
                 logger.error("Migration FAILED (%s): %s", name, e, exc_info=True)
+                # Name the migration on the exception itself (#1160) so it rides
+                # the crash-loop traceback, while preserving the original type.
+                e.add_note(f"Trinity migration that failed: {name!r}")
                 raise
         except Exception as e:
             logger.error("Migration FAILED (%s): %s", name, e, exc_info=True)
+            e.add_note(f"Trinity migration that failed: {name!r}")
             raise
+
+
+def migration_health(cursor):
+    """Migration-completeness snapshot for the `/health` check (#1160).
+
+    Returns ``(applied, expected, first_pending)``: how many of ``MIGRATIONS``
+    are recorded in ``schema_migrations``, the total expected, and the first
+    registered migration not yet recorded (``None`` when all are applied) — so a
+    503 names the stuck/pending migration instead of just reporting a count.
+    """
+    cursor.execute("SELECT name FROM schema_migrations")
+    applied_names = {row[0] for row in cursor.fetchall()}
+    first_pending = next((name for name, _ in MIGRATIONS if name not in applied_names), None)
+    return len(applied_names), len(MIGRATIONS), first_pending
 
 
 def _migrate_agent_sharing_table(cursor, conn):
@@ -155,20 +207,17 @@ def _migrate_agent_sharing_table(cursor, conn):
     if "shared_with_id" in columns and "shared_with_email" not in columns:
         print("Migrating agent_sharing table to email-based schema...")
 
-        # Migrate existing data: join with users to get emails
-        cursor.execute("""
-            SELECT s.id, s.agent_name, u.email, s.shared_by_id, s.created_at
-            FROM agent_sharing s
-            JOIN users u ON s.shared_with_id = u.id
-        """)
-        existing_shares = cursor.fetchall()
-
-        # Drop old table
-        cursor.execute("DROP TABLE agent_sharing")
-
-        # Create new table with email
-        cursor.execute("""
-            CREATE TABLE agent_sharing (
+        # Rename-swap inside one transaction (#1160) — the copy joins users to
+        # resolve emails, lowercases them, and drops NULL-email rows, exactly as
+        # the previous row-by-row Python loop did (which silently skipped
+        # `if share[2]`). Indexes are created by init_schema's index pass, so
+        # none are recreated here (matches the prior behavior).
+        _atomic_rebuild(
+            cursor,
+            conn,
+            "agent_sharing",
+            """
+            CREATE TABLE agent_sharing_new (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 agent_name TEXT NOT NULL,
                 shared_with_email TEXT NOT NULL,
@@ -177,18 +226,17 @@ def _migrate_agent_sharing_table(cursor, conn):
                 FOREIGN KEY (shared_by_id) REFERENCES users(id),
                 UNIQUE(agent_name, shared_with_email)
             )
-        """)
-
-        # Re-insert migrated data
-        for share in existing_shares:
-            if share[2]:  # email exists
-                cursor.execute("""
-                    INSERT INTO agent_sharing (agent_name, shared_with_email, shared_by_id, created_at)
-                    VALUES (?, ?, ?, ?)
-                """, (share[1], share[2].lower(), share[3], share[4]))
-
-        conn.commit()
-        print(f"Migrated {len(existing_shares)} sharing records to email-based schema")
+            """,
+            """
+            INSERT INTO agent_sharing_new
+                (agent_name, shared_with_email, shared_by_id, created_at)
+            SELECT s.agent_name, lower(u.email), s.shared_by_id, s.created_at
+            FROM agent_sharing s
+            JOIN users u ON s.shared_with_id = u.id
+            WHERE u.email IS NOT NULL AND u.email != ''
+            """,
+        )
+        print("Migrated agent_sharing to email-based schema")
 
 
 def _migrate_schedule_executions_observability(cursor, conn):
@@ -478,16 +526,14 @@ def _migrate_agent_skills_table(cursor, conn):
     if "skill_id" in columns and "skill_name" not in columns:
         print("Migrating agent_skills table: renaming skill_id to skill_name...")
 
-        # Get existing data
-        cursor.execute("SELECT id, agent_name, skill_id, assigned_by, assigned_at FROM agent_skills")
-        existing_data = cursor.fetchall()
-
-        # Drop old table
-        cursor.execute("DROP TABLE agent_skills")
-
-        # Create new table with correct schema
-        cursor.execute("""
-            CREATE TABLE agent_skills (
+        # Rename-swap inside one transaction (#1160) — straight column copy
+        # (skill_id -> skill_name). Recreates the two indexes the old code did.
+        _atomic_rebuild(
+            cursor,
+            conn,
+            "agent_skills",
+            """
+            CREATE TABLE agent_skills_new (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 agent_name TEXT NOT NULL,
                 skill_name TEXT NOT NULL,
@@ -495,21 +541,18 @@ def _migrate_agent_skills_table(cursor, conn):
                 assigned_at TEXT NOT NULL,
                 UNIQUE(agent_name, skill_name)
             )
-        """)
-
-        # Reinsert data
-        for row in existing_data:
-            cursor.execute("""
-                INSERT INTO agent_skills (agent_name, skill_name, assigned_by, assigned_at)
-                VALUES (?, ?, ?, ?)
-            """, (row[1], row[2], row[3], row[4]))
-
-        # Recreate indexes
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_skills_agent ON agent_skills(agent_name)")
-        cursor.execute("CREATE INDEX IF NOT EXISTS idx_agent_skills_skill ON agent_skills(skill_name)")
-
-        conn.commit()
-        print(f"Migrated {len(existing_data)} agent_skills records")
+            """,
+            """
+            INSERT INTO agent_skills_new
+                (agent_name, skill_name, assigned_by, assigned_at)
+            SELECT agent_name, skill_id, assigned_by, assigned_at FROM agent_skills
+            """,
+            indexes=(
+                "CREATE INDEX IF NOT EXISTS idx_agent_skills_agent ON agent_skills(agent_name)",
+                "CREATE INDEX IF NOT EXISTS idx_agent_skills_skill ON agent_skills(skill_name)",
+            ),
+        )
+        print("Migrated agent_skills to skill_name schema")
 
 
 def _migrate_agent_dashboard_values_table(cursor, conn):
@@ -927,6 +970,80 @@ def _migrate_agent_ownership_voice_prompt(cursor, conn):
         "ALTER TABLE agent_ownership ADD COLUMN voice_system_prompt TEXT",
     )
     conn.commit()
+
+def _migrate_agent_ownership_voice_name(cursor, conn):
+    """Add voice_name column to agent_ownership (#28).
+
+    Persists the per-agent Gemini Live voice (e.g. 'Kore', 'Puck'). NULL means
+    unset — the getter falls back to DEFAULT_VOICE_NAME ('Kore'), preserving the
+    prior hardcoded behaviour for existing agents.
+    """
+    _safe_add_column(
+        cursor,
+        "agent_ownership",
+        "voice_name",
+        "ALTER TABLE agent_ownership ADD COLUMN voice_name TEXT",
+    )
+    conn.commit()
+
+
+def _migrate_agent_ownership_public_channel_model(cursor, conn):
+    """Add public_channel_model column to agent_ownership (#894).
+
+    Per-agent model override for public-facing channels (public link, Slack/
+    Telegram/WhatsApp, x402 paid chat). NULL means inherit the platform default
+    model — preserving the prior behaviour for existing agents (additive, no
+    backfill).
+    """
+    _safe_add_column(
+        cursor,
+        "agent_ownership",
+        "public_channel_model",
+        "ALTER TABLE agent_ownership ADD COLUMN public_channel_model TEXT",
+    )
+    conn.commit()
+
+
+def _migrate_agent_ownership_public_channel_prompt(cursor, conn):
+    """Add public_channel_system_prompt column to agent_ownership (#1205).
+
+    Per-agent custom instructions appended to the system prompt for
+    public-facing conversations only (public links, Slack/Telegram/WhatsApp
+    channels, x402 paid chat). Text-surface counterpart of voice_system_prompt.
+    """
+    _safe_add_column(
+        cursor,
+        "agent_ownership",
+        "public_channel_system_prompt",
+        "ALTER TABLE agent_ownership ADD COLUMN public_channel_system_prompt TEXT",
+    )
+    conn.commit()
+
+
+def _migrate_public_chat_messages_sender(cursor, conn):
+    """Add per-message speaker attribution to public_chat_messages (#903).
+
+    Thread-scoped Slack channel sessions drop ``sender_id`` from the session key
+    so multi-participant threads share one context. Who-said-what moves onto each
+    message row: ``sender_email`` (verified email, drives sender-filtered MEM-001
+    summarization) + ``sender_label`` (display name for attributed history
+    replay). Both nullable — pre-migration rows replay via role fallback.
+    Mirrored by Alembic 0013_public_chat_messages_sender for PostgreSQL.
+    """
+    _safe_add_column(
+        cursor,
+        "public_chat_messages",
+        "sender_email",
+        "ALTER TABLE public_chat_messages ADD COLUMN sender_email TEXT",
+    )
+    _safe_add_column(
+        cursor,
+        "public_chat_messages",
+        "sender_label",
+        "ALTER TABLE public_chat_messages ADD COLUMN sender_label TEXT",
+    )
+    conn.commit()
+
 
 def _migrate_slack_channel_agents(cursor, conn):
     """Add multi-agent Slack support: workspace table + channel-agent bindings.
@@ -1796,6 +1913,25 @@ def _migrate_agent_schedules_webhook(cursor, conn):
     conn.commit()
 
 
+def _migrate_agent_schedules_webhook_auth(cursor, conn):
+    """Add optional HMAC signature auth to schedule webhooks (trinity-enterprise#77).
+
+    webhook_secret_encrypted holds an AES-256-GCM envelope of the signing secret
+    (Invariant #12); webhook_auth_enabled gates verification in the public
+    trigger. Both default off, so an existing token-in-URL webhook is unchanged.
+    """
+    _safe_add_column(
+        cursor, "agent_schedules", "webhook_secret_encrypted",
+        "ALTER TABLE agent_schedules ADD COLUMN webhook_secret_encrypted TEXT",
+        log_msg="Adding webhook_secret_encrypted to agent_schedules for webhook signature auth (ent#77)...",
+    )
+    _safe_add_column(
+        cursor, "agent_schedules", "webhook_auth_enabled",
+        "ALTER TABLE agent_schedules ADD COLUMN webhook_auth_enabled INTEGER DEFAULT 0",
+    )
+    conn.commit()
+
+
 def _migrate_agent_shared_files(cursor, conn):
     """Create agent_shared_files table and add file_sharing_enabled to agent_ownership.
 
@@ -2383,6 +2519,21 @@ def _migrate_users_suspended_at(cursor, conn):
     conn.commit()
 
 
+def _migrate_activities_created_index(cursor, conn):
+    """Issue #1265: standalone index on agent_activities(created_at DESC).
+
+    The cross-agent timeline (/api/activities/timeline) sorts by created_at DESC
+    with no agent_name predicate, which the composite idx_activities_agent
+    (agent_name, created_at DESC) cannot serve as a sort — it degraded to a
+    full scan + sort as activity volume grew with fleet size. Idempotent.
+    """
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_activities_created "
+        "ON agent_activities(created_at DESC)"
+    )
+    conn.commit()
+
+
 def _migrate_operator_queue_cleared_at(cursor, conn):
     """#1017 — Clear All on the Operations Resolved tab.
 
@@ -2398,6 +2549,199 @@ def _migrate_operator_queue_cleared_at(cursor, conn):
         "operator_queue",
         "cleared_at",
         "ALTER TABLE operator_queue ADD COLUMN cleared_at TEXT",
+    )
+    conn.commit()
+
+
+def _migrate_agent_compatibility_results_table(cursor, conn):
+    """Create agent_compatibility_results table (#668).
+
+    Latest-snapshot-per-agent compatibility report (one row, upserted by
+    agent_name). Schema is also defined in db/schema.py for fresh installs;
+    this migration handles existing installs. Idempotent.
+    """
+    cursor.execute("PRAGMA table_info(agent_compatibility_results)")
+    if cursor.fetchall():
+        return  # already created (fresh-install path via init_schema)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS agent_compatibility_results (
+            agent_name TEXT PRIMARY KEY,
+            overall_status TEXT NOT NULL,
+            checks_json TEXT NOT NULL,
+            hard_count INTEGER NOT NULL DEFAULT 0,
+            soft_count INTEGER NOT NULL DEFAULT 0,
+            info_count INTEGER NOT NULL DEFAULT 0,
+            container_running INTEGER NOT NULL DEFAULT 0,
+            ai_ran_at TEXT,
+            static_ran_at TEXT,
+            updated_at TEXT NOT NULL
+        )
+    """)
+    conn.commit()
+    print("Created agent_compatibility_results table (#668)")
+
+
+def _migrate_agent_loops_max_duration(cursor, conn):
+    """#1156 — loop-level wall-clock deadline.
+
+    Adds `max_duration_seconds INTEGER` (NULL = no deadline) to `agent_loops`.
+    The runner stops the loop at the next iteration boundary once the deadline
+    measured from `started_at` is exceeded (stop_reason='deadline_exceeded'),
+    bounding total loop duration alongside the existing `max_runs` cap.
+    """
+    _safe_add_column(
+        cursor,
+        "agent_loops",
+        "max_duration_seconds",
+        "ALTER TABLE agent_loops ADD COLUMN max_duration_seconds INTEGER",
+    )
+    conn.commit()
+
+
+def _migrate_agent_loops_max_cost(cursor, conn):
+    """#1155 — per-loop USD cost budget.
+
+    Adds `max_cost_usd REAL` (NULL = no limit) to `agent_loops`. The runner
+    accumulates per-run cost and stops the loop at the next iteration boundary
+    once accumulated cost meets/exceeds the budget
+    (stop_reason='budget_exhausted'), bounding total loop spend alongside the
+    existing `max_runs` cap. Mirrored by the Alembic revision
+    0008_agent_loops_max_cost for PostgreSQL.
+    """
+    _safe_add_column(
+        cursor,
+        "agent_loops",
+        "max_cost_usd",
+        "ALTER TABLE agent_loops ADD COLUMN max_cost_usd REAL",
+    )
+    conn.commit()
+
+
+def _migrate_agent_ownership_mcp_exposed(cursor, conn):
+    """#846 — per-agent MCP exposure toggle.
+
+    Adds ``mcp_exposed INTEGER DEFAULT 0`` to ``agent_ownership``. When set, the
+    Trinity MCP server (which polls the backend) dynamically registers a
+    dedicated ``chat_with_<slug>`` tool for the agent. Default 0 (OFF) — opt-in,
+    owner-toggled. Mirrored by the Alembic revision
+    0009_agent_ownership_mcp_exposed for PostgreSQL.
+    """
+    _safe_add_column(
+        cursor,
+        "agent_ownership",
+        "mcp_exposed",
+        "ALTER TABLE agent_ownership ADD COLUMN mcp_exposed INTEGER DEFAULT 0",
+    )
+    conn.commit()
+
+
+def _migrate_agent_ownership_tts_voice(cursor, conn):
+    """epic #24 / #25 — outbound voice replies (shared agent-level config).
+
+    Adds ``tts_voice_replies_enabled INTEGER DEFAULT 0`` and ``tts_voice_id TEXT``
+    to ``agent_ownership``. When enabled with a voice id, channel adapters speak
+    the agent's reply via the shared ``services/tts_service.py`` (ElevenLabs →
+    OGG/Opus). Shared per-agent primitive (no per-channel column sprawl) consumed
+    by Telegram (#25) first, then Slack (#26) and WhatsApp (trinity-enterprise#56).
+    Default OFF. Mirrored by Alembic 0011_agent_ownership_tts_voice for PostgreSQL.
+    """
+    _safe_add_column(
+        cursor,
+        "agent_ownership",
+        "tts_voice_replies_enabled",
+        "ALTER TABLE agent_ownership ADD COLUMN tts_voice_replies_enabled INTEGER DEFAULT 0",
+    )
+    _safe_add_column(
+        cursor,
+        "agent_ownership",
+        "tts_voice_id",
+        "ALTER TABLE agent_ownership ADD COLUMN tts_voice_id TEXT",
+    )
+    conn.commit()
+
+
+def _migrate_agent_loops_no_progress(cursor, conn):
+    """#1157 — no-progress / doom-loop detection.
+
+    Adds `no_progress_threshold INTEGER` to `agent_loops`. NULL = disabled
+    (back-compat for in-flight loops created before this change); new loops
+    created via the API/MCP default to 3. The runner fingerprints each
+    successful run's response and stops the loop (stop_reason='no_progress')
+    once K consecutive runs produce an identical fingerprint.
+    """
+    _safe_add_column(
+        cursor,
+        "agent_loops",
+        "no_progress_threshold",
+        "ALTER TABLE agent_loops ADD COLUMN no_progress_threshold INTEGER",
+    )
+    conn.commit()
+
+
+def _migrate_agent_reports_table(cursor, conn):
+    """Create agent_reports table (#918).
+
+    Agent-published structured reports (telemetry / domain reports) surfaced on
+    the dashboard. Schema is also defined in db/schema.py for fresh installs;
+    this migration handles existing installs. Idempotent. Mirrored by the
+    Alembic revision 0006_agent_reports for PostgreSQL.
+    """
+    cursor.execute("PRAGMA table_info(agent_reports)")
+    if cursor.fetchall():
+        return  # already created (fresh-install path via init_schema)
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS agent_reports (
+            id TEXT PRIMARY KEY,
+            agent_name TEXT NOT NULL,
+            user_id INTEGER,
+            report_type TEXT NOT NULL,
+            title TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            display_hint TEXT,
+            schema_version INTEGER DEFAULT 1,
+            period_start TEXT,
+            period_end TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (user_id) REFERENCES users(id)
+        )
+    """)
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_reports_agent "
+        "ON agent_reports(agent_name, created_at DESC)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_reports_type "
+        "ON agent_reports(report_type, created_at DESC)"
+    )
+    cursor.execute(
+        "CREATE INDEX IF NOT EXISTS idx_agent_reports_created "
+        "ON agent_reports(created_at)"
+    )
+    conn.commit()
+    print("Created agent_reports table (#918)")
+
+
+def _migrate_enterprise_connectors_table(cursor, conn):
+    """Create enterprise_connectors table (per-agent MCP connector, ent#46 → OSS #118).
+
+    Config row per agent: enabled + exposed-playbook allow-list. Schema is also in
+    db/schema.py for fresh installs; this handles existing installs. Idempotent —
+    ``CREATE TABLE IF NOT EXISTS`` on the SAME name the enterprise module used, so an
+    existing enterprise install adopts its data unchanged (zero data migration, no
+    duplicate-table drift, #118). Mirrored by Alembic 0015_enterprise_connectors for PG.
+    """
+    cursor.execute(
+        """
+        CREATE TABLE IF NOT EXISTS enterprise_connectors (
+            agent_name TEXT PRIMARY KEY,
+            enabled INTEGER NOT NULL DEFAULT 0,
+            exposed_playbooks TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        )
+        """
     )
     conn.commit()
 
@@ -2454,6 +2798,7 @@ MIGRATIONS = [
     ("sync_health", _migrate_sync_health),
     ("whatsapp_bindings", _migrate_whatsapp_bindings),
     ("agent_schedules_webhook", _migrate_agent_schedules_webhook),
+    ("agent_schedules_webhook_auth", _migrate_agent_schedules_webhook_auth),
     ("agent_shared_files", _migrate_agent_shared_files),
     ("agent_sessions_tables", _migrate_agent_sessions_tables),
     ("session_compact_events", _migrate_session_compact_events),
@@ -2475,4 +2820,17 @@ MIGRATIONS = [
     ("agent_ownership_circuit_breaker", _migrate_agent_ownership_circuit_breaker),
     ("voip_tables", _migrate_voip_tables),
     ("operator_queue_cleared_at", _migrate_operator_queue_cleared_at),
+    ("activities_created_index", _migrate_activities_created_index),
+    ("agent_compatibility_results_table", _migrate_agent_compatibility_results_table),
+    ("agent_ownership_voice_name", _migrate_agent_ownership_voice_name),
+    ("agent_loops_max_duration", _migrate_agent_loops_max_duration),
+    ("agent_reports_table", _migrate_agent_reports_table),
+    ("agent_loops_no_progress", _migrate_agent_loops_no_progress),
+    ("agent_loops_max_cost", _migrate_agent_loops_max_cost),
+    ("agent_ownership_public_channel_model", _migrate_agent_ownership_public_channel_model),
+    ("agent_ownership_mcp_exposed", _migrate_agent_ownership_mcp_exposed),
+    ("agent_ownership_tts_voice", _migrate_agent_ownership_tts_voice),
+    ("agent_ownership_public_channel_prompt", _migrate_agent_ownership_public_channel_prompt),
+    ("public_chat_messages_sender", _migrate_public_chat_messages_sender),
+    ("enterprise_connectors_table", _migrate_enterprise_connectors_table),
 ]

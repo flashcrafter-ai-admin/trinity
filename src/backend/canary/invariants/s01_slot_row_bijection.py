@@ -8,9 +8,22 @@ and agent_name=A.
 Drain sentinels (members starting with `drain-`) are filtered out — see
 services/backlog_service.py for why they exist.
 
-Tier A, severity critical. A bijection violation always indicates either
-leaked Redis slots (capacity is wrong) or phantom SQL running rows (cleanup
-service is failing) — both of which directly cause user-visible breakage.
+Tier A, severity major. A bijection violation indicates either leaked Redis
+slots (capacity is wrong) or phantom SQL running rows (cleanup service is
+failing) — real slot-ZSET/SQL drift worth catching while the push-model ZSET
+exists.
+
+## Why major, not critical (#1082)
+
+S-01 becomes **redundant** once single-owner status (#1082, status-as-
+projection) holds: with `schedule_executions.status` a CAS-guarded projection
+of the execution's terminal event, the slot ZSET is no longer a *competing*
+authority for "is running" — it is only an ephemeral coordination hint, so a
+ZSET/SQL disagreement no longer implies a corrupted source of truth. The check
+stays registered and Tier A (it still catches genuine drift under the push
+model), but is downgraded to `major` and is slated for removal *with the slot
+ZSET itself* in #1081 Phase 5. Matches the E-05 Tier-A/Tier-B downgrade
+precedent.
 """
 
 import time
@@ -22,7 +35,9 @@ from ..snapshot import Snapshot, ViolationReport
 
 INVARIANT_ID = "S-01"
 TIER = "A"
-SEVERITY = "critical"
+# Downgraded critical → major (#1082): redundant under single-owner status,
+# retires with the slot ZSET in #1081 Phase 5. See module docstring.
+SEVERITY = "major"
 
 DRAIN_PREFIX = "drain-"
 # Suppress race-window false positives: SQL row commits before the Redis ZADD

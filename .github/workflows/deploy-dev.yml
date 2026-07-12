@@ -12,7 +12,7 @@ jobs:
     steps:
       - name: Connect to Tailscale
         # SHA-pinned to mitigate supply-chain hijack of the v2 floating tag.
-        uses: tailscale/github-action@4e4c49acaa9818630ce0bd7a564372c17e33fb4d # v2
+        uses: tailscale/github-action@780049a30b6ff5c378a9e7b389d15ece7a204888 # v4.1.3
         with:
           authkey: ${{ secrets.TAILSCALE_AUTH_KEY }}
 
@@ -69,9 +69,28 @@ jobs:
             # repo, this is a non-fatal warning — the conditional import
             # in main.py falls back to OSS-only mode and the deploy
             # continues. Enterprise UI surfaces simply stay hidden.
-            if git submodule update --init --recursive src/backend/enterprise; then
+            #
+            # #1443 — .gitmodules now sets `update = none` on this
+            # submodule (OSS clones skip it). A skipped submodule exits 0,
+            # so (a) persist a local `update = checkout` override so this
+            # and every future plain `git submodule update` on the VM
+            # actually syncs it, and (b) judge success by the populated
+            # marker file, never the exit code.
+            git config submodule.src/backend/enterprise.update checkout
+            git submodule update --init --recursive src/backend/enterprise || true
+            if [ -f src/backend/enterprise/backend/__init__.py ]; then
               ENT_SHA=$(git -C src/backend/enterprise rev-parse --short HEAD 2>/dev/null || echo "unknown")
               echo "ENTERPRISE: initialized at ${ENT_SHA}"
+              # A populated marker only proves the tree exists — a failed
+              # update on a previously-mounted VM leaves the OLD checkout in
+              # place. Compare against the recorded gitlink and warn on
+              # drift so a stale enterprise tree can't ship under a green
+              # log line (#1443 review F2).
+              WANT=$(git rev-parse HEAD:src/backend/enterprise 2>/dev/null || echo "none")
+              HAVE=$(git -C src/backend/enterprise rev-parse HEAD 2>/dev/null || echo "none")
+              if [ "$WANT" != "$HAVE" ]; then
+                echo "::warning::Enterprise submodule STALE: checked out ${HAVE}, dev records ${WANT} — update failed; deploying the old enterprise tree"
+              fi
             else
               echo "::warning::Enterprise submodule init failed — deploying in OSS-only mode"
               echo "ENTERPRISE: confirm the dev VM has read access to Abilityai/trinity-enterprise"

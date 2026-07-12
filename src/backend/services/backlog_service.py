@@ -118,9 +118,14 @@ class BacklogService:
             execution_id, json.dumps(metadata), queued_at
         )
         if not ok:
+            # update_execution_to_queued is CAS-guarded on status == RUNNING
+            # (#1082), so a False here means the row is gone or already terminal
+            # (a stale/duplicate enqueue). Do not re-queue — there is no slot
+            # held on this path (the slot acquire failed upstream), so returning
+            # False is the clean rejection.
             logger.warning(
                 f"[Backlog] Failed to transition execution {execution_id} "
-                f"to queued for agent '{agent_name}' — row missing?"
+                f"to queued for agent '{agent_name}' — row missing or already terminal"
             )
             return False
 
@@ -153,7 +158,12 @@ class BacklogService:
             return False
 
         slots = self._slots()
-        max_parallel = db.get_max_parallel_tasks(agent_name)
+        # #506: facade bypass — clamp to the fleet ceiling here (this path
+        # calls slots.acquire_slot directly, skipping CapacityManager.acquire).
+        # The same `max_parallel` local is reused by the real_slot re-acquire
+        # at :193, so clamping once covers both.
+        from services.settings_service import get_effective_max_parallel_tasks
+        max_parallel = get_effective_max_parallel_tasks(agent_name)
         effective_timeout = db.get_execution_timeout(agent_name)
 
         # Sentinel execution_id for the slot — replaced by the real one after

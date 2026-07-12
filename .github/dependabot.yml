@@ -1,8 +1,15 @@
 version: 2
 # All version-update PRs target `dev` per the SDLC (feature → dev → main).
 # Note: Dependabot reads this file from the DEFAULT branch (main), so changes
-# here only take effect after a release cut. Security updates ignore
-# target-branch and still go to main by GitHub design.
+# here only take effect after a release cut.
+#
+# SECURITY updates ignore `target-branch` and ALWAYS open against the default
+# branch (main) by GitHub design — `target-branch: dev` cannot redirect them,
+# and closing such a PR just makes Dependabot recreate it against main. So a
+# Dependabot *security* PR against `main` is EXPECTED, not a config misroute
+# (see #1341): let it merge to main as a security fix and it reaches dev on the
+# next release back-merge, or cherry-pick the bump into a dev PR if urgent.
+# Only *version* updates honor the per-entry `target-branch: dev` below.
 updates:
   # GitHub Actions: catch new SHAs for already-pinned third-party actions and
   # flag CVEs in first-party actions. Weekly cadence — security PRs from
@@ -15,6 +22,11 @@ updates:
     labels:
       - dependencies
       - github-actions
+    groups:
+      # One PR per week for all action bumps, not one PR per action (#1243).
+      github-actions:
+        patterns:
+          - "*"
 
   # Frontend (Vite + Vue): catches Vue / Vite / Chart.js / DOMPurify CVEs.
   - package-ecosystem: npm
@@ -57,6 +69,21 @@ updates:
     labels:
       - dependencies
       - mcp-server
+    groups:
+      patch-and-minor:
+        update-types:
+          - patch
+          - minor
+
+  # git-sync test harness (#1243): previously uncovered, which left esbuild CVEs
+  # here (alert #152) only reachable via security updates against main.
+  - package-ecosystem: npm
+    directory: /tests/git-sync
+    target-branch: dev
+    schedule:
+      interval: weekly
+    labels:
+      - dependencies
     groups:
       patch-and-minor:
         update-types:

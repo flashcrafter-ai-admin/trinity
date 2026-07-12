@@ -24,11 +24,10 @@ from fastapi import (
     Query,
     status,
 )
-from pydantic import BaseModel
 
 from database import db
 from dependencies import AuthorizedAgentByName, OwnedAgentByName, get_current_user
-from models import User
+from models import User, VoipBindingResponse, VoipCallRequest, VoipConfigureRequest, VoipEnabledRequest
 from services import idempotency_service
 from services.settings_service import settings_service
 from services.voip_service import voip_service, normalize_e164
@@ -38,31 +37,6 @@ logger = logging.getLogger(__name__)
 
 auth_router = APIRouter(prefix="/api/agents", tags=["voip"])
 public_router = APIRouter(tags=["voip-public"])
-
-
-# ── Request/Response models ──────────────────────────────────────────────────
-
-class VoipConfigureRequest(BaseModel):
-    account_sid: str
-    auth_token: str
-    from_number: str
-    daily_call_cap: Optional[int] = None
-
-
-class VoipBindingResponse(BaseModel):
-    agent_name: str
-    configured: bool
-    account_sid: Optional[str] = None
-    from_number: Optional[str] = None
-    daily_call_cap: Optional[int] = None
-    display_name: Optional[str] = None
-    enabled: Optional[bool] = None
-
-
-class VoipCallRequest(BaseModel):
-    to_number: str
-    context: Optional[str] = None
-    process_transcript: bool = True
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -150,6 +124,33 @@ async def configure_voip_binding(
     )
 
 
+@auth_router.put("/{agent_name}/voip/enabled", response_model=VoipBindingResponse)
+async def set_voip_enabled(
+    agent_name: OwnedAgentByName,
+    config: VoipEnabledRequest,
+):
+    """Enable/disable an agent's VoIP without re-entering credentials (owner-only, #28).
+
+    The call path already refuses disabled bindings (voip_service); this flips the
+    `enabled` flag in place. 404 when no binding exists so the UI never shows a
+    disabled-but-nonexistent state.
+    """
+    _require_enabled()
+    updated = db.set_voip_enabled(agent_name, config.enabled)
+    if not updated:
+        raise HTTPException(status_code=404, detail="No VoIP binding configured for this agent")
+    binding = db.get_voip_binding(agent_name)
+    return VoipBindingResponse(
+        agent_name=agent_name,
+        configured=True,
+        account_sid=binding["account_sid"],
+        from_number=binding["from_number"],
+        daily_call_cap=binding.get("daily_call_cap"),
+        display_name=binding.get("display_name"),
+        enabled=binding.get("enabled"),
+    )
+
+
 @auth_router.delete("/{agent_name}/voip")
 async def delete_voip_binding(agent_name: OwnedAgentByName):
     """Remove the Twilio voice binding for an agent (owner-only)."""
@@ -194,6 +195,16 @@ async def place_voip_call(
             public_url=public_url,
             context=request.context,
             process_transcript=request.process_transcript,
+            execution_id=request.execution_id,
+            dedup_label=request.dedup_label,
+        )
+    except idempotency_service.EffectInProgressError:
+        # Concurrent duplicate dial for the same (execution, number) is mid-flight
+        # (#1084). Release the outer trigger claim and surface a retryable 409.
+        idempotency_service.fail(idem)
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="A duplicate call for this execution is already in progress.",
         )
     except HTTPException:
         idempotency_service.fail(idem)  # nothing durable dialed → release the claim

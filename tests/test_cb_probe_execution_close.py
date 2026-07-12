@@ -56,9 +56,13 @@ def _install_sanitizer_stub() -> None:
     sanitizer.sanitize_text = lambda x: x
     sanitizer.sanitize_dict = lambda x: x
     sys.modules["utils.credential_sanitizer"] = sanitizer
+    return sanitizer
 
 
-_install_sanitizer_stub()
+# Keep a module-level handle to the complete stub so the autouse fixture can
+# re-assert it after cross-file pollution (#1260: previously referenced an
+# unbound `_sanitizer_mod`, raising NameError at setup for all tests here).
+_sanitizer_mod = _install_sanitizer_stub()
 
 sys.modules.setdefault("database", MagicMock())
 

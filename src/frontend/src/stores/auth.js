@@ -11,6 +11,10 @@ export const useAuthStore = defineStore('auth', {
     // Runtime mode detection (from backend)
     emailAuthEnabled: null,  // Email-based authentication
     modeDetected: false,
+    // Enterprise 2FA (#5): set when a login returns an MFA challenge instead
+    // of a token. { token, enrolled, enrollmentRequired }. The Login view
+    // switches to the second-factor step while this is non-null.
+    mfaChallenge: null,
     // Promise that resolves when initializeAuth() completes (PERF-269)
     _initResolve: null,
     _initPromise: null
@@ -185,7 +189,12 @@ export const useAuthStore = defineStore('auth', {
         formData.append('password', password)
 
         const response = await axios.post('/api/token', formData)
-        this.token = response.data.access_token
+
+        // Enterprise 2FA (#5): a second factor is required — defer the token.
+        if (response.data?.mfa_required) {
+          this._setMfaChallenge(response.data)
+          return false
+        }
 
         // Create a dev user profile
         const devUser = {
@@ -195,16 +204,7 @@ export const useAuthStore = defineStore('auth', {
           email_verified: true
         }
 
-        this.user = devUser
-        this.isAuthenticated = true
-
-        localStorage.setItem('token', this.token)
-        localStorage.setItem('auth0_user', JSON.stringify(devUser))
-        this.setupAxiosAuth()
-
-        // Pull the canonical role from the backend (#302).
-        await this.fetchUserProfile()
-
+        await this._finalizeLogin(response.data.access_token, devUser)
         console.log('🔐 Admin login: authenticated as', username)
         return true
       } catch (error) {
@@ -251,15 +251,14 @@ export const useAuthStore = defineStore('auth', {
       try {
         const response = await axios.post('/api/auth/email/verify', { email, code })
 
-        this.token = response.data.access_token
-        this.user = response.data.user
-        this.isAuthenticated = true
+        // Enterprise 2FA (#5): a second factor is required — defer the token.
+        if (response.data?.mfa_required) {
+          this._setMfaChallenge(response.data)
+          return false
+        }
 
-        localStorage.setItem('token', this.token)
-        localStorage.setItem('auth0_user', JSON.stringify(this.user))
-        this.setupAxiosAuth()
-
-        console.log('📧 Email auth: authenticated as', this.user.email)
+        await this._finalizeLogin(response.data.access_token, response.data.user)
+        console.log('📧 Email auth: authenticated as', this.user?.email)
         return true
       } catch (error) {
         console.error('Verify email code failed:', error)
@@ -269,12 +268,137 @@ export const useAuthStore = defineStore('auth', {
       }
     },
 
+    // =========================================================================
+    // Enterprise Two-Factor Authentication (#5)
+    // =========================================================================
+
+    // Shared finalize step: persist the real access token, hydrate the user,
+    // and pull the canonical role. Used by every login path (admin, email,
+    // post-2FA). `seedUser` is an optimistic profile overwritten by
+    // fetchUserProfile().
+    async _finalizeLogin(token, seedUser = null) {
+      this.token = token
+      if (seedUser) this.user = seedUser
+      this.isAuthenticated = true
+      this.mfaChallenge = null
+      localStorage.setItem('token', token)
+      if (seedUser) localStorage.setItem('auth0_user', JSON.stringify(seedUser))
+      this.setupAxiosAuth()
+      // Pull the canonical profile/role from the backend (#302).
+      await this.fetchUserProfile()
+    },
+
+    _setMfaChallenge(data) {
+      this.mfaChallenge = {
+        token: data.challenge_token,
+        enrolled: !!data.mfa_enrolled,
+        enrollmentRequired: !!data.enrollment_required,
+      }
+    },
+
+    cancelMfa() {
+      this.mfaChallenge = null
+    },
+
+    // #32 — enabled SSO providers for the login page (id + name only). Returns
+    // [] in OSS builds (endpoint 404s when the `sso` module isn't entitled).
+    async fetchSsoProviders() {
+      try {
+        const r = await axios.get('/api/enterprise/sso/public-providers')
+        return r.data?.providers || []
+      } catch (e) {
+        return []
+      }
+    },
+
+    // Complete an SSO (OIDC) login from the callback URL fragment the backend
+    // redirects to: `/login#sso=ok&access_token=…`, `…sso=mfa&challenge_token=…`,
+    // or `…sso=error&reason=…` (#32). Reuses the same finalize / 2FA-challenge
+    // paths as password/email login. Returns {ok, mfa?}.
+    async completeSsoLogin(params) {
+      const status = params.get('sso')
+      if (status === 'ok') {
+        await this._finalizeLogin(params.get('access_token'))
+        return { ok: true }
+      }
+      if (status === 'mfa') {
+        this._setMfaChallenge({
+          challenge_token: params.get('challenge_token'),
+          enrollment_required: params.get('enroll') === '1',
+        })
+        return { ok: true, mfa: true }
+      }
+      this.authError = params.get('reason') || 'SSO login failed'
+      return { ok: false }
+    },
+
+    // Complete login by verifying a TOTP or recovery code against the
+    // outstanding challenge. Returns true on success.
+    async verifyMfaCode(code) {
+      if (!this.mfaChallenge) return false
+      try {
+        const r = await axios.post('/api/enterprise/2fa/login/verify', {
+          challenge_token: this.mfaChallenge.token,
+          code,
+        })
+        await this._finalizeLogin(r.data.access_token)
+        return true
+      } catch (error) {
+        const detail = error.response?.data?.detail || 'Invalid verification code'
+        this.authError = detail
+        return false
+      }
+    },
+
+    // Forced enrollment during login (policy requires 2FA, user not enrolled).
+    // Returns the provisioning payload { secret, otpauth_uri, ... } or null.
+    async startMfaEnrollment() {
+      if (!this.mfaChallenge) return null
+      try {
+        const r = await axios.post('/api/enterprise/2fa/login/enroll/start', {
+          challenge_token: this.mfaChallenge.token,
+        })
+        return r.data
+      } catch (error) {
+        this.authError = error.response?.data?.detail || 'Failed to start enrollment'
+        return null
+      }
+    },
+
+    // Confirm forced enrollment with the first code → finalize login.
+    // Returns { ok, recoveryCodes } so the UI can show the backup codes once.
+    async confirmMfaEnrollment(code) {
+      if (!this.mfaChallenge) return { ok: false }
+      try {
+        const r = await axios.post('/api/enterprise/2fa/login/enroll/confirm', {
+          challenge_token: this.mfaChallenge.token,
+          code,
+        })
+        const recoveryCodes = r.data.recovery_codes || []
+        await this._finalizeLogin(r.data.access_token)
+        return { ok: true, recoveryCodes }
+      } catch (error) {
+        this.authError = error.response?.data?.detail || 'Invalid verification code'
+        return { ok: false }
+      }
+    },
+
     // Logout
-    logout() {
+    async logout() {
+      // #187: revoke the token server-side first so an exfiltrated copy stops
+      // working immediately. Best-effort — never block local logout if the
+      // call fails (the Authorization header is still set at this point).
+      try {
+        await axios.post('/api/auth/logout')
+      } catch (e) {
+        // ignore — proceed to clear local state regardless
+      }
+
       this.token = null
       this.user = null
       this.isAuthenticated = false
       this.authError = null
+      this.mfaChallenge = null
 
       localStorage.removeItem('token')
       localStorage.removeItem('auth0_user')

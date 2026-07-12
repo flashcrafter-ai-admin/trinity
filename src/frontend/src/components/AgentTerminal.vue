@@ -136,7 +136,12 @@ const errorMessage = ref('')
 
 // Computed - Runtime-aware labels
 const isGemini = computed(() => props.runtime === 'gemini-cli' || props.runtime === 'gemini')
-const cliModeLabel = computed(() => isGemini.value ? 'Gemini CLI' : 'Claude Code')
+const isCodex = computed(() => props.runtime === 'codex')
+const cliModeLabel = computed(() => {
+  if (isCodex.value) return 'Codex CLI'
+  if (isGemini.value) return 'Gemini CLI'
+  return 'Claude Code'
+})
 
 // Terminal and WebSocket instances
 let terminal = null
@@ -325,8 +330,9 @@ function connect() {
 
   // Build WebSocket URL - use agent-specific terminal endpoint
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  // Map 'cli' mode to the appropriate runtime command (claude or gemini)
-  const terminalMode = selectedMode.value === 'cli' ? (isGemini.value ? 'gemini' : 'claude') : 'bash'
+  // Map 'cli' mode to the appropriate runtime command (claude, gemini, or codex)
+  const cliRuntimeMode = isCodex.value ? 'codex' : (isGemini.value ? 'gemini' : 'claude')
+  const terminalMode = selectedMode.value === 'cli' ? cliRuntimeMode : 'bash'
   // Include model parameter if specified (for gemini --model or claude --model flags)
   const modelParam = props.model ? `&model=${encodeURIComponent(props.model)}` : ''
   const wsUrl = `${protocol}//${location.host}/api/agents/${encodeURIComponent(props.agentName)}/terminal?mode=${terminalMode}${modelParam}`

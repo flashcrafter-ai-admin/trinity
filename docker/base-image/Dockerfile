@@ -50,6 +50,13 @@ RUN npm install -g @anthropic-ai/claude-code@latest
 # Install Gemini CLI for multi-runtime support
 RUN npm install -g @google/gemini-cli
 
+# Install OpenAI Codex CLI for multi-runtime support (#1187).
+# Pinned (not @latest) so base-image rebuilds are reproducible and a
+# breaking Codex release can't silently change the agent runtime. The npm
+# package resolves the platform-specific Rust binary via optional deps;
+# the linux-x64 build lands here. Bump deliberately after testing.
+RUN npm install -g @openai/codex@0.139.0
+
 RUN useradd -m -s /bin/bash -u 1000 developer && \
     echo "developer:developer" | chpasswd && \
     usermod -aG sudo developer && \
@@ -129,6 +136,13 @@ RUN mkdir -p /workspace /data /logs && \
 
 RUN mkdir -p /tmp/secure && \
     chmod 1777 /tmp/secure
+
+# #1089: writable-layer dir for the subscription-token hot-reload override
+# (/var/lib/trinity/oauth-token). Owned by the agent (UID 1000) so the
+# agent-server process can write it; on the writable layer (NOT /home/developer)
+# so it survives a plain stop+start but is wiped on recreate.
+RUN mkdir -p /var/lib/trinity && \
+    chown developer:developer /var/lib/trinity
 
 USER developer
 

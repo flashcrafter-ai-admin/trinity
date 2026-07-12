@@ -1,0 +1,96 @@
+name: Dependabot auto-merge
+
+# Zero-touch merge for LOW-RISK Dependabot PRs. Eligible = semver patch/minor
+# only (every ecosystem, incl. github-actions and dev-deps); ALL major bumps are
+# held for human review. The substantive gate is CI: this only proceeds once the
+# `build` job and every `pytest` check are green. Branch protection still
+# enforces the required CodeQL checks at merge time via `--auto`.
+#
+# Branch protection on dev/main requires 1 approval with enforce_admins ON, and
+# the Actions GITHUB_TOKEN cannot supply a *counting* approval. So a dedicated
+# machine PAT (DEPENDABOT_AUTOMERGE_TOKEN) approves eligible green PRs. That PAT
+# MUST be stored as a **Dependabot** secret (Settings -> Secrets and variables ->
+# Dependabot), NOT an Actions secret -- Dependabot-triggered runs only read the
+# Dependabot secret store. Needs repo setting allow_auto_merge = true.
+#
+# This file must exist on EVERY base branch Dependabot targets: `dev` (version
+# updates) AND `main` (GitHub security updates ignore target-branch). The run
+# executes from the PR base branch's copy of this file.
+
+on: pull_request
+
+permissions:
+  contents: read
+  pull-requests: read
+  checks: read
+
+jobs:
+  auto-merge:
+    if: ${{ github.actor == 'dependabot[bot]' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98  # v3.1.0
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Decide eligibility (patch/minor only -- hold ALL majors)
+        id: gate
+        run: |
+          ut="${{ steps.meta.outputs.update-type }}"
+          if [[ "$ut" == "version-update:semver-patch" || "$ut" == "version-update:semver-minor" ]]; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            echo "Eligible: $ut"
+          else
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+            echo "::notice title=Held for human review::update-type=$ut is not patch/minor"
+          fi
+
+      - name: Wait for build + pytest to pass
+        if: steps.gate.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          grace_deadline=$(( SECONDS + 300 ))    # 5 min for gating checks to appear
+          hard_deadline=$(( SECONDS + 1800 ))    # 30 min overall ceiling
+          while (( SECONDS < hard_deadline )); do
+            mapfile -t rows < <(gh api "repos/$REPO/commits/$SHA/check-runs" --paginate \
+              --jq '.check_runs[] | select(.name | test("^build$|pytest")) | "\(.status)\t\(.conclusion)"')
+            if (( ${#rows[@]} == 0 )); then
+              if (( SECONDS < grace_deadline )); then sleep 20; continue; fi
+              echo "No build/pytest checks for this PR (path-filtered) -- relying on required checks via --auto"
+              exit 0
+            fi
+            pending=0; failed=0
+            for r in "${rows[@]}"; do
+              status="${r%%$'\t'*}"; conclusion="${r##*$'\t'}"
+              [[ "$status" != "completed" ]] && pending=1
+              [[ "$status" == "completed" && "$conclusion" != "success" ]] && failed=1
+            done
+            if (( failed )); then
+              echo "::error title=Auto-merge blocked::a gating check failed"
+              printf '%s\n' "${rows[@]}"
+              exit 1
+            fi
+            if (( pending == 0 )); then echo "build + pytest green"; exit 0; fi
+            sleep 30
+          done
+          echo "::error title=Auto-merge blocked::timed out waiting for build/pytest"
+          exit 1
+
+      - name: Approve + enable auto-merge (machine identity)
+        if: steps.gate.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.DEPENDABOT_AUTOMERGE_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          if [[ -z "${GH_TOKEN}" ]]; then
+            echo "::warning title=Not activated::DEPENDABOT_AUTOMERGE_TOKEN (Dependabot secret) is not set -- skipping approve/merge"
+            exit 0
+          fi
+          gh pr review "$PR_URL" --approve \
+            --body "Auto-approved: Dependabot semver patch/minor; build + pytest green. Substantive gate is CI."
+          gh pr merge "$PR_URL" --auto --squash

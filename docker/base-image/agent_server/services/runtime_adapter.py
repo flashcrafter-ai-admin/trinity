@@ -7,12 +7,32 @@ while maintaining a unified interface for chat, tool execution, and cost trackin
 import os
 import logging
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, asdict
 from typing import List, Dict, Optional, Tuple
 from datetime import datetime
 
 from ..models import ExecutionLogEntry, ExecutionMetadata
+from ..model_context import resolve_context_window
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RuntimeCapabilities:
+    """What a runtime supports, so callers gate on a capability instead of
+    branching on the runtime name (#1187).
+
+    ``cost_reporting`` is a string, not a bool: ``"native"`` means the CLI
+    reports a real cost (Claude Code), ``"estimated"`` means Trinity derives
+    it from token counts (Gemini, Codex).
+    """
+    chat_continuity: bool = False
+    session_tab_resume: bool = False
+    mcp_support: bool = False
+    cost_reporting: str = "estimated"  # "native" | "estimated"
+
+    def to_dict(self) -> Dict[str, object]:
+        return asdict(self)
 
 
 class AgentRuntime(ABC):
@@ -86,10 +106,15 @@ class AgentRuntime(ABC):
         """
         pass
 
-    @abstractmethod
     def get_context_window(self, model: Optional[str] = None) -> int:
         """
-        Get the context window size for a model.
+        Fallback context window size for a model (#1521).
+
+        Non-abstract by design: a new runtime inherits the shared model catalog
+        so it can't ship a silently-wrong 200K denominator by forgetting to
+        implement this. Runtimes with a fixed native window (Gemini, Codex)
+        override it to resolve against their own default model id. This is a
+        FALLBACK — the authoritative value is the runtime-reported window.
 
         Args:
             model: Optional model identifier (uses default if None)
@@ -97,7 +122,7 @@ class AgentRuntime(ABC):
         Returns:
             Context window size in tokens
         """
-        pass
+        return resolve_context_window(model)
 
     @abstractmethod
     async def execute_headless(
@@ -142,28 +167,60 @@ class AgentRuntime(ABC):
         """
         pass
 
+    @classmethod
+    def capabilities(cls) -> RuntimeCapabilities:
+        """Declare what this runtime supports.
+
+        Conservative by default (#1187, AC2): a runtime that forgets to
+        override this is treated as the least-capable — no Session-tab
+        resume, no assumed MCP, estimated cost. Override per runtime to
+        declare real support.
+        """
+        return RuntimeCapabilities()
+
+
+# Accepted AGENT_RUNTIME values (lowercased). Unknown values fail loudly
+# rather than silently selecting Claude (#1187 Phase D).
+_CLAUDE_RUNTIMES = frozenset({"claude-code", "claude"})
+_GEMINI_RUNTIMES = frozenset({"gemini-cli", "gemini"})
+_CODEX_RUNTIMES = frozenset({"codex"})
+KNOWN_RUNTIMES = _CLAUDE_RUNTIMES | _GEMINI_RUNTIMES | _CODEX_RUNTIMES
+
 
 def get_runtime() -> AgentRuntime:
     """
     Factory function to get the appropriate runtime based on configuration.
 
     Reads AGENT_RUNTIME environment variable to determine which runtime to use.
-    Defaults to Claude Code for backward compatibility.
+    Defaults to Claude Code (env unset) for backward compatibility, but an
+    explicitly-set UNKNOWN value raises instead of silently falling back to
+    Claude — a typo'd runtime should fail loudly, not run the wrong engine
+    (#1187 Phase D).
 
     Returns:
-        AgentRuntime instance (ClaudeCodeRuntime or GeminiRuntime)
+        AgentRuntime instance (ClaudeCodeRuntime, GeminiRuntime, or CodexRuntime)
+
+    Raises:
+        ValueError: if AGENT_RUNTIME is set to an unrecognized value.
     """
     runtime_type = os.getenv("AGENT_RUNTIME", "claude-code").lower()
 
-    if runtime_type == "gemini-cli" or runtime_type == "gemini":
+    if runtime_type in _GEMINI_RUNTIMES:
         from .gemini_runtime import get_gemini_runtime
-        runtime = get_gemini_runtime()
         logger.info("Using Gemini CLI runtime")
-        return runtime
-    else:
-        # Default to Claude Code
+        return get_gemini_runtime()
+    if runtime_type in _CODEX_RUNTIMES:
+        from .codex_runtime import get_codex_runtime
+        logger.info("Using OpenAI Codex runtime")
+        return get_codex_runtime()
+    if runtime_type in _CLAUDE_RUNTIMES:
         from .claude_code import get_claude_runtime
-        runtime = get_claude_runtime()
         logger.info("Using Claude Code runtime")
-        return runtime
+        return get_claude_runtime()
+
+    raise ValueError(
+        f"Unknown AGENT_RUNTIME={runtime_type!r}. "
+        f"Known runtimes: {sorted(KNOWN_RUNTIMES)}. "
+        "Refusing to silently fall back to Claude Code."
+    )
 

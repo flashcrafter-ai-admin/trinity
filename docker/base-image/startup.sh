@@ -25,7 +25,7 @@ mkdir -p "${AGENT_TMPDIR}" 2>/dev/null && chmod 700 "${AGENT_TMPDIR}" 2>/dev/nul
 # Initialize from GitHub repository if specified
 if [ -n "${GITHUB_REPO}" ] && [ -n "${GITHUB_PAT}" ]; then
     echo "Initializing agent from GitHub repository: ${GITHUB_REPO}"
-    cd /home/developer
+    cd /home/developer || exit 1
 
     # Clone the repository using PAT authentication.
     # TRINITY_GIT_BASE_URL defaults to https://github.com; overridable for
@@ -45,33 +45,52 @@ if [ -n "${GITHUB_REPO}" ] && [ -n "${GITHUB_PAT}" ]; then
             # We only fetch to update remote refs - no checkout, no branch change
             echo "Repository already exists on persistent volume - skipping clone"
             echo "Running git fetch to sync with remote..."
-            cd /home/developer
+            cd /home/developer || exit 1
             CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || echo "unknown")
             echo "Current branch: ${CURRENT_BRANCH} (preserved from previous run)"
             # Update remote URL with current PAT (may have changed since last start)
             if [ -n "${GITHUB_PAT}" ]; then
                 git remote set-url origin "${CLONE_URL}"
             fi
+            # trinity-enterprise#93: keep the credential-less upstream remote
+            # (template source) in place across restarts — self-healing if it
+            # was removed.
+            if [ -n "${GIT_UPSTREAM_REPO}" ]; then
+                UPSTREAM_URL="${GIT_SCHEME}://${GIT_HOST_PATH}/${GIT_UPSTREAM_REPO}.git"
+                git remote set-url upstream "${UPSTREAM_URL}" 2>/dev/null || \
+                    git remote add upstream "${UPSTREAM_URL}" 2>/dev/null || \
+                    echo "Note: could not add upstream remote"
+            fi
             git fetch origin 2>&1 || echo "Note: Could not fetch from remote"
+
+            # #1439: .git exists ⇒ a prior clone succeeded; clear any stale
+            # failure marker so health doesn't report a recovered agent unhealthy.
+            rm -f /home/developer/.git-clone-status 2>/dev/null || true
 
             echo "Existing repository ready with persisted files"
         else
             echo "Git sync enabled - cloning with full history for bidirectional sync"
             echo "Cloning repository..."
 
-            # Preserve Python packages before cloning
-            cp -r /home/developer/.local /tmp/.local.bak 2>/dev/null || true
+            # #1439: clone into a temp dir on the DISK-BACKED home volume, then
+            # MERGE into /home/developer — never `git clone` straight into the
+            # live home dir. The home dir is populated concurrently at container
+            # start (async named-volume-from-image copy), so a clone into it
+            # intermittently races that writer, sees a non-empty dir, and aborts
+            # (exit 128) → a silent empty agent. A temp subdir the base image
+            # never ships is guaranteed empty (writer-immune) and same-filesystem
+            # (fast merge). NOT /tmp: it is a 512 MB RAM tmpfs (#1098), too small
+            # for a full-history clone of a large repo.
+            CLONE_TMP="/home/developer/.trinity-clone-tmp"
+            rm -rf "${CLONE_TMP}" 2>/dev/null || true  # clear any leftover from a prior partial boot
 
-            # Clone directly into /home/developer (first time setup on empty volume)
-            rm -rf /home/developer/* /home/developer/.[!.]* 2>/dev/null || true
-
-            # GIT-002: Clone directly to the target branch if specified
+            # GIT-002: Clone the target branch if specified (source mode)
             CLONE_BRANCH="${GIT_SOURCE_BRANCH:-main}"
             if [ "${GIT_SOURCE_MODE}" = "true" ] && [ -n "${CLONE_BRANCH}" ]; then
                 echo "Cloning branch: ${CLONE_BRANCH}"
-                CLONE_CMD="git clone -b ${CLONE_BRANCH} ${CLONE_URL} /home/developer"
+                CLONE_CMD="git clone -b ${CLONE_BRANCH} ${CLONE_URL} ${CLONE_TMP}"
             else
-                CLONE_CMD="git clone ${CLONE_URL} /home/developer"
+                CLONE_CMD="git clone ${CLONE_URL} ${CLONE_TMP}"
             fi
 
             # Capture clone output for error reporting (#218)
@@ -79,7 +98,17 @@ if [ -n "${GITHUB_REPO}" ] && [ -n "${GITHUB_PAT}" ]; then
             CLONE_EXIT=$?
             if [ $CLONE_EXIT -eq 0 ]; then
             echo "Repository cloned successfully with git history"
-            cd /home/developer
+
+            # #1439: merge the clone (incl .git) into /home/developer. A tar-pipe
+            # is a true recursive MERGE: file collisions overwrite, dir collisions
+            # (e.g. .claude) merge in place — mv would fail "Directory not empty"
+            # and cp -r would nest a colliding dir. Base-image dotfiles already in
+            # place (.local pip cache, .ssh, mcp-servers) are left untouched
+            # (gitignored, never committed); .git will not collide (image ships none).
+            ( cd "${CLONE_TMP}" && tar cf - . ) | ( cd /home/developer && tar xf - )
+            rm -rf "${CLONE_TMP}" 2>/dev/null || true
+
+            cd /home/developer || exit 1
 
             # Configure git user for commits
             git config user.email "trinity-agent@ability.ai"
@@ -120,8 +149,21 @@ if [ -n "${GITHUB_REPO}" ] && [ -n "${GITHUB_PAT}" ]; then
             # Store git remote URL with credentials for push operations
             git remote set-url origin "${CLONE_URL}"
 
-            # Restore Python packages (these are from the base image, not the repo)
-            cp -r /tmp/.local.bak /home/developer/.local 2>/dev/null || true
+            # trinity-enterprise#93: fork-to-own agents track the template
+            # they were copied from as `upstream` (credential-less — the
+            # template is public; read-only by construction) so
+            # `git pull upstream <branch>` adopts template improvements.
+            if [ -n "${GIT_UPSTREAM_REPO}" ]; then
+                UPSTREAM_URL="${GIT_SCHEME}://${GIT_HOST_PATH}/${GIT_UPSTREAM_REPO}.git"
+                git remote set-url upstream "${UPSTREAM_URL}" 2>/dev/null || \
+                    git remote add upstream "${UPSTREAM_URL}" 2>/dev/null || \
+                    echo "Note: could not add upstream remote"
+            fi
+
+            # #1439: .local (base-image pip cache) is untouched — the merge never
+            # removes it — so no backup/restore is needed (the old rm-then-clone
+            # required it). This also drops a copy of a potentially-large .local
+            # onto the 512 MB /tmp tmpfs.
 
             # #953: do NOT touch .gitignore from startup.sh. The canonical
             # pattern list lives in `_GITIGNORE_PATTERNS`
@@ -133,12 +175,18 @@ if [ -n "${GITHUB_REPO}" ] && [ -n "${GITHUB_PAT}" ]; then
             # because the unanchored/anchored greps gave false negatives on
             # trailing whitespace, CRLF, or missing newline-terminator.
 
+            # #1439: clear any stale failure marker from a prior boot's failed
+            # clone so a recovered agent stops reporting unhealthy (health treats
+            # a lingering .git-clone-status=failed as an identity-clone failure).
+            rm -f /home/developer/.git-clone-status 2>/dev/null || true
+
             echo "Git sync initialization complete"
             else
                 echo "=========================================="
                 echo "ERROR: Failed to clone GitHub repository: ${GITHUB_REPO}"
                 echo "Exit code: ${CLONE_EXIT}"
                 # Sanitize output to avoid leaking PAT in logs
+                # shellcheck disable=SC2001  # regex char-class [^@]; ${//} glob can't express it
                 echo "Clone output: $(echo "${CLONE_OUTPUT}" | sed "s|oauth2:[^@]*@|oauth2:***@|g")"
                 echo "=========================================="
                 echo "Possible causes:"
@@ -149,8 +197,10 @@ if [ -n "${GITHUB_REPO}" ] && [ -n "${GITHUB_PAT}" ]; then
                 echo "=========================================="
                 # Write status file for backend to check
                 echo "{\"status\":\"failed\",\"error\":\"clone_failed\",\"repo\":\"${GITHUB_REPO}\",\"branch\":\"${CLONE_BRANCH}\"}" > /home/developer/.git-clone-status
-                # Restore Python packages so agent server can still start
-                cp -r /tmp/.local.bak /home/developer/.local 2>/dev/null || true
+                # #1439: remove the partial/failed temp clone so it can't break
+                # the next boot's clone or leave a PAT-bearing .git/config behind.
+                # (.local is untouched — the merge never removed it.)
+                rm -rf "${CLONE_TMP}" 2>/dev/null || true
             fi
         fi
     else
@@ -178,27 +228,31 @@ if [ -n "${GITHUB_REPO}" ] && [ -n "${GITHUB_PAT}" ]; then
 
             # Copy all files from the cloned repo to the working directory
             # Using rsync-like behavior with cp
-            cd /tmp/repo-clone
-
-            # Copy everything except .git directory
-            for item in $(ls -A | grep -v "^\.git$"); do
-                echo "Copying ${item}..."
-                cp -r "${item}" /home/developer/ 2>/dev/null || true
-            done
+            # Copy everything except .git directory. Absolute paths via find
+            # -print0 / read -d '' so odd filenames can't word-split (SC2010/SC2045).
+            find /tmp/repo-clone -mindepth 1 -maxdepth 1 ! -name '.git' -print0 |
+                while IFS= read -r -d '' item; do
+                    echo "Copying $(basename "${item}")..."
+                    cp -r "${item}" /home/developer/ 2>/dev/null || true
+                done
 
             # Clean up the clone
             rm -rf /tmp/repo-clone
 
-            cd /home/developer
+            cd /home/developer || exit 1
 
             # Create initialization marker to prevent re-cloning on restart
             touch /home/developer/.trinity-initialized
+
+            # #1439: clear any stale failure marker from a prior failed clone.
+            rm -f /home/developer/.git-clone-status 2>/dev/null || true
 
             echo "GitHub repository initialization complete"
         else
             echo "=========================================="
             echo "ERROR: Failed to clone GitHub repository: ${GITHUB_REPO}"
             echo "Exit code: ${SHALLOW_EXIT}"
+            # shellcheck disable=SC2001  # regex char-class [^@]; ${//} glob can't express it
             echo "Clone output: $(echo "${SHALLOW_OUTPUT}" | sed "s|oauth2:[^@]*@|oauth2:***@|g")"
             echo "=========================================="
             echo "Possible causes:"
@@ -214,7 +268,7 @@ if [ -n "${GITHUB_REPO}" ] && [ -n "${GITHUB_PAT}" ]; then
 # Initialize from local template if specified (fallback)
 elif [ -n "${TEMPLATE_NAME}" ] && [ -d "/template" ]; then
     echo "Initializing agent from local template: ${TEMPLATE_NAME}"
-    cd /home/developer
+    cd /home/developer || exit 1
 
     # Check if workspace is already initialized (persistent volume has files from previous start)
     if [ -f "/home/developer/.trinity-initialized" ]; then
@@ -223,12 +277,12 @@ elif [ -n "${TEMPLATE_NAME}" ] && [ -d "/template" ]; then
         # Copy ALL template files to workspace (including template.yaml - it's a required Trinity file)
         # This ensures custom directories (src/, lib/, docs/, etc.) are included
         echo "Copying template files..."
-        cd /template
-        for item in $(ls -A); do
-            echo "  Copying ${item}..."
-            cp -r "${item}" /home/developer/ 2>/dev/null || true
-        done
-        cd /home/developer
+        find /template -mindepth 1 -maxdepth 1 -print0 |
+            while IFS= read -r -d '' item; do
+                echo "  Copying $(basename "${item}")..."
+                cp -r "${item}" /home/developer/ 2>/dev/null || true
+            done
+        cd /home/developer || exit 1
 
         # Make scripts executable if present
         if [ -d "/home/developer/scripts" ]; then
@@ -249,7 +303,7 @@ fi
 # Copy generated credential files (with real values, generated by backend)
 if [ -d "/generated-creds" ]; then
     echo "Copying generated credential files..."
-    cd /home/developer
+    cd /home/developer || exit 1
 
     # Copy .mcp.json with real credentials
     if [ -f "/generated-creds/.mcp.json" ]; then
@@ -264,7 +318,8 @@ if [ -d "/generated-creds" ]; then
     fi
 
     # Copy any other generated config files (preserving directory structure)
-    for file in $(find /generated-creds -type f ! -name ".mcp.json" ! -name ".env" 2>/dev/null); do
+    find /generated-creds -type f ! -name ".mcp.json" ! -name ".env" -print0 2>/dev/null |
+        while IFS= read -r -d '' file; do
         # Get relative path from /generated-creds
         rel_path="${file#/generated-creds/}"
 
@@ -288,7 +343,8 @@ if [ -d "/generated-creds" ]; then
     # The path structure inside credential-files/ maps to the target path in /home/developer/
     if [ -d "/generated-creds/credential-files" ]; then
         echo "Copying credential files..."
-        for file in $(find /generated-creds/credential-files -type f 2>/dev/null); do
+        find /generated-creds/credential-files -type f -print0 2>/dev/null |
+            while IFS= read -r -d '' file; do
             # Get path relative to credential-files/
             rel_path="${file#/generated-creds/credential-files/}"
             target_dir=$(dirname "$rel_path")
@@ -305,6 +361,31 @@ if [ -d "/generated-creds" ]; then
     fi
 
     echo "Credential files copied"
+fi
+
+# === Codex runtime setup (#1187) ===
+# Codex is the third agent runtime. Two Codex-specific quirks are fixed here:
+#  1. Identity: Codex reads AGENTS.md (NOT CLAUDE.md). Mirror the agent's
+#     instructions so a Codex agent gets the same platform identity Claude does
+#     (the per-turn system prompt is additionally prepended by codex_runtime.py).
+#  2. CODEX_HOME defaults to ~/.codex — inside the git-tracked repo, which would
+#     dirty auto-sync. Relocate it onto the disk-backed scratch dir (#1098).
+# NOTE: startup.sh must NOT write to .gitignore (#953) — the canonical list
+# (`_GITIGNORE_PATTERNS` in src/backend/services/git_service.py, applied on git
+# init/push by `_build_gitignore_merge_command`) carries `.tmp/`, so the
+# relocated CODEX_HOME under $TMPDIR is excluded from git without a shell write.
+if [ "${AGENT_RUNTIME}" = "codex" ]; then
+    echo "Configuring Codex runtime..."
+
+    if [ -f "/home/developer/CLAUDE.md" ] && [ ! -f "/home/developer/AGENTS.md" ]; then
+        cp /home/developer/CLAUDE.md /home/developer/AGENTS.md 2>/dev/null && \
+            echo "  Mirrored CLAUDE.md -> AGENTS.md for Codex" || \
+            echo "  Warning: could not create AGENTS.md"
+    fi
+
+    CODEX_HOME_DIR="${CODEX_HOME:-${AGENT_TMPDIR}/codex}"
+    mkdir -p "${CODEX_HOME_DIR}" 2>/dev/null && chmod 700 "${CODEX_HOME_DIR}" 2>/dev/null || \
+        echo "  Warning: could not create CODEX_HOME ${CODEX_HOME_DIR}"
 fi
 
 # Ensure core agent-server dependencies are installed correctly
@@ -343,6 +424,21 @@ if [ -d "/config/mcp-servers" ]; then
     done
 fi
 
+# === Rotated subscription token: durable override (#1089) ===
+# A hot-reload (POST /api/credentials/reload-token) persists the rotated
+# CLAUDE_CODE_OAUTH_TOKEN to this writable-layer path so it survives a plain
+# stop+start. The container's baked Config.Env still holds the OLD token and a
+# fleet restart (ops.py) does a raw stop+start that bypasses start_agent_internal
+# — so export the override (when present and non-empty) BEFORE launching the
+# agent server, so the rotated token wins. The file is wiped on recreate (fresh
+# writable layer), so a DB-driven recreate cleanly reverts to the freshly-baked
+# Config.Env token — no marker logic needed.
+if [ -s /var/lib/trinity/oauth-token ]; then
+    CLAUDE_CODE_OAUTH_TOKEN="$(cat /var/lib/trinity/oauth-token)"
+    export CLAUDE_CODE_OAUTH_TOKEN
+    echo "Applied rotated subscription token from durable override"
+fi
+
 # Start Agent Web Server (self-contained UI)
 if [ "${ENABLE_AGENT_UI}" = "true" ]; then
     echo "Starting Agent Web UI on port ${AGENT_SERVER_PORT:-8000}..."
@@ -361,7 +457,7 @@ fi
 # === Auto-Import Encrypted Credentials ===
 # If .credentials.enc exists but .env doesn't, decrypt and inject credentials
 # This enables portable credential storage via git-committed encrypted files
-cd /home/developer
+cd /home/developer || exit 1
 if [ -f ".credentials.enc" ] && [ ! -f ".env" ]; then
     echo "Found .credentials.enc without .env - attempting auto-import..."
 

@@ -1,16 +1,19 @@
 /**
- * Operator Queue read tools (OPS-001, #1101)
+ * Operator Queue tools (OPS-001, #1101 read + #1104 respond)
  *
- * Two MCP tools exposing the Operating Room queue over MCP (read-only v1):
- *   - list_operator_queue      — broad listing, or scoped via the agent_name filter
- *   - get_operator_queue_item  — a single item by id
+ * MCP tools exposing the Operating Room queue over MCP:
+ *   - list_operator_queue       — broad listing, or scoped via the agent_name filter
+ *   - get_operator_queue_item   — a single item by id
+ *   - respond_to_operator_queue — resolve a pending item (answer / approve / deny)
  *
  * Access control crux: the backend resolves an agent-scoped MCP key to its
  * OWNER and filters by the owner's accessible agents — it does NOT apply
  * agent_permissions (architecture §5). So agent-to-agent gating lives HERE,
  * mirroring executions.ts (`checkAgentAccess`) and agents.ts (`list_agents`
- * post-filter). Write actions (respond / cancel) are intentionally deferred to
- * a follow-up — this surface is read-only.
+ * post-filter). The write tool resolves the item's `agent_name` first, then
+ * runs the SAME `checkAgentAccess` gate before proxying the response — an
+ * agent-scoped key may resolve items for {self} ∪ permitted only. (#1104 v1
+ * exposes `respond` only; `cancel` is deferred — wider blast radius.)
  */
 
 import { z } from "zod";
@@ -238,6 +241,77 @@ export function createOperatorQueueTools(
         }
 
         return JSON.stringify(item, null, 2);
+      },
+    },
+
+    // ========================================================================
+    // respond_to_operator_queue (#1104)
+    // ========================================================================
+    respondToOperatorQueue: {
+      name: "respond_to_operator_queue",
+      description:
+        "Respond to (resolve) a pending Operating Room (operator queue) item — " +
+        "answer a question, or approve/deny an approval request. `response` is " +
+        "the decision value (e.g. the chosen approval option, or the answer); " +
+        "`response_text` is optional freeform context. Only items in the " +
+        "'pending' state can be resolved — responding to an already-resolved, " +
+        "expired, or cancelled item returns a structured error. Access control: " +
+        "agent-scoped keys may only resolve items belonging to themselves or " +
+        "agents they have explicit permission for.",
+      parameters: z.object({
+        item_id: z.string().min(1).describe("Operator queue item id to resolve."),
+        response: z
+          .string()
+          .min(1)
+          .describe(
+            "The response/decision value — for an approval item the chosen option (e.g. 'approve'/'deny'); for a question, the answer.",
+          ),
+        response_text: z
+          .string()
+          .optional()
+          .describe("Optional freeform text accompanying the response."),
+      }),
+      execute: async (
+        params: { item_id: string; response: string; response_text?: string },
+        context?: { session?: McpAuthContext },
+      ) => {
+        const authContext = context?.session;
+        const apiClient = getClient(authContext);
+
+        // Resolve the item's agent_name first so the permission check has a
+        // target (the caller only supplies an id). A read here also surfaces a
+        // 404 cleanly before any write attempt.
+        let item: { agent_name: string };
+        try {
+          item = await apiClient.getOperatorQueueItem(params.item_id);
+        } catch (error) {
+          const msg = error instanceof Error ? error.message : String(error);
+          console.error(`[respond_to_operator_queue] lookup error: ${msg}`);
+          return JSON.stringify({ error: msg }, null, 2);
+        }
+
+        // Same MCP-layer agent_permissions gate as the read tools — the backend
+        // resolved the item under the KEY OWNER's access, so re-check it against
+        // the calling agent's permits before allowing a write.
+        const access = await checkAgentAccess(apiClient, authContext, item.agent_name);
+        if (!access.allowed) {
+          console.log(`[respond_to_operator_queue] Access denied: ${access.reason}`);
+          return JSON.stringify({ error: "Access denied", reason: access.reason }, null, 2);
+        }
+
+        try {
+          const updated = await apiClient.respondToOperatorQueueItem(params.item_id, {
+            response: params.response,
+            response_text: params.response_text,
+          });
+          return JSON.stringify(updated, null, 2);
+        } catch (error) {
+          // Backend 400s on a non-pending item (already responded / expired /
+          // cancelled) — surface as a structured error, not a thrown exception.
+          const msg = error instanceof Error ? error.message : String(error);
+          console.error(`[respond_to_operator_queue] error: ${msg}`);
+          return JSON.stringify({ error: msg }, null, 2);
+        }
       },
     },
   };

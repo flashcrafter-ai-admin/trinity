@@ -1,10 +1,18 @@
 # Trinity User Documentation
 
-> Auto-generated from source code. Run `/generate-user-docs` to update. Last sync: 2026-06-11.
+> Auto-generated from source code. Run `/generate-user-docs` to update. Last sync: 2026-07-11.
 
 ## What's New
 
-- [Release highlights](whats-new/README.md) — user-facing changes per release, newest first ([v0.6.0](whats-new/v0.6.0.md))
+- [Release highlights](whats-new/README.md) — user-facing changes per release, newest first ([v0.8.0](whats-new/v0.8.0.md))
+
+## FAQ
+
+- [Trinity FAQ](faq/README.md) — 260+ grounded answers to common questions, organized by topic ([troubleshooting](faq/troubleshooting.md) for symptom → fix)
+
+## Watch
+
+- [Video Library](videos.md) — workshops, demos, and deep-dives, newest first
 
 ## Guides
 
@@ -23,8 +31,11 @@
 ## Agents
 
 - [Creating Agents](agents/creating-agents.md) — Templates, GitHub repos, from scratch
+- [Agent Runtimes](agents/agent-runtimes.md) — Claude Code, OpenAI Codex, Gemini CLI
 - [Managing Agents](agents/managing-agents.md) — Start/stop, rename, delete, health
+- [Agent Data & Portability](agents/agent-data.md) — Runtime data paths, export/import across instances
 - [Agent Chat](agents/agent-chat.md) — Chat interface, voice, streaming, history
+- [Agent Session](agents/agent-session.md) — Resumable Claude session with full context
 - [Agent Terminal](agents/agent-terminal.md) — Web terminal, SSH access, mode switching
 - [Agent Files](agents/agent-files.md) — File browser, virtual filesystem, shared folders
 - [Agent Logs](agents/agent-logs.md) — Log viewing, telemetry, Vector aggregation
@@ -64,7 +75,7 @@
 
 ## Sharing and Access
 
-- [Agent Sharing](sharing-and-access/agent-sharing.md) — Share with users, access levels
+- [Agent Sharing & Access](sharing-and-access/agent-sharing.md) — Access tab (operators), Sharing tab (external clients, channels, client roster)
 - [Access Control](sharing-and-access/access-control.md) — Cross-channel email verification, access requests
 - [Public Links](sharing-and-access/public-links.md) — Public chat URLs, email verification, session memory
 - [Tags and Organization](sharing-and-access/tags-and-organization.md) — Tags, filtering, system views
@@ -77,7 +88,7 @@
 - [Slack Integration](integrations/slack-integration.md) — Multi-agent channels, DMs, thread routing
 - [Telegram Integration](integrations/telegram-integration.md) — Bot setup, group chats, privacy mode, trigger modes
 - [WhatsApp Integration](integrations/whatsapp-integration.md) — Twilio binding, sandbox setup, email verification
-- [MCP Server](integrations/mcp-server.md) — 80 MCP tools, API keys, tool categories
+- [MCP Server](integrations/mcp-server.md) — 93 MCP tools, API keys, dedicated per-agent tools
 - [A2A Agent Card](integrations/a2a-protocol.md) — A2A v1.0 discovery for external orchestrators
 - [Nevermined Payments](integrations/nevermined-payments.md) — x402 payment monetization
 
@@ -101,6 +112,7 @@
 ## Advanced
 
 - [Voice Chat](advanced/voice-chat.md) — Real-time voice via Gemini Live API
+- [Voice Replies](advanced/voice-replies.md) — Agents speak channel replies as voice notes (ElevenLabs TTS)
 - [VoIP Telephony](advanced/voip-telephony.md) — Agents place outbound phone calls via Twilio + Gemini Live
 - [Image Generation](advanced/image-generation.md) — Gemini two-step image pipeline
 - [Agent Avatars](advanced/agent-avatars.md) — AI-generated avatars, emotion variants

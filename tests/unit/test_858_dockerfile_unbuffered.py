@@ -11,13 +11,20 @@ first-time setup token printed during the backend lifespan never reaches
 an actual `ENV` instruction (a bare substring match would be satisfiable by a
 comment) and assert backend/scheduler parity so the two cannot re-drift.
 
-Layer 2 (lifespan source): the setup token must be emitted via `logger.warning`
-(the logging StreamHandler flushes per record — immune to Dockerfile drift),
-positioned after `setup_logging()` but BEFORE the event-bus startup so a hang
-there can't suppress it; and the lifespan must contain no `print()` calls at
-all (a reintroduced print would silently regress to the buffered path). These
-are AST checks on `src/backend/main.py` — unit tests never import `main`
-(too heavy; see tests/unit/test_websocket_auth.py for the precedent).
+Layer 2 (lifespan source): the first-time-setup notice must be emitted via
+`logger.warning` (the logging StreamHandler flushes per record — immune to
+Dockerfile drift), positioned after `setup_logging()` but BEFORE the event-bus
+startup so a hang there can't suppress it; and the lifespan must contain no
+`print()` calls at all (a reintroduced print would silently regress to the
+buffered path). These are AST checks on `src/backend/main.py` — unit tests never
+import `main` (too heavy; see tests/unit/test_websocket_auth.py for the
+precedent).
+
+Note (trinity-enterprise#49): the log-copied **setup token was removed** — the
+lifespan now emits a plain "first-time setup required" warning (no token) and
+`routers/setup.py` no longer has `ensure_setup_token()`. The #858 flush
+guarantee is unchanged: that notice still flows through `logger.warning`, after
+`setup_logging()` and before the event bus, with no `print()` in the lifespan.
 
 True unit tests — no Docker, no backend.
 
@@ -130,35 +137,44 @@ def _is_method_call(call: ast.Call, obj: str, method: str) -> bool:
 
 
 @pytest.mark.unit
-def test_lifespan_emits_setup_token_via_logger_before_event_bus() -> None:
-    """The token must go through logger.warning, after setup_logging() and
-    before event_bus.start() — a hang in later startup must not suppress it."""
+def test_lifespan_emits_first_run_notice_via_logger_before_event_bus() -> None:
+    """The first-time-setup notice must go through logger.warning, after
+    setup_logging() and before event_bus.start() — a hang in later startup must
+    not suppress it (#858).
+
+    trinity-enterprise#49 removed the setup token, so the lifespan emits the
+    notice inline via ``logger.warning`` (no ``_ensure_setup_token()`` call). The
+    #858 ordering + flushing-logger invariant is unchanged; we match the warning
+    by its content marker so a refactor of the message keeps it honest.
+    """
     body = _lifespan_body()
+
+    def _is_first_run_warning(call: ast.Call) -> bool:
+        return (
+            _is_method_call(call, "logger", "warning")
+            and "FIRST-TIME SETUP" in _string_content(call)
+        )
 
     logging_idx = _first_statement_index(
         body, lambda c: _is_name_call(c, "setup_logging")
     )
-    token_idx = _first_statement_index(
-        body,
-        lambda c: _is_method_call(c, "logger", "warning")
-        and "Setup token:" in _string_content(c),
-    )
+    notice_idx = _first_statement_index(body, _is_first_run_warning)
     event_bus_idx = _first_statement_index(
         body, lambda c: _is_method_call(c, "event_bus", "start")
     )
 
-    assert token_idx is not None, (
-        "lifespan no longer emits the first-time setup token via "
-        "logger.warning('... Setup token: ...') — fresh installs would have no "
-        "way to read the token from `docker logs` (#858)."
+    assert notice_idx is not None, (
+        "lifespan no longer logs a FIRST-TIME SETUP notice via logger.warning — "
+        "fresh installs would have no `docker logs` signal that setup is required "
+        "(#858, trinity-enterprise#49)."
     )
-    assert logging_idx is not None and logging_idx < token_idx, (
-        "the setup-token emission must come after setup_logging() so the "
-        "structured handler is configured (#858)."
+    assert logging_idx is not None and logging_idx < notice_idx, (
+        "the first-run notice must come after setup_logging() so the structured "
+        "handler is configured (#858)."
     )
-    assert event_bus_idx is not None and token_idx < event_bus_idx, (
-        "the setup-token emission must come before event_bus.start() so a hang "
-        "in event-bus/audit startup cannot suppress it (#858)."
+    assert event_bus_idx is not None and notice_idx < event_bus_idx, (
+        "the first-run notice must come before event_bus.start() so a hang in "
+        "event-bus/audit startup cannot suppress it (#858)."
     )
 
 

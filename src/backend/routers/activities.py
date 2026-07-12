@@ -30,26 +30,28 @@ async def get_activity_timeline(
     if activity_types:
         types_list = [t.strip() for t in activity_types.split(',')]
 
-    # Get all activities
-    all_activities = db.get_activities_in_range(
+    # #1265: push the per-user access filter into SQL (None = admin, no filter)
+    # so we fetch exactly `limit` rows instead of over-fetching limit*2 and
+    # filtering in Python.
+    #
+    # Admin scope note: `accessible_agent_names` returns None for admins, so the
+    # admin timeline is unfiltered and surfaces the full audit history — including
+    # activity rows of agents whose containers were since deleted. This is
+    # intentional (admins should see complete history). The prior code filtered
+    # admins to Docker-present agents only via get_accessible_agents(); that
+    # incidental narrowing is dropped on purpose, not by accident.
+    from services.agent_service.helpers import accessible_agent_names
+    allowed = accessible_agent_names(current_user)
+
+    activities = db.get_activities_in_range(
         start_time=start_time,
         end_time=end_time,
         activity_types=types_list,
-        limit=limit * 2  # Get more than needed for filtering
+        limit=limit,
+        agent_names=allowed,
     )
 
-    # Get accessible agents for this user
-    from routers.agents import get_accessible_agents
-    accessible_agents = get_accessible_agents(current_user)
-    accessible_agent_names = {agent['name'] for agent in accessible_agents}
-
-    # Filter activities to only include accessible agents
-    filtered_activities = [
-        activity for activity in all_activities
-        if activity['agent_name'] in accessible_agent_names
-    ][:limit]
-
     return {
-        "count": len(filtered_activities),
-        "activities": filtered_activities
+        "count": len(activities),
+        "activities": activities
     }

@@ -2,6 +2,8 @@
 
 Cron-based automation for agents using APScheduler. Schedule recurring tasks with timezone support, execution history, and manual triggers.
 
+> 📺 **Watch:** [Trinity Platform Demo](https://youtu.be/ivljtZqsxeo) *(May 2026)* · [all videos](../videos.md)
+
 ## Concepts
 
 - **Schedule** -- A cron expression paired with a message or task sent to an agent at the specified times.
@@ -57,12 +59,22 @@ Cron-based automation for agents using APScheduler. Schedule recurring tasks wit
 | `/api/agents/{name}/schedules/{id}/trigger` | POST | Manual trigger |
 | `/api/agents/{name}/schedules/{id}/executions` | GET | Execution history |
 | `/api/agents/{name}/schedules/{id}/analytics` | GET | Per-schedule analytics (see below) |
+| `/api/agents/{name}/schedules/analytics-summary` | GET | Per-schedule performance rollup for the whole agent (`?window=7d\|14d\|30d`) |
 
 ## Per-Schedule Analytics
 
 Each schedule has an analytics view summarizing how it has been performing over a selectable time window.
 
-### In the UI
+### At-a-Glance Scorecards
+
+Performance shows up in two places without opening any analytics card:
+
+- **Schedules tab** — each schedule row carries inline stats: 7-day success rate, average duration, and a last-run status dot.
+- **Agent Overview tab** — a **"Schedules performance"** section rolls up every schedule for the selected window (success rate, average duration, run count, tool-call count per schedule) and deep-links to the Schedules tab. Tool counts are sampled over the newest runs.
+
+Both are fed by one endpoint: `GET /api/agents/{name}/schedules/analytics-summary?window=7d|14d|30d` — one row per schedule, including zero-run schedules.
+
+### Detailed Analytics Card
 
 1. Open the agent's Schedules tab.
 2. Click **Show execution history** on a schedule.

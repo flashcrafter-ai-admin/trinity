@@ -1,0 +1,36 @@
+name: test-codex
+# Excluded from the user-facing template catalog (GET /api/templates). See README "Not starting points". (#1513)
+hidden: true
+display_name: Test Codex Agent
+description: Test agent using OpenAI's Codex CLI runtime for validation (#1187)
+version: "1.0.0"
+author: Trinity Platform
+priority: 10  # Lower = higher in list (after system templates)
+
+type: business-assistant
+
+# Use the OpenAI Codex runtime instead of Claude Code
+runtime:
+  type: codex
+  model: gpt-5.1-codex
+
+resources:
+  cpu: "2"
+  memory: "2g"
+
+capabilities:
+  - chat
+  - code-generation
+  - web-search
+
+mcp_servers: []
+
+# Codex authenticates with an OpenAI API key read from the agent's .env
+# (CRED-002). Declaring it here makes the Quick Inject UI prompt for it.
+credentials:
+  env_file:
+    - OPENAI_API_KEY
+
+slash_commands:
+  - name: /test
+    description: Test command to verify the Codex runtime is working

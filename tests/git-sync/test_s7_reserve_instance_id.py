@@ -28,6 +28,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+import sqlalchemy.exc as sa_exc
+
 import pytest
 
 
@@ -387,8 +389,18 @@ class TestReserveAndGenerateInstanceId:
             def create_git_config(self, *args, **kwargs):
                 calls["inserts"] += 1
                 if calls["inserts"] == 1:
-                    raise sqlite3.IntegrityError(
-                        "UNIQUE constraint failed: idx_git_config_repo_branch_unique"
+                    # #1260: production (db.create_git_config) goes through the
+                    # SQLAlchemy engine, so a unique-constraint violation surfaces
+                    # as sqlalchemy.exc.IntegrityError (wrapping the sqlite3 one) —
+                    # which is exactly what reserve_and_generate_instance_id
+                    # catches (#300). Raising the bare sqlite3 error never tripped
+                    # the retry path.
+                    raise sa_exc.IntegrityError(
+                        "INSERT INTO agent_git_config ...",
+                        {},
+                        sqlite3.IntegrityError(
+                            "UNIQUE constraint failed: idx_git_config_repo_branch_unique"
+                        ),
                     )
                 self.created.append(kwargs)
                 return types.SimpleNamespace(**kwargs)

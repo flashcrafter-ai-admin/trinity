@@ -30,6 +30,8 @@ from .agent_settings import (
     AccessPolicyMixin,
     GitPATMixin,
     FileSharingMixin,
+    McpExposureMixin,
+    TtsMixin,
 )
 from utils.helpers import utc_now_iso
 
@@ -47,6 +49,8 @@ class AgentOperations(
     AccessPolicyMixin,
     GitPATMixin,
     FileSharingMixin,
+    McpExposureMixin,
+    TtsMixin,
 ):
     """Agent ownership, access control, and settings database operations.
 
@@ -139,6 +143,30 @@ class AgentOperations(
             ).first()
             return row is not None
 
+    def is_agent_live(self, agent_name: str) -> bool:
+        """True if `agent_name` has a live (non-soft-deleted) ownership row.
+
+        Deliberately checks ONLY `agent_ownership` with `deleted_at IS NULL`
+        — no `users` join — so it matches the webhook token-lookup predicate
+        (`get_schedule_by_webhook_token`, db/schedules.py) *exactly*. This is
+        the schedule/webhook creation gate (#1445): a schedule may only be
+        created on an agent the trigger lookup would actually serve.
+
+        Do NOT "fix" this to reuse `get_agent_owner` — that INNER-JOINs
+        `users`, so it returns None for a live agent whose owner-user row is
+        missing (FKs are disabled platform-wide). That would be a false
+        negative: the gate would 404 an agent the webhook lookup happily
+        resolves, re-opening the mismatch this predicate closes.
+        """
+        with get_engine().connect() as conn:
+            row = conn.execute(
+                select(agent_ownership.c.agent_name).where(
+                    agent_ownership.c.agent_name == agent_name,
+                    agent_ownership.c.deleted_at.is_(None),
+                )
+            ).first()
+            return row is not None
+
     def get_agent_owner(self, agent_name: str) -> Optional[Dict]:
         """Get the owner of an agent, including is_system flag.
 
@@ -183,6 +211,23 @@ class AgentOperations(
         )
         with get_engine().connect() as conn:
             return [row["agent_name"] for row in conn.execute(stmt).mappings()]
+
+    def count_non_system_agents(self) -> int:
+        """Count live (non-soft-deleted), non-system agents.
+
+        The Cornelius first-run seeder (ent#107) uses this as its
+        "genuinely-fresh install" signal: on an established fleet (any
+        non-system agent already present) the default-Cornelius seed is
+        skipped, so upgrading an existing install never spawns a surprise
+        container. The system agent (`is_system=1`) is always present and
+        must not count.
+        """
+        stmt = select(func.count()).select_from(agent_ownership).where(
+            agent_ownership.c.deleted_at.is_(None),
+            func.coalesce(agent_ownership.c.is_system, 0) == 0,
+        )
+        with get_engine().connect() as conn:
+            return int(conn.execute(stmt).scalar() or 0)
 
     def delete_agent_ownership(self, agent_name: str) -> bool:
         """Soft-delete the agent ownership row (Issue #834 Phase 1a).
@@ -395,5 +440,104 @@ class AgentOperations(
                 update(agent_ownership)
                 .where(agent_ownership.c.agent_name == agent_name)
                 .values(voice_system_prompt=prompt or None)
+            )
+            return result.rowcount > 0
+
+    # =========================================================================
+    # Voice Name (#28) — persisted per-agent Gemini Live voice
+    # =========================================================================
+
+    def get_voice_name(self, agent_name: str) -> str:
+        """Get the persisted Gemini voice for an agent.
+
+        Falls back to DEFAULT_VOICE_NAME ('Kore') when unset, and ALSO when the
+        persisted value is not in the current GEMINI_VOICE_NAMES set (a voice
+        removed after it was saved) — defense-in-depth so the call path never
+        hands Gemini an unusable voice (#28, reviewer M1).
+        """
+        from config import DEFAULT_VOICE_NAME, GEMINI_VOICE_NAMES
+
+        stmt = select(agent_ownership.c.voice_name).where(
+            agent_ownership.c.agent_name == agent_name,
+            agent_ownership.c.deleted_at.is_(None),
+        )
+        with get_engine().connect() as conn:
+            row = conn.execute(stmt).mappings().first()
+        value = row["voice_name"] if row else None
+        return value if value in GEMINI_VOICE_NAMES else DEFAULT_VOICE_NAME
+
+    def set_voice_name(self, agent_name: str, voice_name: Optional[str]) -> bool:
+        """Set the persisted Gemini voice for an agent (None clears it → default)."""
+        with get_engine().begin() as conn:
+            result = conn.execute(
+                update(agent_ownership)
+                .where(agent_ownership.c.agent_name == agent_name)
+                .values(voice_name=voice_name or None)
+            )
+            return result.rowcount > 0
+
+    def get_public_channel_model(self, agent_name: str) -> Optional[str]:
+        """Per-agent model override for public-facing channels (#894).
+
+        Returns the persisted model id, or ``None`` when unset OR when the
+        persisted value is not a currently-valid public-channel model (a model
+        removed after it was saved). ``None`` ⇒ the caller inherits the platform
+        default — same defense-in-depth posture as ``get_voice_name`` (#28).
+        """
+        from services.settings_service import is_valid_public_channel_model
+
+        stmt = select(agent_ownership.c.public_channel_model).where(
+            agent_ownership.c.agent_name == agent_name,
+            agent_ownership.c.deleted_at.is_(None),
+        )
+        with get_engine().connect() as conn:
+            row = conn.execute(stmt).mappings().first()
+        value = row["public_channel_model"] if row else None
+        return value if (value and is_valid_public_channel_model(value)) else None
+
+    def set_public_channel_model(self, agent_name: str, model: Optional[str]) -> bool:
+        """Set/clear the per-agent public-channel model override (None clears it)."""
+        with get_engine().begin() as conn:
+            result = conn.execute(
+                update(agent_ownership)
+                .where(agent_ownership.c.agent_name == agent_name)
+                .values(public_channel_model=model or None)
+            )
+            return result.rowcount > 0
+
+    # =========================================================================
+    # Public/Channel System Prompt (#1205)
+    # Custom instructions injected into public-facing conversations only
+    # (public links, Slack/Telegram/WhatsApp channels, x402 paid chat).
+    # Text-surface counterpart of voice_system_prompt.
+    # =========================================================================
+
+    def get_public_channel_system_prompt(self, agent_name: str) -> Optional[str]:
+        """Get the public/channel system prompt for an agent (#1205)."""
+        stmt = select(agent_ownership.c.public_channel_system_prompt).where(
+            agent_ownership.c.agent_name == agent_name,
+            agent_ownership.c.deleted_at.is_(None),
+        )
+        with get_engine().connect() as conn:
+            row = conn.execute(stmt).mappings().first()
+            return (
+                row["public_channel_system_prompt"]
+                if row and row["public_channel_system_prompt"]
+                else None
+            )
+
+    def set_public_channel_system_prompt(
+        self, agent_name: str, prompt: Optional[str]
+    ) -> bool:
+        """Set the public/channel system prompt for an agent (#1205).
+
+        Empty/whitespace-only clears the value (strict no-op surface).
+        """
+        cleaned = prompt.strip() if prompt else None
+        with get_engine().begin() as conn:
+            result = conn.execute(
+                update(agent_ownership)
+                .where(agent_ownership.c.agent_name == agent_name)
+                .values(public_channel_system_prompt=cleaned or None)
             )
             return result.rowcount > 0

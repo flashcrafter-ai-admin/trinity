@@ -51,7 +51,7 @@
       <div class="bg-white dark:bg-gray-800 border border-gray-200 dark:border-gray-700 rounded-lg px-3 py-2">
         <p class="text-[10px] uppercase tracking-wide text-gray-500 dark:text-gray-400">Cost</p>
         <p class="text-base font-semibold text-gray-900 dark:text-white">
-          {{ store.stats ? '$' + store.stats.total_cost.toFixed(2) : '—' }}
+          {{ store.stats ? formatCostCompact(store.stats.total_cost) : '—' }}
         </p>
       </div>
     </div>
@@ -245,7 +245,7 @@
               <!-- Meta row -->
               <div class="mt-1 flex flex-wrap items-center gap-3 text-xs text-gray-400 dark:text-gray-500">
                 <span v-if="row.duration_ms">{{ formatDuration(row.duration_ms) }}</span>
-                <span v-if="row.cost != null">${{ row.cost.toFixed(3) }}</span>
+                <span v-if="row.cost != null">{{ formatCost(row.cost) }}</span>
                 <span v-if="row.context_used">{{ formatTokens(row.context_used) }}</span>
                 <span v-if="row.error_summary" class="text-status-danger-600 dark:text-status-danger-400 truncate max-w-xs">{{ row.error_summary }}</span>
               </div>
@@ -285,7 +285,9 @@
 <script setup>
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { useRouter } from 'vue-router'
+import { formatCost, formatCostCompact } from '../composables/useFormatters'
 import axios from 'axios'
+import { parseUTC } from '@/utils/timestamps'
 import { useExecutionsStore } from '../stores/executions'
 import { useAuthStore } from '../stores/auth'
 import { useAgentsStore } from '../stores/agents'
@@ -367,7 +369,7 @@ function triggerLabelClass(trigger) {
 
 function timeAgo(iso) {
   if (!iso) return ''
-  const diff = Math.floor((Date.now() - new Date(iso)) / 1000)
+  const diff = Math.floor((Date.now() - parseUTC(iso)) / 1000)
   if (diff < 60) return 'just now'
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`

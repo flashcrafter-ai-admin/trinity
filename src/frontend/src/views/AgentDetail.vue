@@ -2,7 +2,11 @@
   <div :class="isFullscreenTab ? 'h-screen overflow-hidden flex flex-col bg-gray-100 dark:bg-gray-900' : 'min-h-screen bg-gray-100 dark:bg-gray-900'">
     <NavBar />
 
-    <main :class="['max-w-[1400px] mx-auto py-2 sm:px-6 lg:px-8', isFullscreenTab ? 'flex-1 flex flex-col overflow-hidden' : 'overflow-visible']">
+    <!-- #954: w-full keeps <main> at its max width in BOTH layout modes. Without it,
+         the fullscreen (Chat) mode makes the root a flex column, and `mx-auto`'s auto
+         inline margins override align-items:stretch on the flex item — collapsing
+         <main> to content width and shifting/narrowing the whole card on tab switch. -->
+    <main :class="['w-full max-w-[1400px] mx-auto py-2 sm:px-6 lg:px-8', isFullscreenTab ? 'flex-1 flex flex-col overflow-hidden' : 'overflow-visible']">
       <div :class="['px-4 sm:px-0 py-2', isFullscreenTab ? 'flex-1 flex flex-col overflow-hidden' : 'overflow-visible']">
         <div v-if="loading" class="text-center py-8">
           <div class="animate-spin rounded-full h-12 w-12 border-b-2 border-action-primary-500 mx-auto"></div>
@@ -67,6 +71,7 @@
             :emotion-avatar-url="emotionAvatarUrl"
             :voice-available="sessionsStore.voiceAvailable"
             :workspace-available="sessionsStore.workspaceAvailable"
+            :brain-available="sessionsStore.brainOrbAvailable && hasBrainOrb"
           />
 
           <!-- Tabs -->
@@ -84,27 +89,63 @@
               <InfoPanel :agent-name="agent.name" :agent-status="agent.status" @item-click="handleInfoItemClick" />
             </div>
 
-            <!-- Tasks Tab Content -->
-            <div v-if="activeTab === 'tasks'" class="p-6">
+            <!-- Brain Tab Content (#60) — settings + launch, not an auto-jump -->
+            <div v-if="activeTab === 'brain'" class="p-6">
+              <BrainPanel :name="agent.name" :running="agent.status === 'running'" />
+            </div>
+
+            <!-- Tasks Tab Content (#1500: fullscreen flex-fill like Chat; padding
+                 lives on TasksPanel's scroll root so content scrolls under it) -->
+            <div v-if="activeTab === 'tasks'" class="flex-1 min-h-0 flex flex-col overflow-hidden">
               <TasksPanel :agent-name="agent.name" :agent-status="agent.status" :highlight-execution-id="route.query.execution" :initial-message="taskPrefillMessage" @create-schedule="handleCreateSchedule" />
             </div>
 
-            <!-- Chat Tab Content (v-show keeps component mounted so state/polling survives tab switches) -->
-            <div v-show="activeTab === 'chat'" class="flex-1 overflow-hidden">
-              <ChatPanel
-                :agent-name="agent.name"
-                :agent-status="agent.status"
-                :resume-session-id="resumeSessionId"
-                :resume-execution-id="resumeExecutionId"
-              />
-            </div>
+            <!-- Chat Tab Content (#1112: unified Chat tab with a Session-mode toggle).
+                 v-show keeps the active surface mounted so state/polling survives tab switches. -->
+            <div v-show="activeTab === 'chat'" class="flex-1 overflow-hidden flex flex-col">
+              <!-- Session-mode toggle — hidden when the Session surface is unavailable
+                   (feature flag off, or Codex runtime without --resume machinery). -->
+              <div
+                v-if="sessionAvailable"
+                class="flex items-center justify-end gap-2 px-3 py-1.5 border-b border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900/40"
+              >
+                <span
+                  class="text-xs text-gray-500 dark:text-gray-400"
+                  title="Session mode resumes the same Claude session each turn (--resume), preserving memory, tool-result state, and reasoning across turns. Off = stateless, ephemeral per-turn chat."
+                >Session mode</span>
+                <button
+                  type="button"
+                  role="switch"
+                  :aria-checked="effectiveChatMode === 'session'"
+                  @click="toggleChatMode"
+                  :class="[
+                    effectiveChatMode === 'session' ? 'bg-action-primary-600' : 'bg-gray-300 dark:bg-gray-600',
+                    'relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-action-primary-500 focus:ring-offset-2 dark:focus:ring-offset-gray-800'
+                  ]"
+                >
+                  <span
+                    :class="[
+                      effectiveChatMode === 'session' ? 'translate-x-4' : 'translate-x-0',
+                      'pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out'
+                    ]"
+                  />
+                </button>
+              </div>
 
-            <!-- Session Tab Content (SESSION_TAB_2026-04 Phase 3) -->
-            <div v-show="activeTab === 'session'" v-if="sessionsStore.sessionTabEnabled" class="flex-1 overflow-hidden">
-              <SessionPanel
-                :agent-name="agent.name"
-                :agent-status="agent.status"
-              />
+              <div class="flex-1 overflow-hidden">
+                <SessionPanel
+                  v-if="effectiveChatMode === 'session'"
+                  :agent-name="agent.name"
+                  :agent-status="agent.status"
+                />
+                <ChatPanel
+                  v-else
+                  :agent-name="agent.name"
+                  :agent-status="agent.status"
+                  :resume-session-id="resumeSessionId"
+                  :resume-execution-id="resumeExecutionId"
+                />
+              </div>
             </div>
 
             <!-- Dashboard Tab Content -->
@@ -130,6 +171,11 @@
             </div>
 
             <!-- Sharing Tab Content -->
+            <!-- Access Tab Content (#17 — Trinity operators) -->
+            <div v-if="activeTab === 'access' && agent.can_share">
+              <AccessPanel :agent-name="agent.name" />
+            </div>
+
             <div v-if="activeTab === 'sharing' && agent.can_share">
               <SharingPanel
                 :agent-name="agent.name"
@@ -146,6 +192,11 @@
             <!-- Schedules Tab Content -->
             <div v-if="activeTab === 'schedules'" class="p-6">
               <SchedulesPanel :agent-name="agent.name" :initial-message="schedulePrefillMessage" />
+            </div>
+
+            <!-- Reports Tab Content (#918) -->
+            <div v-if="activeTab === 'reports'">
+              <ReportsPanel :agent-name="agent.name" :can-delete="agent.can_share" />
             </div>
 
             <!-- Loops Tab Content (#1106 / #740 Phase 2) -->
@@ -259,6 +310,7 @@ import GitConflictModal from '../components/GitConflictModal.vue'
 import OverviewPanel from '../components/OverviewPanel.vue'
 import SchedulesPanel from '../components/SchedulesPanel.vue'
 import LoopsPanel from '../components/LoopsPanel.vue'
+import ReportsPanel from '../components/ReportsPanel.vue'
 import TasksPanel from '../components/TasksPanel.vue'
 import GitPanel from '../components/GitPanel.vue'
 import InfoPanel from '../components/InfoPanel.vue'
@@ -268,11 +320,13 @@ import SettingsPanel from '../components/settings/SettingsPanel.vue'
 
 // Panel Components (newly extracted)
 import AgentHeader from '../components/AgentHeader.vue'
+import BrainPanel from '../components/BrainPanel.vue'
 import ResourceModal from '../components/ResourceModal.vue'
 import AvatarGenerateModal from '../components/AvatarGenerateModal.vue'
 import LogsPanel from '../components/LogsPanel.vue'
 import CredentialsPanel from '../components/CredentialsPanel.vue'
 import SharingPanel from '../components/SharingPanel.vue'
+import AccessPanel from '../components/AccessPanel.vue'
 import PermissionsPanel from '../components/PermissionsPanel.vue'
 import FilesPanel from '../components/FilesPanel.vue'
 import TerminalPanelContent from '../components/TerminalPanelContent.vue'
@@ -306,17 +360,24 @@ const error = ref('')
 const activeTab = ref('overview')  // #1107: Overview is the default landing tab
 // Tabs reachable via ?tab= deep-link (Timeline / EXEC-023 navigation).
 // Single source — referenced in onMounted + onActivated (#1107: dedupe + overview).
-const DEEP_LINK_TABS = ['overview', 'tasks', 'chat', 'session', 'dashboard', 'logs', 'files', 'schedules', 'credentials', 'skills', 'sharing', 'permissions', 'git', 'folders', 'settings', 'info']
+const DEEP_LINK_TABS = ['overview', 'tasks', 'chat', 'reports', 'dashboard', 'logs', 'files', 'schedules', 'credentials', 'skills', 'sharing', 'permissions', 'git', 'folders', 'settings', 'info']
 // Legacy ?tab= ids that moved/renamed — keep old deep-links working (#1108).
-const TAB_ALIASES = { guardrails: 'settings' }
+// #1112: the Session tab collapsed into Chat, so ?tab=session resolves to chat
+// (the session-mode toggle, not the tab id, selects the surface).
+const TAB_ALIASES = { guardrails: 'settings', session: 'chat' }
 // Resolve a ?tab= value to a live tab id (applying aliases), or null if unknown.
 function resolveDeepLinkTab(requested) {
   const resolved = TAB_ALIASES[requested] || requested
   return DEEP_LINK_TABS.includes(resolved) ? resolved : null
 }
-// Tabs that need a full-viewport flex layout (input pinned to bottom).
-// Chat + Session both render ChatMessages which depends on flex-1 grow.
-const isFullscreenTab = computed(() => activeTab.value === 'chat' || activeTab.value === 'session')
+// Tabs that flex-fill the viewport (page enters h-screen fullscreen layout).
+// #1112: Chat (both session and legacy modes render ChatMessages, which depends
+// on flex-1 grow). #1500: Tasks (list fills instead of a fixed max-h-96 cap).
+// A tab joining this list must render a wrapper that is `flex-1 min-h-0 flex
+// flex-col overflow-hidden` and a panel whose root fills it with its own
+// `flex-1 min-h-0 overflow-y-auto` scroll region (see TasksPanel).
+const FULLSCREEN_TABS = ['chat', 'tasks']
+const isFullscreenTab = computed(() => FULLSCREEN_TABS.includes(activeTab.value))
 const showResourceModal = ref(false)
 const showAvatarModal = ref(false)
 const avatarIdentityPrompt = ref('')
@@ -329,6 +390,9 @@ const emotionCycleTimer = ref(null)
 const taskPrefillMessage = ref('')
 const schedulePrefillMessage = ref('')
 const hasDashboard = ref(false)
+// #58 (trinity-enterprise) — Brain Orb: per-agent half of the gate. True when the
+// agent's template.yaml declares the generalizable `brain-orb` capability token.
+const hasBrainOrb = ref(false)
 
 // Tags state (ORG-001)
 const agentTags = ref([])
@@ -345,6 +409,30 @@ const tokenStats = ref(null)
 // Resume mode state (EXEC-023)
 const resumeSessionId = computed(() => route.query.resumeSessionId || null)
 const resumeExecutionId = computed(() => route.query.executionId || null)
+
+// #1112: Chat-tab session-mode toggle. The unified Chat tab renders SessionPanel
+// (--resume continuity) or the legacy ChatPanel (stateless). The user's choice
+// persists per-user via localStorage (one preference across agents), default ON.
+const CHAT_MODE_KEY = 'trinity.chatMode'
+const chatMode = ref(localStorage.getItem(CHAT_MODE_KEY) === 'legacy' ? 'legacy' : 'session')
+// Transient routing override (NOT persisted): execution-resume must land on the
+// legacy ChatPanel, which owns resumeSessionId — without changing the saved pref.
+const routeForcedMode = ref(null)
+// Session surface is available only when the platform flag is on AND the runtime
+// has --resume machinery (Codex does not, #1187).
+const sessionAvailable = computed(
+  () => sessionsStore.sessionTabEnabled && agent.value?.runtime !== 'codex'
+)
+const effectiveChatMode = computed(() => {
+  if (!sessionAvailable.value) return 'legacy'      // feature-flag / codex fallback
+  if (routeForcedMode.value) return routeForcedMode.value
+  return chatMode.value
+})
+function toggleChatMode() {
+  routeForcedMode.value = null                       // user intent overrides routing
+  chatMode.value = effectiveChatMode.value === 'session' ? 'legacy' : 'session'
+  try { localStorage.setItem(CHAT_MODE_KEY, chatMode.value) } catch (e) { /* ignore */ }
+}
 
 // Initialize composables
 const { notification, showNotification } = useNotification()
@@ -545,6 +633,9 @@ const defaultModel = computed(() => {
   if (runtime === 'gemini-cli' || runtime === 'gemini') {
     return 'gemini-2.5-flash'
   }
+  if (runtime === 'codex') {
+    return 'gpt-5.1-codex' // OpenAI Codex default (#1187)
+  }
   return 'sonnet' // Claude default
 })
 
@@ -648,18 +739,24 @@ const visibleTabs = computed(() => {
     { id: 'chat', label: 'Chat' }
   ]
 
-  // Session tab — SESSION_TAB_2026-04. Sits between Chat and the rest;
-  // gated on the platform feature flag so it's invisible until enabled.
-  if (sessionsStore.sessionTabEnabled) {
-    tabs.push({ id: 'session', label: 'Session' })
-  }
+  // #1112: the Session tab collapsed into the single Chat tab above. The
+  // Session surface is now reached via the Chat tab's "Session mode" toggle
+  // (default ON), gated on the same feature-flag + non-Codex-runtime condition
+  // (see `sessionAvailable`). No separate tab entry.
 
   // Dashboard tab - only show if agent has a dashboard.yaml file (insert after Tasks)
   if (hasDashboard.value) {
     tabs.push({ id: 'dashboard', label: 'Dashboard' })
   }
 
+  // Brain Orb tab (#58) — platform flag AND per-agent capability. Selecting it
+  // navigates to the dedicated /agents/:name/brain route (handled by a watcher).
+  if (sessionsStore.brainOrbAvailable && hasBrainOrb.value) {
+    tabs.push({ id: 'brain', label: 'Brain' })
+  }
+
   tabs.push(
+    { id: 'reports', label: 'Reports' },  // #918 agent-published reports
     { id: 'schedules', label: 'Schedules' },
     { id: 'loops', label: 'Loops' },
     { id: 'playbooks', label: 'Playbooks' },
@@ -669,6 +766,7 @@ const visibleTabs = computed(() => {
 
   // Access control tabs - hide for system agent (system agent has full access)
   if (agent.value?.can_share && !isSystem) {
+    tabs.push({ id: 'access', label: 'Access' })  // #17 operators (Trinity users)
     tabs.push({ id: 'sharing', label: 'Sharing' })
     tabs.push({ id: 'permissions', label: 'Permissions' })
   }
@@ -885,6 +983,27 @@ async function checkDashboardExists() {
   hasDashboard.value = false
 }
 
+// #58 — detect the per-agent Brain Orb capability from template.yaml's
+// `capabilities:` list (surfaced by GET /api/agents/{name}/info). Generalizable:
+// any agent declaring the `brain-orb` token qualifies — never a hardcoded name.
+async function checkBrainOrbCapability() {
+  if (!agent.value?.name || agent.value?.status !== 'running') {
+    hasBrainOrb.value = false
+    return
+  }
+  try {
+    const info = await agentsStore.getAgentInfo(agent.value.name)
+    const caps = Array.isArray(info?.capabilities) ? info.capabilities : []
+    hasBrainOrb.value = caps.includes('brain-orb')
+  } catch {
+    hasBrainOrb.value = false
+  }
+}
+
+// #60: the Brain tab is now an in-page settings panel (BrainPanel) with a launch
+// button — no longer an auto-jump to the full-page orb (that was confusing). The
+// header brain logo and the panel's "Open Brain Orb" button do the route hop.
+
 // Load auth status (subscription vs API key)
 async function loadAuthStatus() {
   if (!agent.value?.name) return
@@ -1057,7 +1176,7 @@ onMounted(async () => {
     loadAvailableSubscriptions(),
     sessionsStore.loadFeatureFlags(),  // SESSION_TAB_2026-04 Phase 3
     loadTokenStats(),
-    ...(agent.value?.status === 'running' ? [checkDashboardExists()] : [])
+    ...(agent.value?.status === 'running' ? [checkDashboardExists(), checkBrainOrbCapability()] : [])
   ])
   startEmotionCycling()
   startAllPolling()
@@ -1068,7 +1187,13 @@ onMounted(async () => {
     if (resolvedTab) {
       activeTab.value = resolvedTab
     }
+    // #1112: a legacy ?tab=session deep-link expresses session-mode intent.
+    if (route.query.tab === 'session') chatMode.value = 'session'
   }
+  // #1112: execution-resume (ExecutionDetail "continue as chat") carries a
+  // claude_session_id the legacy ChatPanel resumes — force legacy for this
+  // landing without persisting the change to the user's saved preference.
+  if (resumeSessionId.value) routeForcedMode.value = 'legacy'
 })
 
 // onActivated fires when component is shown (after being cached by KeepAlive)
@@ -1080,9 +1205,10 @@ onActivated(async () => {
   // Reload emotions and restart cycling (AVATAR-002)
   await loadAvailableEmotions()
   startEmotionCycling()
-  // Re-check for dashboard if agent is running
+  // Re-check for dashboard + brain-orb capability if agent is running
   if (agent.value?.status === 'running') {
     await checkDashboardExists()
+    await checkBrainOrbCapability()
   }
 
   // Handle tab query param (EXEC-023: Continue as Chat navigation)

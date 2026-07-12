@@ -13,47 +13,21 @@ import base64
 import json
 import logging
 import types
-from typing import Optional
 
-import httpx
 from fastapi import APIRouter, Depends, HTTPException, WebSocket, WebSocketDisconnect, Query
-from pydantic import BaseModel
 
-from models import User
-from dependencies import get_current_user, get_authorized_agent
+from models import User, VoiceStartRequest, VoiceStartResponse, VoiceStopRequest, VoiceStopResponse
+from dependencies import get_current_user, get_authorized_agent, get_owned_agent
 from database import db
-from config import GEMINI_API_KEY, VOICE_ENABLED
+from config import GEMINI_API_KEY, VOICE_ENABLED, DEFAULT_VOICE_NAME, GEMINI_VOICE_NAMES
 from services.gemini_voice import voice_service, WORKSPACE_PANEL_INSTRUCTIONS
+from services.agent_auth import agent_httpx_client
 from services.docker_service import get_agent_container
 from services.platform_audit_service import platform_audit_service, AuditEventType
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["voice"])
-
-
-# ── Request/Response Models ──────────────────────────────────────────────────
-
-class VoiceStartRequest(BaseModel):
-    session_id: Optional[str] = None  # Existing chat session to continue
-    voice_name: Optional[str] = None  # Gemini voice name (e.g. "Kore", "Puck")
-    workspace_mode: bool = False       # Enable canvas panel tools
-
-
-class VoiceStartResponse(BaseModel):
-    voice_session_id: str
-    websocket_url: str
-    chat_session_id: str
-
-
-class VoiceStopRequest(BaseModel):
-    voice_session_id: str
-
-
-class VoiceStopResponse(BaseModel):
-    transcript: list
-    messages_saved: int
-    duration_seconds: float
 
 
 # ── REST Endpoints ───────────────────────────────────────────────────────────
@@ -211,6 +185,43 @@ async def set_voice_prompt(
     prompt = (body or {}).get("voice_system_prompt", "")
     db.set_voice_system_prompt(name, prompt)
     return {"ok": True, "voice_system_prompt": prompt}
+
+
+@router.get("/api/agents/{name}/voice/name")
+async def get_voice_name(
+    name: str = Depends(get_authorized_agent),
+    current_user: User = Depends(get_current_user),
+):
+    """Get the agent's persisted voice + the selectable voice list (#28)."""
+    return {
+        "voice_name": db.get_voice_name(name),
+        "available_voices": list(GEMINI_VOICE_NAMES),
+        "default_voice": DEFAULT_VOICE_NAME,
+    }
+
+
+@router.put("/api/agents/{name}/voice/name")
+async def set_voice_name(
+    name: str = Depends(get_owned_agent),
+    current_user: User = Depends(get_current_user),
+    body: dict = None,
+):
+    """Set the agent's persisted voice (owner-only) (#28).
+
+    Validates against the canonical GEMINI_VOICE_NAMES set (400 on unknown). An
+    empty/None value clears the override, reverting to DEFAULT_VOICE_NAME.
+    """
+    voice_name = (body or {}).get("voice_name")
+    if voice_name in (None, ""):
+        db.set_voice_name(name, None)
+        return {"ok": True, "voice_name": db.get_voice_name(name)}
+    if voice_name not in GEMINI_VOICE_NAMES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown voice '{voice_name}'. Allowed: {', '.join(GEMINI_VOICE_NAMES)}",
+        )
+    db.set_voice_name(name, voice_name)
+    return {"ok": True, "voice_name": voice_name}
 
 
 # ── WebSocket Handler ────────────────────────────────────────────────────────
@@ -413,7 +424,7 @@ async def _get_voice_system_prompt(agent_name: str) -> str:
     description = None
     if container:
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with agent_httpx_client(agent_name, timeout=5.0) as client:
                 resp = await client.get(f"http://agent-{agent_name}:8000/api/template/info")
                 if resp.status_code == 200:
                     info = resp.json()
@@ -435,9 +446,13 @@ async def _get_voice_system_prompt(agent_name: str) -> str:
 
 
 def _get_voice_name(agent_name: str) -> str:
-    """Get voice name for an agent (default: Kore)."""
-    # For MVP, use a fixed default. Per-agent voice selection is Phase 3.
-    return "Kore"
+    """Resolve the agent's persisted Gemini voice (#28).
+
+    Delegates to the DB accessor, which falls back to DEFAULT_VOICE_NAME ('Kore')
+    when unset or invalid. A per-session override (VoiceStartRequest.voice_name)
+    still takes precedence at the call site (see voice_start).
+    """
+    return db.get_voice_name(agent_name)
 
 
 def _build_context_summary(chat_session_id: str) -> str:

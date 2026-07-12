@@ -8,7 +8,6 @@ Handles:
 - Initializing git in agent containers
 """
 import asyncio
-import httpx
 import os
 import re
 import shlex
@@ -20,6 +19,7 @@ from enum import Enum
 from typing import Optional, Dict, Any, List, Tuple
 from sqlalchemy.exc import IntegrityError
 from database import db, AgentGitConfig, GitSyncResult
+from services.agent_auth import agent_httpx_client
 from services.docker_service import get_agent_container, execute_command_in_container
 
 logger = logging.getLogger(__name__)
@@ -165,9 +165,60 @@ def _git_remote_url(github_pat: str, github_repo: str) -> str:
     return f"{scheme}://oauth2:{github_pat}@{host_path}/{github_repo}.git"
 
 
+def _remote_seturl_subcommand(url: str) -> str:
+    """Idempotent `origin` set-url/add shell subcommand, with the (token-bearing)
+    URL shell-quoted (#1264 review). Shared by ``initialize_github_sync`` and
+    ``update_remote_pat`` so the templating logic lives in one place; the
+    ``shlex.quote`` is defense-in-depth (canonical PATs are ``[A-Za-z0-9_]``,
+    but ``set_agent_github_pat`` accepts arbitrary input)."""
+    q = shlex.quote(url)
+    return (
+        f"git remote get-url origin >/dev/null 2>&1 && "
+        f"git remote set-url origin {q} || git remote add origin {q}"
+    )
+
+
 def generate_working_branch(agent_name: str, instance_id: str) -> str:
     """Generate a working branch name for an agent instance."""
     return f"trinity/{agent_name}/{instance_id}"
+
+
+async def update_remote_pat(agent_name: str, github_pat: str, github_repo: str) -> bool:
+    """Re-template a running agent's ``origin`` remote to embed ``github_pat`` (#1264).
+
+    A per-agent PAT configured *after* the container/git was set up never reaches
+    the live remote — it stays frozen with an empty password (e.g.
+    ``https://x-access-token:@github.com/...``) in the persisted workspace
+    volume, so every fetch/push fails. This rewrites ``remote.origin.url`` to the
+    authenticated ``oauth2:<pat>@`` URL (``_git_remote_url``, same scheme
+    startup.sh uses), idempotently (set-url if origin exists, else add). The
+    startup.sh self-heal does the same on restart; this is the no-restart path
+    used by ``set_agent_github_pat``.
+
+    Returns True on success. Best-effort: returns False (never raises) if the
+    container isn't running, has no git dir, or the command fails.
+    """
+    if not github_pat or not github_repo:
+        return False
+    container_name = f"agent-{agent_name}"
+    try:
+        git_dir = await _detect_git_dir(container_name)
+        cmd = _remote_seturl_subcommand(_git_remote_url(github_pat, github_repo))
+        result = await execute_command_in_container(
+            container_name=container_name,
+            command=f'bash -c "cd {git_dir} && {cmd}"',
+            timeout=30,
+        )
+        ok = result.get("exit_code", 1) == 0
+        if not ok:
+            logger.warning(
+                "update_remote_pat: set-url failed for %s: %s",
+                agent_name, result.get("output", "")[:200],
+            )
+        return ok
+    except Exception as e:  # noqa: BLE001 — best-effort, container may be down
+        logger.warning("update_remote_pat: error for %s: %s", agent_name, e)
+        return False
 
 
 # ============================================================================
@@ -191,6 +242,89 @@ DEFAULT_PERSISTENT_STATE: list[str] = [
 
 _PERSISTENT_STATE_PATH = "/home/developer/.trinity/persistent-state.yaml"
 
+# #1169: declared runtime-data paths over the existing durable home volume.
+# Opt-in (empty default) — undeclared agents get no file and no side effects.
+DEFAULT_DATA_PATHS: list[str] = []
+
+_DATA_PATHS_PATH = "/home/developer/.trinity/data-paths.yaml"
+
+# #1169: the agent's runtime-data root, relative to the git repo root
+# (`/home/developer`). Always gitignored alongside any declared paths so
+# runtime data never lands in a commit.
+_DATA_ROOT_GITIGNORE = "data/"
+
+
+# ---------------------------------------------------------------------------
+# Shared `.trinity/<file>.yaml` list primitives (#1169)
+#
+# Extracted from the S4 persistent-state functions (#383) so persistent_state
+# and data_paths share one injection-safe write/read implementation. The
+# heredoc delimiter is a parameter so each caller keeps its own marker (the
+# S4 tests pin `PSTATE_EOF`).
+# ---------------------------------------------------------------------------
+
+
+async def materialize_trinity_yaml_list(
+    agent_name: str,
+    *,
+    path: str,
+    key: str,
+    patterns: list[str],
+    heredoc: str,
+    timeout: int = 10,
+) -> None:
+    """Write `{key: [patterns]}` as YAML to `path` inside the agent container.
+
+    The single-quoted heredoc preserves glob characters verbatim and is
+    injection-safe (no shell expansion inside the body).
+    """
+    import yaml as _yaml
+    body = _yaml.safe_dump({key: list(patterns)}, sort_keys=False)
+    cmd = (
+        f"mkdir -p /home/developer/.trinity && "
+        f"cat > {path} <<'{heredoc}'\n{body}{heredoc}"
+    )
+    await execute_command_in_container(
+        container_name=f"agent-{agent_name}",
+        command=f'bash -c "{cmd}"',
+        timeout=timeout,
+    )
+
+
+async def _read_trinity_yaml_list(
+    agent_name: str,
+    *,
+    path: str,
+    key: str,
+    default: list[str],
+    timeout: int = 5,
+) -> list[str]:
+    """Read a `{key: [...]}` list from `path`, falling back to `default`.
+
+    Returns the on-disk list when present and valid; otherwise returns a
+    fresh copy of `default` (never a reference — callers may mutate the
+    result, and must not mutate a shared default constant).
+    """
+    import yaml as _yaml
+    result = await execute_command_in_container(
+        container_name=f"agent-{agent_name}",
+        command=f'bash -c "cat {path} 2>/dev/null || true"',
+        timeout=timeout,
+    )
+    if result.get("exit_code", 0) != 0:
+        return list(default)
+    raw = result.get("output", "").strip()
+    if not raw:
+        return list(default)
+    try:
+        data = _yaml.safe_load(raw) or {}
+    except _yaml.YAMLError:
+        return list(default)
+    patterns = data.get(key)
+    if not isinstance(patterns, list) or not patterns:
+        return list(default)
+    return [str(p) for p in patterns]
+
 
 async def materialize_persistent_state(
     agent_name: str, patterns: list[str]
@@ -201,19 +335,12 @@ async def materialize_persistent_state(
     Operators may edit the file thereafter; runtime readers treat the
     on-disk copy as authoritative.
     """
-    import yaml as _yaml
-    body = _yaml.safe_dump(
-        {"persistent_state": list(patterns)}, sort_keys=False
-    )
-    # Heredoc quotes preserve glob characters verbatim.
-    cmd = (
-        f"mkdir -p /home/developer/.trinity && "
-        f"cat > {_PERSISTENT_STATE_PATH} <<'PSTATE_EOF'\n{body}PSTATE_EOF"
-    )
-    await execute_command_in_container(
-        container_name=f"agent-{agent_name}",
-        command=f'bash -c "{cmd}"',
-        timeout=10,
+    await materialize_trinity_yaml_list(
+        agent_name,
+        path=_PERSISTENT_STATE_PATH,
+        key="persistent_state",
+        patterns=patterns,
+        heredoc="PSTATE_EOF",
     )
 
 
@@ -226,25 +353,108 @@ async def _persistent_state_for(agent_name: str) -> list[str]:
     reset-preserve-state operation from #384) must not mutate the default
     constant, hence the defensive `list(...)` copies on every fallback.
     """
-    import yaml as _yaml
-    result = await execute_command_in_container(
-        container_name=f"agent-{agent_name}",
-        command=f'bash -c "cat {_PERSISTENT_STATE_PATH} 2>/dev/null || true"',
-        timeout=5,
+    return await _read_trinity_yaml_list(
+        agent_name,
+        path=_PERSISTENT_STATE_PATH,
+        key="persistent_state",
+        default=DEFAULT_PERSISTENT_STATE,
     )
-    if result.get("exit_code", 0) != 0:
-        return list(DEFAULT_PERSISTENT_STATE)
-    raw = result.get("output", "").strip()
-    if not raw:
-        return list(DEFAULT_PERSISTENT_STATE)
-    try:
-        data = _yaml.safe_load(raw) or {}
-    except _yaml.YAMLError:
-        return list(DEFAULT_PERSISTENT_STATE)
-    patterns = data.get("persistent_state")
-    if not isinstance(patterns, list) or not patterns:
-        return list(DEFAULT_PERSISTENT_STATE)
-    return [str(p) for p in patterns]
+
+
+# #1169 L1: a declared data_path must be a plain glob over the data root —
+# alphanumerics, path separators, and glob metacharacters only. The heredoc
+# write below runs in the agent's OWN container (no privilege boundary), but a
+# shell metacharacter (quote, `$`, backtick, `;`, `|`, …) in a template-supplied
+# entry would still corrupt the `bash -c` tokenization and fail the whole
+# materialization, so unsafe entries are dropped loudly rather than silently
+# breaking the declaration. `re.fullmatch` rejects any embedded/trailing
+# newline that `$` would otherwise tolerate.
+_SAFE_DATA_PATH_RE = re.compile(r"[A-Za-z0-9_./*?{},\[\] -]+")
+
+
+def _is_safe_data_path(path: str) -> bool:
+    """True if `path` is a shell-safe glob over the data root (#1169 L1)."""
+    return bool(path) and _SAFE_DATA_PATH_RE.fullmatch(path) is not None
+
+
+async def materialize_data_paths(agent_name: str, paths: list[str]) -> None:
+    """Materialize an agent's declared `data_paths` (#1169).
+
+    Writes `.trinity/data-paths.yaml` (key `data_paths`) AND appends the
+    runtime-data root + each declared path to the agent's own `.gitignore`,
+    so the declaration and its ignore rule are materialized together.
+
+    Opt-in: a falsy/whitespace-only declaration is a complete no-op — no
+    file is written and no `.gitignore` is touched — so undeclared agents
+    are entirely unaffected. Entries carrying shell metacharacters are
+    dropped (logged) before any container write (#1169 L1).
+    """
+    cleaned = [str(p).strip() for p in (paths or []) if str(p).strip()]
+    safe: list[str] = []
+    dropped: list[str] = []
+    for p in cleaned:
+        (safe if _is_safe_data_path(p) else dropped).append(p)
+    if dropped:
+        logger.warning(
+            "[#1169] Dropping %d unsafe data_paths entr%s for %s "
+            "(shell metacharacters): %r",
+            len(dropped),
+            "y" if len(dropped) == 1 else "ies",
+            agent_name,
+            dropped,
+        )
+    if not safe:
+        return
+    await materialize_trinity_yaml_list(
+        agent_name,
+        path=_DATA_PATHS_PATH,
+        key="data_paths",
+        patterns=safe,
+        heredoc="DATAPATHS_EOF",
+    )
+    await _append_agent_gitignore(
+        agent_name, _data_paths_gitignore_entries(safe)
+    )
+
+
+async def _data_paths_for(agent_name: str) -> list[str]:
+    """Read an agent's declared `data_paths` (#1169).
+
+    Returns the on-disk list when `.trinity/data-paths.yaml` is present and
+    valid; otherwise a fresh empty list (data_paths is opt-in).
+    """
+    return await _read_trinity_yaml_list(
+        agent_name,
+        path=_DATA_PATHS_PATH,
+        key="data_paths",
+        default=DEFAULT_DATA_PATHS,
+    )
+
+
+def _data_paths_gitignore_entries(paths: list[str]) -> list[str]:
+    """Gitignore lines for declared data_paths: the `data/` root plus each
+    declared path, deduped and order-preserving.
+    """
+    entries = [_DATA_ROOT_GITIGNORE]
+    for p in paths:
+        if p not in entries:
+            entries.append(p)
+    return entries
+
+
+async def _append_agent_gitignore(agent_name: str, patterns: list[str]) -> None:
+    """Append `patterns` to the agent's own `/home/developer/.gitignore` (#1169).
+
+    Idempotent (exact-line `grep -qxF` gate). Best-effort and scoped to the
+    agent's repo root — never the fleet-wide `_GITIGNORE_PATTERNS`.
+    """
+    if not patterns:
+        return
+    await execute_command_in_container(
+        container_name=f"agent-{agent_name}",
+        command=_build_gitignore_append_command("/home/developer", patterns),
+        timeout=10,
+    )
 
 
 async def check_remote_branch_exists(github_repo: str, branch: str) -> bool:
@@ -453,7 +663,7 @@ async def get_git_status(agent_name: str) -> Optional[Dict[str, Any]]:
 
     try:
         # Call the agent's internal git status endpoint
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with agent_httpx_client(agent_name, timeout=30.0) as client:
             response = await client.get(
                 f"http://agent-{agent_name}:8000/api/git/status"
             )
@@ -461,7 +671,9 @@ async def get_git_status(agent_name: str) -> Optional[Dict[str, Any]]:
                 return response.json()
             return None
     except Exception as e:
-        print(f"Error getting git status for {agent_name}: {e}")
+        # #1561: structured logging, not a bare print() — otherwise these
+        # failures have no level/timestamp and are invisible to log-based alerting.
+        logger.warning("Error getting git status for %s: %s", agent_name, e)
         return None
 
 
@@ -506,7 +718,7 @@ async def sync_to_github(
 
     try:
         # Call the agent's internal sync endpoint
-        async with httpx.AsyncClient(timeout=360.0) as client:
+        async with agent_httpx_client(agent_name, timeout=360.0) as client:
             payload = {"strategy": strategy}
             if message:
                 payload["message"] = message
@@ -574,7 +786,7 @@ async def get_git_log(agent_name: str, limit: int = 10) -> Optional[Dict[str, An
         return None
 
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with agent_httpx_client(agent_name, timeout=30.0) as client:
             response = await client.get(
                 f"http://agent-{agent_name}:8000/api/git/log",
                 params={"limit": limit}
@@ -606,7 +818,7 @@ async def pull_from_github(agent_name: str, strategy: Optional[str] = "clean") -
         return {"success": False, "message": "Agent must be running to pull"}
 
     try:
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with agent_httpx_client(agent_name, timeout=120.0) as client:
             response = await client.post(
                 f"http://agent-{agent_name}:8000/api/git/pull",
                 json={"strategy": strategy}
@@ -679,6 +891,8 @@ _GITIGNORE_PATTERNS: Tuple[str, ...] = (
     ".npm/",
     ".ssh/",
     ".trinity/",
+    ".tmp/",  # #1098 disk-backed scratch (TMPDIR); #1187 relocated CODEX_HOME
+    ".trinity-clone-tmp/",  # #1439 transient full-history clone staging dir (removed post-merge; ignored so a crash-orphaned copy — incl. its PAT-bearing .git/config — is never committed)
     # Large generated content
     "content/",
     # Claude Code runtime — commit commands/skills/agents, exclude runtime data
@@ -700,18 +914,29 @@ _GITIGNORE_PATTERNS: Tuple[str, ...] = (
 )
 
 
+def _build_gitignore_append_command(git_dir: str, patterns) -> str:
+    """Build a bash command that appends any missing ``patterns`` to
+    ``{git_dir}/.gitignore`` without clobbering user-supplied rules.
+    Idempotent — each pattern is gated by an exact-line ``grep -qxF`` check,
+    so a second run is a no-op. Generic over the pattern list so both the
+    fleet-wide ignore merge and the per-agent data_paths append (#1169) share
+    one implementation.
+    """
+    parts = [f"cd {shlex.quote(git_dir)}", "touch .gitignore"]
+    for p in patterns:
+        q = shlex.quote(p)
+        parts.append(f"(grep -qxF -- {q} .gitignore || echo {q} >> .gitignore)")
+    script = " && ".join(parts)
+    return f"bash -c {shlex.quote(script)}"
+
+
 def _build_gitignore_merge_command(git_dir: str) -> str:
     """Build a bash command that appends any missing ``_GITIGNORE_PATTERNS``
     entries to ``{git_dir}/.gitignore`` without clobbering user-supplied
     rules. Idempotent — each pattern is gated by an exact-line ``grep -qxF``
     check, so a second run is a no-op.
     """
-    parts = [f"cd {shlex.quote(git_dir)}", "touch .gitignore"]
-    for p in _GITIGNORE_PATTERNS:
-        q = shlex.quote(p)
-        parts.append(f"(grep -qxF -- {q} .gitignore || echo {q} >> .gitignore)")
-    script = " && ".join(parts)
-    return f"bash -c {shlex.quote(script)}"
+    return _build_gitignore_append_command(git_dir, _GITIGNORE_PATTERNS)
 
 
 def _build_rm_cached_ignored_command(git_dir: str) -> str:
@@ -723,12 +948,21 @@ def _build_rm_cached_ignored_command(git_dir: str) -> str:
     (bash can't hold NUL bytes), then a NUL-delimited pipe to xargs so paths
     with spaces or unicode survive the round-trip. Working-tree files are
     left alone; only the index is touched.
+
+    ``.trinity/brain-orb/`` and ``.trinity/setup.sh`` are exempt: Brain-Orb /
+    setup-convention templates COMMIT those files (trinity-enterprise#76), while
+    the fleet-wide ``.trinity/`` ignore appended above makes them look
+    ignored-but-tracked — without the pathspec exclusions the first push would
+    untrack them and push the deletion, so a later re-clone/recreate boots
+    hookless and never runs its startup setup (verified live: the e2e Push
+    swept setup.sh before the second exemption was added).
     """
+    exempt = '":!.trinity/brain-orb" ":!.trinity/setup.sh"'
     script = (
         f"cd {shlex.quote(git_dir)} && "
-        "ignored=$(git ls-files -ci --exclude-standard) && "
+        f"ignored=$(git ls-files -ci --exclude-standard -- . {exempt}) && "
         'if [ -n "$ignored" ]; then '
-        "git ls-files -ci -z --exclude-standard | "
+        f"git ls-files -ci -z --exclude-standard -- . {exempt} | "
         "xargs -0 git rm --cached --quiet -r --; "
         "fi"
     )
@@ -878,9 +1112,7 @@ async def initialize_git_in_container(
         ('git config --global user.name "Trinity Agent"', True),
         ('git config --global init.defaultBranch main', True),
         ('git init', True),
-        (f'git remote get-url origin >/dev/null 2>&1 && '
-         f'git remote set-url origin {_git_remote_url(github_pat, github_repo)} || '
-         f'git remote add origin {_git_remote_url(github_pat, github_repo)}', True),
+        (_remote_seturl_subcommand(_git_remote_url(github_pat, github_repo)), True),
         ('git fetch origin', False),  # Optional — remote may be empty
     ]
 
@@ -1076,7 +1308,7 @@ async def reset_to_main_preserve_state(agent_name: str) -> Dict[str, Any]:
             ),
         }
 
-    async with httpx.AsyncClient(timeout=180.0) as client:
+    async with agent_httpx_client(agent_name, timeout=180.0) as client:
         response = await client.post(
             f"http://agent-{agent_name}:8000/api/git/reset-to-main-preserve-state"
         )

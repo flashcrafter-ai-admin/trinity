@@ -4,13 +4,23 @@ name: container-security
 #
 # These checks used to live in `frontend-e2e.yml`, which is `ui`-label
 # gated and therefore skipped on backend infrastructure PRs — the exact
-# PRs that can break them. This workflow runs on every PR (and push to
-# dev/main); the heavy `verify-non-root` job is gated by the `changes`
-# detector so it executes whenever the Docker / compose / bootstrap
-# surface changes and is SKIPPED (→ passing required check) otherwise.
-# That keeps it a safe required status check — see #1222.
+# PRs that can break them. This workflow runs on any PR (and push to
+# dev/main) and self-skips the heavy stack boot when the relevant Docker /
+# compose / bootstrap surface is untouched, so the guard executes whenever
+# it could possibly regress while staying cheap on unrelated PRs.
 #
-# Scope:
+# REQUIRED-CHECK SAFETY (self-skip): `verify-non-root` is a REQUIRED status
+# check on `dev`. A purely path-filtered workflow that doesn't run on an
+# unrelated PR leaves the required context ABSENT, which GitHub holds at
+# "Expected — waiting for status" forever — bricking every PR that doesn't
+# touch the container surface. So the job now runs on EVERY PR and self-skips
+# the heavy steps (stack boot + UID asserts) when no relevant file changed:
+# it then passes trivially, satisfying the required check without doing work.
+# When a relevant file changes, the full verification runs and can fail.
+# Change detection is pure `git diff` — no third-party action, no token scope
+# beyond `contents: read`.
+#
+# Scope (when the heavy path runs):
 #   - `verify-non-root`: every Trinity-built service that holds platform
 #     credentials or the docker.sock mount runs as the expected non-root
 #     UID, AND the backend can still reach `/var/run/docker.sock` on
@@ -26,6 +36,13 @@ name: container-security
 on:
   push:
     branches: [dev, main]
+    paths:
+      - 'docker/**'
+      - 'docker-compose*.yml'
+      - 'scripts/deploy/start.sh'
+      - 'tests/deploy/**'
+      - 'src/mcp-server/Dockerfile'
+      - '.github/workflows/container-security.yml'
   pull_request:
   workflow_dispatch:
 
@@ -37,44 +54,47 @@ permissions:
   contents: read
 
 jobs:
-  # Cheap path detector — runs on every PR/push so the required `verify-non-root`
-  # context is ALWAYS produced. The heavy stack-boot job below is gated on it, so
-  # an unrelated PR skips it (→ passing required check) rather than leaving the
-  # context "expected" forever (the #1222 freeze).
-  changes:
-    runs-on: ubuntu-latest
-    # paths-filter resolves the PR's changed-file list via the API; the heavy
-    # verify-non-root job keeps the workflow-level least-privilege contents: read.
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      docker: ${{ steps.filter.outputs.docker }}
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dorny/paths-filter@v3
-        id: filter
-        with:
-          filters: |
-            docker:
-              - 'docker/**'
-              - 'docker-compose*.yml'
-              - 'scripts/deploy/start.sh'
-              - 'src/mcp-server/Dockerfile'
-              - '.github/workflows/container-security.yml'
-
   verify-non-root:
-    needs: changes
-    # Skipped (→ reported as a passing required check) when no docker/compose
-    # paths changed; boots the stack and verifies UIDs for real when they did.
-    if: needs.changes.outputs.docker == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # need base history to diff the PR's changed paths
+
+      - name: Detect container-surface changes
+        id: changes
+        env:
+          GH_EVENT: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # Only PRs self-skip. push is already path-filtered to the container
+          # surface, and dispatch is a deliberate manual run — both run fully.
+          if [ "$GH_EVENT" != "pull_request" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            echo "event=$GH_EVENT — running the full verification."
+            exit 0
+          fi
+          if [ -z "$PR_BASE_SHA" ] || [ "$PR_BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            echo "no base sha available — running the full verification."
+            exit 0
+          fi
+          CHANGED="$(git diff --name-only "$PR_BASE_SHA...$PR_HEAD_SHA")"
+          echo "Changed files in PR:"; echo "$CHANGED"
+          if printf '%s\n' "$CHANGED" | grep -qE '^(docker/|docker-compose[^/]*\.yml$|scripts/deploy/start\.sh$|src/mcp-server/Dockerfile$|\.github/workflows/container-security\.yml$)'; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            echo "container-surface files changed — running the full verification."
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+            echo "No container-surface files changed — required check trivially satisfied (self-skip)."
+          fi
 
       - name: Generate CI admin password
+        if: steps.changes.outputs.relevant == 'true'
         # I-01 fix (cso-diff-2026-05-17): replace any hardcoded fallback
         # with a per-run random value so the repo never publishes a
         # default admin credential, even one only reachable from the
@@ -96,6 +116,7 @@ jobs:
           echo "ADMIN_PASSWORD=$PASS" >> "$GITHUB_ENV"
 
       - name: Start Trinity stack
+        if: steps.changes.outputs.relevant == 'true'
         env:
           # ADMIN_PASSWORD is inherited from GITHUB_ENV (see the
           # "Generate CI admin password" step above).
@@ -111,6 +132,7 @@ jobs:
           ./scripts/deploy/start.sh
 
       - name: Wait for backend health
+        if: steps.changes.outputs.relevant == 'true'
         run: |
           for i in {1..60}; do
             if curl -fsS http://localhost:8000/health >/dev/null 2>&1; then
@@ -121,6 +143,7 @@ jobs:
           echo "backend never became healthy"; exit 1
 
       - name: Skip first-time setup wizard
+        if: steps.changes.outputs.relevant == 'true'
         # On a fresh DB the admin user is bootstrapped from ADMIN_PASSWORD,
         # but `setup_completed` stays false — so /api/token returns 403
         # `setup_required` until an operator completes the wizard. The
@@ -131,6 +154,7 @@ jobs:
           docker exec trinity-backend python3 -c "from database import db; db.set_setting('setup_completed', 'true'); print('setup_completed=true')"
 
       - name: Verify non-root containers and Docker socket reachability
+        if: steps.changes.outputs.relevant == 'true'
         run: |
           set -euo pipefail
           for c in trinity-backend trinity-scheduler trinity-mcp-server; do
@@ -159,6 +183,7 @@ jobs:
           echo "verify-non-root: PASS"
 
       - name: Verify prod frontend image UID
+        if: steps.changes.outputs.relevant == 'true'
         # I-02 fix (cso-diff-2026-05-17): close the #874 CI gap for the
         # prod frontend image. start.sh boots the dev compose (Vite-dev
         # image), so the prod image (nginxinc/nginx-unprivileged:alpine,
@@ -179,14 +204,30 @@ jobs:
           echo "verify-prod-frontend-uid: PASS"
 
       - name: Collect Trinity logs on failure
-        if: failure()
+        if: failure() && steps.changes.outputs.relevant == 'true'
         run: |
           docker compose logs --no-color --tail=200 backend frontend mcp-server scheduler > trinity-logs.txt || true
 
       - name: Upload failure artifacts
-        if: failure()
+        if: failure() && steps.changes.outputs.relevant == 'true'
         uses: actions/upload-artifact@v7
         with:
           name: container-security-failure
           path: trinity-logs.txt
           retention-days: 14
+
+  # #1131: lock start.sh's DOCKER_GID detection. This is the ONLY guard for the
+  # probe path — verify-non-root above runs on the Linux runner where the socket
+  # IS group-owned by `docker`, so it never exercises the Docker Desktop / Colima
+  # / rootless probe branch that the #1131 fix turns on. The bash test is
+  # hermetic (it shims `docker`/`getent`/`uname` and extracts the real functions
+  # from start.sh), so it needs no daemon and runs in ~1s. Separate job, not
+  # gated on the container-surface self-skip, so the GID invariant is always
+  # checked on every PR.
+  verify-docker-gid-detection:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - name: Run ensure_docker_gid regression test
+        run: bash tests/deploy/test_docker_gid.sh

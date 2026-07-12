@@ -21,7 +21,7 @@ View, monitor, and manage task executions across all agents. Executions are crea
 | `fan_out` | Fan-out to multiple agents |
 | `loop` | Sequential agent loop iteration |
 
-**Execution Status** -- Every execution moves through a lifecycle: `queued` -> `running` -> `success`, `failed`, `error`, `cancelled`, or `skipped`.
+**Execution Status** -- Every execution moves through a lifecycle: `queued` -> `running` -> `success`, `failed`, `error`, `cancelled`, or `skipped`. A run you stop yourself terminates as `cancelled` — a distinct state, not a failure: it has its own filter option and badge in the Executions list, and renders neutral (not red) on the activity timeline.
 
 **Parallel Capacity** -- Each agent has a configurable slot system (default: 3 concurrent slots). Slot TTL equals the agent timeout plus a 5-minute buffer. When all slots are occupied, new executions queue until a slot frees up.
 
@@ -32,6 +32,8 @@ View, monitor, and manage task executions across all agents. Executions are crea
 ## How It Works
 
 ### Executions Tab (Operations Page)
+
+![Operations page — Executions tab listing task runs across the fleet with Total, Success rate, Failed, and Cost stat cards and per-agent/status/trigger filters](../images/operations-executions.png)
 
 The fleet execution list lives on the **Executions** tab of the [Operations page](operating-room.md) (`/operations?tab=executions`). The legacy `/executions` route redirects there.
 

@@ -9,7 +9,8 @@ Key Pattern:
 - agent:slot:{name}:{execution_id} (HASH) - Slot metadata (auto-expires)
 
 Slot Rules:
-- Each agent has configurable max_parallel_tasks (1-10, default 3)
+- Each agent has configurable max_parallel_tasks (1..fleet ceiling, default 3;
+  ceiling is the admin-set `max_parallel_tasks_ceiling`, default 10 — #506)
 - Parallel /task endpoint respects capacity limits
 - Return 429 when at capacity
 - Slots auto-expire after 30 minutes (safety net)
@@ -184,7 +185,15 @@ class SlotService:
         # BACKLOG-001: Notify registered drain listeners. Fire-and-forget via
         # create_task so release_slot stays cheap. Wrap in a guard so a crash
         # in one callback doesn't cancel the others.
-        if self._on_release_callbacks:
+        #
+        # #1083 (Codex #12): gate the drain on `removed`. A release for an
+        # execution_id that no longer holds the slot (a replayed/late
+        # fire-and-forget callback, a double-release) frees NO capacity, so
+        # firing the drain would admit a backlog row past max_parallel_tasks.
+        # Every legitimate drain trigger removes a present member (the backlog
+        # sentinel swap and capacity.release both release an id they just held),
+        # so this only suppresses the spurious replay drain.
+        if removed and self._on_release_callbacks:
             for cb in self._on_release_callbacks:
                 try:
                     asyncio.create_task(self._safe_invoke(cb, agent_name))
@@ -266,17 +275,25 @@ class SlotService:
         Returns:
             Dict mapping agent_name to {"max": N, "active": M}
         """
-        result = {}
+        if not agent_capacities:
+            return {}
 
-        for agent_name, max_tasks in agent_capacities.items():
-            slots_key = self._slots_key(agent_name)
-            active_count = self.redis.zcard(slots_key)
-            result[agent_name] = {
-                "max": max_tasks,
-                "active": active_count
-            }
+        # #1265: one pipelined round-trip instead of an N+1 ZCARD per agent
+        # (Dashboard polls this for the whole fleet every few seconds).
+        agent_names = list(agent_capacities.keys())
+        try:
+            pipe = self.redis.pipeline(transaction=False)
+            for agent_name in agent_names:
+                pipe.zcard(self._slots_key(agent_name))
+            counts = pipe.execute()
+        except Exception:  # noqa: BLE001 — fail open to zero active (slot meter is advisory here)
+            logger.debug("slots: bulk zcard pipeline failed", exc_info=True)
+            counts = [0] * len(agent_names)
 
-        return result
+        return {
+            agent_name: {"max": agent_capacities[agent_name], "active": counts[idx] or 0}
+            for idx, agent_name in enumerate(agent_names)
+        }
 
     async def _cleanup_stale_slots_for_agent(
         self, agent_name: str, default_slot_ttl: int = None

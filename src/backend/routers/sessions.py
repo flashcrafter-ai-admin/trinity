@@ -20,13 +20,12 @@ from datetime import datetime
 from typing import Optional
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Query
-from pydantic import BaseModel, Field
 
 from database import db
 from db_models import WebFileUpload, SessionMessageInsert
 from dependencies import AuthorizedAgent, get_current_user
-from models import User
-from services.docker_service import get_agent_container
+from models import CreateSessionRequest, SessionMessageRequest, User
+from services.docker_service import get_agent_container, get_agent_status_from_container
 from services.session_cleanup_service import get_session_cleanup_service
 from services.settings_service import is_session_tab_enabled
 from services.task_execution_service import get_task_execution_service
@@ -46,31 +45,6 @@ router = APIRouter(prefix="/api/agents", tags=["sessions"])
 
 
 # ---------------------------------------------------------------------------
-# Request / response models
-# ---------------------------------------------------------------------------
-
-
-class CreateSessionRequest(BaseModel):
-    """Optional body for POST /session. All fields optional."""
-
-    subscription_id: Optional[str] = None
-
-
-class SessionMessageRequest(BaseModel):
-    """Body for the turn endpoint."""
-
-    message: str = Field(..., min_length=1)
-    model: Optional[str] = None
-    timeout_seconds: Optional[int] = None
-    # File attachments — same shape as ParallelTaskRequest.files (#364).
-    # Images become vision blocks for the model; non-images are written
-    # into the agent workspace and a "[File uploaded by X]: name (size)
-    # saved to path" line is appended to the prompt so the agent can
-    # `Read` them. (Phase 5.2 file-upload parity with Chat.)
-    files: Optional[list] = None
-
-
-# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -79,6 +53,33 @@ def _enabled_or_404() -> None:
     """Phase 1.6 flag gate. 404 keeps the surface invisible when off."""
     if not is_session_tab_enabled():
         raise HTTPException(status_code=404, detail="Not Found")
+
+
+# #1187 Phase H: runtimes whose Session-tab turns must NOT use the cached-UUID
+# `--resume` machinery. They support plain chat continuity (in the Chat tab) but
+# not the Session tab's Claude-JSONL resume/fallback/reaping model, so we run a
+# stateless turn for them instead. ONE backend constant (decision 1) — keep in
+# sync with the agent-side `RuntimeCapabilities.session_tab_resume`.
+RUNTIMES_WITHOUT_SESSION_TAB_RESUME = {"codex"}
+
+
+def _supports_session_tab_resume(agent_name: str) -> bool:
+    """False for runtimes (e.g. Codex) that lack the cached-UUID `--resume`
+    machinery. Defaults to True on any lookup failure — assume Claude-like
+    so a transient Docker hiccup never silently downgrades a real session."""
+    try:
+        container = get_agent_container(agent_name)
+        if container is None:
+            return True
+        status = get_agent_status_from_container(container)
+        runtime = (status.runtime or "claude-code").lower()
+        return runtime not in RUNTIMES_WITHOUT_SESSION_TAB_RESUME
+    except Exception:
+        logger.warning(
+            "[Session] runtime lookup failed for %s; assuming resume-capable",
+            agent_name, exc_info=True,
+        )
+        return True
 
 
 def _session_or_404(session_id: str, user: User, agent_name: str):
@@ -610,6 +611,17 @@ async def send_session_message(
     lock_ttl = _resolve_lock_ttl(name)
     async with _InflightSentinel(session.id, lock_ttl):
         cached_uuid = db.get_cached_claude_session_id(session.id)
+
+        # #1187 Phase H: for runtimes lacking the cached-UUID --resume model
+        # (Codex), run a plain stateless turn — the Claude-specific resume +
+        # JSONL-not-found fallback below would mis-handle their failure markers.
+        # Only pay the runtime lookup when there's actually a cached UUID to drop.
+        if cached_uuid and not _supports_session_tab_resume(name):
+            logger.info(
+                "[Session] agent=%s runtime lacks session-tab resume — "
+                "running a stateless turn (no --resume)", name,
+            )
+            cached_uuid = None
 
         service = get_task_execution_service()
         fallback_fired = False

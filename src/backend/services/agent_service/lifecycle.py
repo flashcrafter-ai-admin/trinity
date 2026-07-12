@@ -23,9 +23,11 @@ from services.docker_utils import (
     volume_get, volume_create, containers_run
 )
 from services.agent_service.helpers import validate_base_image
+from services.agent_runtime_state import clear_agent_breakers
 from services.settings_service import get_anthropic_api_key, get_github_pat, get_agent_full_capabilities, get_agent_default_resources
 from services.skill_service import skill_service
-from .helpers import check_shared_folder_mounts_match, check_api_key_env_matches, check_github_pat_env_matches, check_resource_limits_match, check_full_capabilities_match, check_guardrails_env_matches
+from .helpers import check_shared_folder_mounts_match, check_api_key_env_matches, check_github_pat_env_matches, check_resource_limits_match, check_full_capabilities_match, check_guardrails_env_matches, check_agent_auth_token_env_matches, is_claude_runtime
+from services.agent_auth import derive_agent_token
 from .file_sharing import check_public_folder_mount_matches
 from .read_only import inject_read_only_hooks, remove_read_only_hooks
 from services.platform_package_service import (
@@ -105,6 +107,8 @@ from .capabilities import (  # noqa: F401
     PROHIBITED_CAPABILITIES,
     AGENT_TMPFS_MOUNT,
     AGENT_DEFAULT_TMPDIR,
+    normalize_cpu,
+    normalize_memory,
 )
 
 
@@ -271,9 +275,31 @@ async def start_agent_internal(agent_name: str) -> dict:
         not check_github_pat_env_matches(container, agent_name) or
         not check_resource_limits_match(container, agent_name) or
         not check_full_capabilities_match(container, agent_name) or
-        not check_guardrails_env_matches(container, agent_name)
-        or not platform_package_mounts_match(container, client=docker_client)
+        not check_guardrails_env_matches(container, agent_name) or
+        not platform_package_mounts_match(container, client=docker_client) or
+        not check_agent_auth_token_env_matches(container, agent_name)
     )
+
+    # #1560: the heartbeat markers and both circuit breakers are keyed by agent
+    # NAME, not by container identity, so a recreated container inherits the
+    # verdict recorded against its predecessor — a fresh, healthy agent is
+    # fast-failed with "agent is unhealthy" without ever being contacted. Any
+    # config drift above (subscription switch, resource change, auth-token
+    # rotation, guardrails edit) recreates the container, and a fleet-wide
+    # rotation recreates every agent at once, so this is the load-bearing clear.
+    #
+    # Runs BEFORE the recreate/start below, not after: `recreate_container_with_
+    # updated_config` starts the replacement via `containers_run(detach=True)`, so
+    # clearing afterwards would leave a window in which a concurrent dispatch
+    # reads the predecessor's verdict against a container that is already up.
+    #
+    # Gated on the container having actually changed or come up: a no-op start of
+    # an already-running agent must NOT reset a breaker, otherwise re-issuing
+    # `start` would let an operator defeat the breaker protecting a genuinely
+    # wedged agent. Slots are deliberately untouched here — the container is live
+    # (see services/agent_runtime_state.py).
+    if needs_recreation or not was_already_running:
+        clear_agent_breakers(agent_name)
 
     if needs_recreation:
         # Recreate container with updated config
@@ -372,11 +398,26 @@ async def recreate_container_with_updated_config(agent_name: str, old_container,
     # Claude Code prioritizes ANTHROPIC_API_KEY over CLAUDE_CODE_OAUTH_TOKEN,
     # so when a subscription is assigned we must remove the API key and set
     # the token env var instead.
+    #
+    # This whole juggle is Claude-only: subscriptions are Claude-OAuth tokens.
+    # Non-Claude runtimes (Gemini, Codex) authenticate from their own .env
+    # (CRED-002) and must NEVER receive a Claude subscription token on recreate,
+    # even if a subscription row somehow exists for them (#1187 decision 7).
+    _runtime = (
+        env_vars.get('AGENT_RUNTIME')
+        or labels.get('trinity.agent-runtime')
+        or 'claude-code'
+    )
+    _is_claude_runtime = is_claude_runtime(_runtime)
     subscription_id = db.get_agent_subscription_id(agent_name)
     has_subscription = subscription_id is not None
     use_platform_key = db.get_use_platform_api_key(agent_name)
 
-    if has_subscription:
+    if not _is_claude_runtime:
+        # Non-Claude: leave the agent's own credentials in place; never inject a
+        # Claude token.
+        env_vars.pop('CLAUDE_CODE_OAUTH_TOKEN', None)
+    elif has_subscription:
         # Subscription assigned — inject token, remove API key
         token = db.get_subscription_token(subscription_id)
         if token:
@@ -391,12 +432,18 @@ async def recreate_container_with_updated_config(agent_name: str, old_container,
         env_vars.pop('ANTHROPIC_API_KEY', None)
         env_vars.pop('CLAUDE_CODE_OAUTH_TOKEN', None)
 
-    # Update GITHUB_PAT using per-agent PAT first, then platform PAT
-    if env_vars.get('GITHUB_PAT'):
+    # Update GITHUB_PAT using per-agent PAT first, then platform PAT.
+    _per_agent_pat = bool(db.get_agent_github_pat(agent_name)) and bool(db.get_git_config(agent_name))
+    if env_vars.get('GITHUB_PAT') or _per_agent_pat:
         from routers.git import get_github_pat_for_agent
         current_pat = get_github_pat_for_agent(agent_name)
         if current_pat:
             env_vars['GITHUB_PAT'] = current_pat
+    # NB: gated on db.get_agent_github_pat (NOT the global fallback) so a global-
+    # only PAT is never injected into a previously-tokenless container (#211's
+    # opt-in path); kept in sync with the recreate matcher so the two converge.
+    # Inlined via db rather than importing the helper, so a test stubbing
+    # services.agent_service.helpers can't break this module's import (#1271 CI).
 
     # GUARD-001: re-serialise guardrails overrides into env so startup.sh
     # can render the runtime config with the latest values.
@@ -406,6 +453,23 @@ async def recreate_container_with_updated_config(agent_name: str, old_container,
         env_vars['AGENT_GUARDRAILS'] = _json.dumps(guardrails_override)
     else:
         env_vars.pop('AGENT_GUARDRAILS', None)
+
+    # #1369: refresh the operator-configurable headless stall-watchdog ceiling
+    # from the CURRENT backend env on every recreate (set or clear, mirroring the
+    # guardrails idiom above), so changing/unsetting AGENT_TOOL_STALL_LIMIT_S
+    # takes effect on recreate rather than persisting a stale baked value.
+    _stall_limit = (os.getenv('AGENT_TOOL_STALL_LIMIT_S') or '').strip()
+    if _stall_limit:
+        env_vars['AGENT_TOOL_STALL_LIMIT_S'] = _stall_limit
+    else:
+        env_vars.pop('AGENT_TOOL_STALL_LIMIT_S', None)
+
+    # #1159: refresh the per-agent auth token. Deterministic from agent_name, so
+    # this re-derives under the CURRENT name — the load-bearing part of the
+    # rename fix (a renamed container otherwise keeps derive(old_name) and 401s
+    # once enforcement is on). check_agent_auth_token_env_matches forces this
+    # recreate whenever the running token is missing or stale.
+    env_vars['TRINITY_AGENT_AUTH_TOKEN'] = derive_agent_token(agent_name)
 
     # Get port from labels
     ssh_port = int(labels.get("trinity.ssh-port", 2222))
@@ -419,6 +483,13 @@ async def recreate_container_with_updated_config(agent_name: str, old_container,
     else:
         cpu = labels.get("trinity.cpu") or system_defaults["cpu"]
         memory = labels.get("trinity.memory") or system_defaults["memory"]
+
+    # #1197: validate/normalize before they reach Docker (int(cpu) NanoCpus /
+    # mem_limit). A stale label or DB override carrying a non-integer cpu or a
+    # Kubernetes-style memory would otherwise crash recreate with an opaque
+    # ValueError; fail with a clear message instead.
+    cpu = normalize_cpu(cpu, system_defaults["cpu"])
+    memory = normalize_memory(memory, system_defaults["memory"])
 
     # Update labels with new resource limits for future reference
     labels["trinity.cpu"] = cpu

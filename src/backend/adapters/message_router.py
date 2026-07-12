@@ -24,6 +24,7 @@ from collections import defaultdict
 from database import db
 from services.docker_service import get_agent_container
 from services.platform_prompt_service import (
+    build_public_channel_caller_prompt,
     format_user_memory_block,
     summarize_user_memory_background,
 )
@@ -126,6 +127,132 @@ def _format_group_sender(message: NormalizedMessage) -> str:
         parts.append(f"[From: User #{message.sender_id}]")
 
     return "\n".join(parts)
+
+
+def _format_channel_identity(message: NormalizedMessage) -> str:
+    """Format channel + sender identity for a non-group channel message (#350).
+
+    Driven by metadata an adapter's ``enrich_message`` populated
+    (``channel_name`` / ``sender_display_name`` / ``sender_username``). Returns
+    a prefix like::
+
+        [Channel: #engineering]
+        [From: John Smith (@johndoe)]
+
+    Gated on ``channel_name`` presence, so this fires only for channel messages
+    (Slack #channel), never DMs or channels without enrichment (empty string ⇒
+    context unchanged).
+    """
+    channel_name = message.metadata.get("channel_name")
+    if not channel_name:
+        return ""
+
+    parts = [f"[Channel: #{channel_name}]"]
+    display = message.metadata.get("sender_display_name")
+    username = message.metadata.get("sender_username")
+    if display and username:
+        parts.append(f"[From: {display} (@{username})]")
+    elif display:
+        parts.append(f"[From: {display}]")
+    elif username:
+        parts.append(f"[From: @{username}]")
+    else:
+        parts.append(f"[From: User {message.sender_id}]")
+    return "\n".join(parts)
+
+
+def _sender_label(message: NormalizedMessage) -> Optional[str]:
+    """Per-message speaker label persisted with a channel user's turn (#903).
+
+    Thread-scoped channel sessions can hold turns from several users, so each
+    stored message carries who spoke it — replayed as an attributed history line
+    (``Alice: …``) instead of a flat ``User:``. Reuses the same
+    ``enrich_message`` metadata as ``_format_channel_identity`` (display name /
+    username). Returns ``None`` for DMs and un-enriched messages, so the history
+    renderer falls back to the role label.
+
+    The label is a channel-controlled display name rendered in the structural
+    ``{speaker}:`` position of the replayed transcript, so newlines/control
+    chars are stripped before it can forge an ``Assistant:`` line (defence in
+    depth: Slack names are single-line today, but the label is persisted and
+    replayed, and future adapters may source multi-line names).
+    """
+    display = _sanitize_label(message.metadata.get("sender_display_name"))
+    username = _sanitize_label(message.metadata.get("sender_username"))
+    if display and username:
+        return f"{display} (@{username})"
+    if display:
+        return display
+    if username:
+        return f"@{username}"
+    return None
+
+
+def _sanitize_label(value: Optional[str]) -> Optional[str]:
+    """Collapse newlines/control chars in an untrusted speaker label (#903).
+
+    Keeps the label on one line so it can't inject a forged role turn into the
+    replayed transcript. A no-op for legitimate names. Returns ``None`` when the
+    result is empty after stripping.
+    """
+    if not value:
+        return None
+    cleaned = " ".join(value.split())
+    return cleaned or None
+
+
+def _assistant_sender_email(
+    message: NormalizedMessage, verified_email: Optional[str]
+) -> Optional[str]:
+    """Email to stamp on the assistant turn for sender-filtered MEM-001 (#903).
+
+    A single-participant session (any DM — Slack/Telegram/WhatsApp — plus web)
+    returns ``verified_email`` so the sender-filtered summarizer keeps the
+    assistant's replies in that user's memory (parity with the web path,
+    pre-#903 behavior). A shared, multi-participant session returns ``None`` so a
+    reply addressed to the whole thread is never folded into one participant's
+    durable memory.
+
+    Two multi-participant shapes exist, each flagged by its own adapter's signal:
+    a Slack *channel* thread (Slack sets ``is_dm`` explicitly ``False`` and never
+    sets ``is_group``) and a group chat (Telegram sets ``is_group``). Keying on
+    ``is_dm`` alone would wrongly null Telegram/WhatsApp DMs (they never set
+    ``is_dm``); keying on ``not is_group`` alone would wrongly stamp Slack channel
+    threads (Slack never sets ``is_group``). So combine both signals.
+    """
+    is_shared_thread = (
+        message.metadata.get("is_dm") is False
+        or message.metadata.get("is_group", False)
+    )
+    return None if is_shared_thread else verified_email
+
+
+def _agent_avatar_url(agent_name: str) -> Optional[str]:
+    """Best-effort public URL to an agent's avatar for a channel bot icon (#292).
+
+    Slack (and any channel supporting a per-message icon) needs a publicly
+    fetchable URL. Returns None when no public base URL is configured; a
+    private/unreachable base is harmless — the channel simply falls back to its
+    default icon. Cache-busts with ``avatar_updated_at`` when available so the
+    channel refetches after an avatar change. The avatar endpoint 404s cleanly
+    for avatar-less agents, so we don't gate on existence.
+    """
+    try:
+        base = settings_service.get_public_chat_url()
+        if not base:
+            return None
+        url = f"{base.rstrip('/')}/api/agents/{agent_name}/avatar"
+        identity = db.get_avatar_identity(agent_name)
+        updated_at = identity.get("updated_at") if identity else None
+        if updated_at:
+            # digits-only cache-bust token from the ISO timestamp
+            ver = "".join(ch for ch in str(updated_at) if ch.isdigit())
+            if ver:
+                url = f"{url}?v={ver}"
+        return url
+    except Exception:  # noqa: BLE001 — icon is best-effort, never blocks a reply
+        logger.debug("[#292] avatar URL build failed for %s", agent_name, exc_info=True)
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +389,11 @@ class ChannelMessageRouter:
             return
         agent_name, bot_token = resolved
 
+        # 2a. Enrich with async-fetched sender/channel identity (#350). No-op on
+        # channels whose event already carries identity (Telegram); Slack fills
+        # in display name + channel name here. Best-effort — never raises.
+        await adapter.enrich_message(message)
+
         # 2b. Transcribe Telegram voice notes in place (no-op elsewhere).
         message = await self._maybe_transcribe_voice(adapter, message, bot_token, channel)
 
@@ -295,6 +427,20 @@ class ChannelMessageRouter:
         if not allowed:
             return
 
+        # 5c. Record the client on the Sharing-tab roster (#1533). Deliberately
+        # placed *after* the access gate: firing it earlier would let any
+        # unauthenticated stranger who messages the bot create unbounded
+        # chat-link rows. Groups are skipped — a chat link is a DM concept, so
+        # counting group traffic would list members who never DM'd the agent.
+        # Best-effort: a counter write must never block message processing.
+        if not is_group:
+            try:
+                await adapter.record_inbound_activity(message, agent_name)
+            except Exception as e:
+                logger.warning(
+                    f"[ROUTER:{channel}] record_inbound_activity failed for {agent_name}: {e}"
+                )
+
         # 6. Get/create session
         logger.debug(f"[ROUTER:{channel}] Step 6 - creating session")
         session_identifier = adapter.get_session_identifier(message)
@@ -313,6 +459,12 @@ class ChannelMessageRouter:
             context_prompt = f"{sender_context}\n\n{message.text}"
         else:
             context_prompt = db.build_public_chat_context(session_id, message.text)
+            # #350: prepend channel + sender identity for channel (non-DM)
+            # messages so the agent knows who is speaking. Empty for DMs and
+            # un-enriched channels → context unchanged.
+            identity_prefix = _format_channel_identity(message)
+            if identity_prefix:
+                context_prompt = f"{identity_prefix}\n\n{context_prompt}"
         logger.debug(f"[ROUTER:{channel}] Step 7 - context built ({len(context_prompt)} chars, group={is_group})")
 
         # 7b. Handle file uploads — download via adapter, copy into agent container.
@@ -432,13 +584,20 @@ class ChannelMessageRouter:
                 source_user_email=source_email,
                 timeout_seconds=None,  # Uses agent's configured timeout (TIMEOUT-001)
                 allowed_tools=public_allowed_tools,
-                system_prompt=memory_system_prompt,
+                # #894: per-agent public-channel model override (None → platform default).
+                model=db.get_public_channel_model(agent_name),
+                # #1205: public/channel custom instructions + MEM-001 memory.
+                system_prompt=build_public_channel_caller_prompt(
+                    agent_name, memory_system_prompt
+                ),
                 images=image_data or None,
             )
 
-            if result.status == "failed":
+            if result.status in ("failed", "cancelled"):
+                # #679: a CANCELLED turn is non-delivery — surface the cancel
+                # notice instead of posting the empty response as if it succeeded.
                 error_msg = result.error or "Unknown error"
-                logger.error(f"[ROUTER:{channel}] Step 9 - task failed: {error_msg}")
+                logger.info(f"[ROUTER:{channel}] Step 9 - task {result.status}: {error_msg}")
                 await adapter.indicate_done(message)
 
                 # Reply with the actual error if available, otherwise generic message
@@ -495,10 +654,26 @@ class ChannelMessageRouter:
         # 10. Done processing — show completion indicator
         await adapter.indicate_done(message)
 
-        # 11. Persist messages in session
+        # 11. Persist messages in session, with per-speaker attribution (#903).
+        # The user turn carries verified_email (drives sender-filtered MEM-001
+        # summarization) + a display label (attributed history replay for
+        # multi-participant threads); the assistant turn is labelled by agent.
         logger.debug(f"[ROUTER:{channel}] Step 11 - persisting messages")
-        db.add_public_chat_message(session_id, "user", message.text)
-        db.add_public_chat_message(session_id, "assistant", response_text, cost=result.cost)
+        db.add_public_chat_message(
+            session_id, "user", message.text,
+            sender_email=verified_email,
+            sender_label=_sender_label(message),
+        )
+        # #903: stamp the assistant turn only for single-participant sessions so
+        # the sender-filtered MEM-001 summarizer keeps assistant replies in that
+        # user's memory (DMs + web) but never folds a shared-thread reply into
+        # one participant's memory. See _assistant_sender_email for the per-
+        # channel signal handling.
+        db.add_public_chat_message(
+            session_id, "assistant", response_text, cost=result.cost,
+            sender_email=_assistant_sender_email(message, verified_email),
+            sender_label=agent_name,
+        )
 
         # 11a. MEM-001 (#895): mirror the web path — increment per-user count
         # and fire-and-forget the conversation summarizer every 5 messages.
@@ -546,6 +721,12 @@ class ChannelMessageRouter:
 
         logger.debug(f"[ROUTER:{channel}] Step 12 - sending response")
         response_metadata = {"bot_token": bot_token, "agent_name": agent_name}
+        # #292: hand the agent's avatar to channels that render a per-message bot
+        # icon (Slack `icon_url`). Best-effort — None when the agent has no
+        # avatar or no public base URL is set; adapters ignore it otherwise.
+        avatar_url = _agent_avatar_url(agent_name)
+        if avatar_url:
+            response_metadata["agent_avatar_url"] = avatar_url
         if is_group:
             response_metadata["is_group"] = True
         await adapter.send_response(

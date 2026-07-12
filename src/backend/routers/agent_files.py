@@ -1,12 +1,10 @@
 """Agent file management, info, and folder endpoints."""
-from typing import Optional
-
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
 
 from models import User
 from database import db
 from dependencies import get_current_user, AuthorizedAgentByName
+from services.agent_auth import agent_httpx_client
 from services.docker_service import get_agent_container
 from services.docker_utils import container_reload
 from services.agent_service import (
@@ -28,12 +26,20 @@ from services.agent_service import (
     get_file_sharing_status_logic,
     set_file_sharing_status_logic,
 )
-from models import ShareFileMcpRequest, ShareFileResponse, SharedFileInfo, SharedFilesList
+from models import (
+    CreateFolderRequest,
+    FileUpdateRequest,
+    ShareFileMcpRequest,
+    ShareFileResponse,
+    SharedFileInfo,
+    SharedFilesList,
+)
 from services.agent_shared_files_service import (
     create_share,
     build_download_url,
     MAX_AGENT_QUOTA_BYTES,
 )
+from services.idempotency_service import EffectInProgressError
 from services.platform_audit_service import platform_audit_service, AuditEventType
 
 router = APIRouter(prefix="/api/agents", tags=["agents"])
@@ -69,7 +75,7 @@ async def get_agent_playbooks_endpoint(
 
     try:
         agent_url = f"http://agent-{agent_name}:8000/api/skills"
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with agent_httpx_client(agent_name, timeout=10.0) as client:
             response = await client.get(agent_url)
             if response.status_code == 200:
                 return response.json()
@@ -119,7 +125,7 @@ async def get_agent_info_endpoint(
 
     try:
         agent_url = f"http://agent-{agent_name}:8000/api/template/info"
-        async with httpx.AsyncClient(timeout=10.0) as client:
+        async with agent_httpx_client(agent_name, timeout=10.0) as client:
             response = await client.get(agent_url)
             if response.status_code == 200:
                 data = response.json()
@@ -211,11 +217,6 @@ async def delete_agent_file_endpoint(
     return await delete_agent_file_logic(agent_name, path, current_user, request)
 
 
-class FileUpdateRequest(BaseModel):
-    """Request body for file updates."""
-    content: str
-
-
 @router.put("/{agent_name}/files")
 async def update_agent_file_endpoint(
     agent_name: str,
@@ -231,11 +232,6 @@ async def update_agent_file_endpoint(
         body: Request body with content
     """
     return await update_agent_file_logic(agent_name, path, body.content, current_user, request)
-
-
-class CreateFolderRequest(BaseModel):
-    """Request body for folder creation."""
-    path: str
 
 
 @router.post("/{agent_name}/files/mkdir")
@@ -478,13 +474,20 @@ async def share_agent_file(
             detail="Agent-scoped MCP key cannot share files for a different agent.",
         )
 
-    result = await create_share(
-        agent_name=agent_name,
-        filename=body.filename,
-        display_name=body.display_name,
-        expires_in=body.expires_in,
-        created_by=actor_agent or current_user.username,
-    )
+    try:
+        result = await create_share(
+            agent_name=agent_name,
+            filename=body.filename,
+            display_name=body.display_name,
+            expires_in=body.expires_in,
+            created_by=actor_agent or current_user.username,
+            execution_id=body.execution_id,
+            dedup_label=body.dedup_label,
+        )
+    except EffectInProgressError as e:
+        # Concurrent duplicate share for the same (execution, file) is mid-flight
+        # (#1084). Retryable — never a silent skip-and-succeed.
+        raise HTTPException(status_code=409, detail=str(e))
     return ShareFileResponse(**result)
 
 

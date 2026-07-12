@@ -258,7 +258,7 @@ Uvicorn runs `--workers 2` in production. HTTP requests (REST `/voice/start`, `/
 | Requirement | Detail |
 |-------------|--------|
 | Function declaration | `_RUN_TASK_TOOL` (`FunctionDeclaration` for `run_task`) registered in `LiveConnectConfig` |
-| Spoken-filler etiquette | `run_task` is a **blocking** Gemini function call — the model emits no audio from the moment it decides to call until `send_tool_response` returns (up to ~30s), which on a phone call reads as dead air. `_TOOL_ETIQUETTE_INSTRUCTION` is appended to every session's `system_instruction` (in `connect_and_stream`, so it covers browser **and** phone) and the `run_task` description is sharpened, instructing the model to say a brief filler ("let me check that for you") before calling. Prompt-side fix; no SDK change. A future upgrade to non-blocking async function calling (`Behavior.NON_BLOCKING` + `FunctionResponseScheduling`) would remove the dead air entirely but requires bumping `google-genai` past the pinned `1.12.1`. |
+| Spoken-filler etiquette | `run_task` is a **blocking** Gemini function call — the model emits no audio from the moment it decides to call until `send_tool_response` returns (up to ~30s), which on a phone call reads as dead air. `_TOOL_ETIQUETTE_INSTRUCTION` is appended to every session's `system_instruction` (in `connect_and_stream`, so it covers browser **and** phone) and the `run_task` description is sharpened, instructing the model to say a brief filler ("let me check that for you") before calling. Prompt-side fix; no SDK change. A future upgrade to non-blocking async function calling (`Behavior.NON_BLOCKING` + `FunctionResponseScheduling`) would remove the dead air entirely; this became available once `google-genai` was bumped `1.12.1 → 1.63.0` for the Brain Orb voice tile (trinity-enterprise#60), but the etiquette prompt-fix stays until the non-blocking path is wired. |
 | Execution | `_execute_and_respond()` coroutine, `asyncio.create_task` per call, 30s `wait_for` timeout |
 | Agent call | `agent_client.task(prompt)` (lazy import), truncated to `_TOOL_PROMPT_MAX=2000` chars |
 | Error handling | `AgentNotReachableError` → "not currently running"; `AgentRequestError` → "Task error: ..." |
@@ -442,6 +442,25 @@ Returns current canvas panel state. Returns empty state (not 404) for non-existe
 - ⏳ Multi-page / tabbed canvas
 
 ---
+
+## Persisted per-agent voice (trinity-enterprise#28)
+
+The Gemini voice was historically hardcoded to `"Kore"` (`routers/voice.py::_get_voice_name`).
+It is now a persisted per-agent setting, `agent_ownership.voice_name` (default `Kore`,
+an edition-agnostic OSS primitive like `voice_system_prompt`):
+
+- `GET/PUT /api/agents/{name}/voice/name` — GET returns the persisted voice plus
+  `available_voices`/`default_voice`; PUT is owner-only and validates against the
+  canonical `GEMINI_VOICE_NAMES` (`config.py`), shared with the frontend picker
+  list (`src/constants/voices.js`) and drift-guarded by a unit test.
+- **Resolution at session start** (`voice_start`): per-session request override
+  (`VoiceStartRequest.voice_name`) → persisted `voice_name` → `Kore`. The read
+  path (`db.get_voice_name`) falls back to `Kore` for an unset or no-longer-valid
+  persisted value.
+- The **Workspace** ephemeral picker (`AgentWorkspace.vue`) now defaults its
+  selection to the persisted voice; the picker list is the shared
+  `src/constants/voices.js` module. The persisted voice also drives outbound VoIP
+  calls — see `voip-telephony.md`.
 
 ## Related Documentation
 

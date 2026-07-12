@@ -1,11 +1,26 @@
 """
 Docker service for managing agent containers.
 """
+import logging
+import time
 from typing import List, Optional
 import docker
 from models import AgentStatus
 from utils.helpers import parse_iso_timestamp, utc_now
 from services.platform_package_service import PLATFORM_PACKAGES_LABEL, parse_platform_package_label
+
+logger = logging.getLogger(__name__)
+
+# #1131: throttle the "socket access denied" WARN. The denial is a persistent
+# condition (a wrong group_add GID stays wrong until the operator fixes .env),
+# and list_all_agents_fast() is hit by the 5s heartbeat-watch and operator-queue
+# loops, the 30s monitoring loop, and many request handlers — so an unthrottled
+# warn floods Vector (~24+/min indefinitely). Log at most once per window so the
+# failure stays observable without drowning the log stream. Module-level state;
+# the GIL makes the read-modify-write atomic enough that a rare duplicate warn
+# under a race is harmless.
+_SOCKET_WARN_THROTTLE_S = 60.0
+_last_socket_warn_monotonic: Optional[float] = None
 
 
 # Initialize Docker client
@@ -27,6 +42,24 @@ def get_agent_container(name: str):
         return None
     except Exception:
         return None
+
+
+def get_agent_runtime(name: str) -> str:
+    """Best-effort resolve an agent's execution runtime from its Docker label.
+
+    Reads the ``trinity.agent-runtime`` label (written at create time by
+    ``crud.py``). Used to make the platform system prompt runtime-aware (#1187
+    F-MCP). Never raises and never blocks dispatch — any failure (no Docker
+    client, container gone, missing label) falls back to ``"claude-code"``, which
+    preserves the historical Claude/Gemini prompt naming.
+    """
+    container = get_agent_container(name)
+    if container is None:
+        return "claude-code"
+    try:
+        return container.labels.get("trinity.agent-runtime", "claude-code") or "claude-code"
+    except Exception:
+        return "claude-code"
 
 
 def get_agent_status_from_container(container) -> AgentStatus:
@@ -153,7 +186,11 @@ def list_all_agents_fast() -> List[AgentStatus]:
                 },
                 container_id=container.id,
                 template=labels.get("trinity.template", None) or None,
-                runtime=labels.get("trinity.runtime", "claude-code"),  # From label instead of env vars
+                # Label written at create time is `trinity.agent-runtime` (crud.py);
+                # `trinity.runtime` is never written, so reading it always reported
+                # claude-code and broke the RuntimeBadge for Codex/Gemini agents
+                # in every fast-path view (#1187 review I6).
+                runtime=labels.get("trinity.agent-runtime", "claude-code"),
                 base_image_version=labels.get("trinity.base-image-version"),  # Label only, no image lookup
                 platform_packages=parse_platform_package_label(labels.get(PLATFORM_PACKAGES_LABEL)),
             )
@@ -161,7 +198,23 @@ def list_all_agents_fast() -> List[AgentStatus]:
 
         return agents
     except Exception as e:
-        print(f"Error listing agents (fast) from Docker: {e}")
+        # #1131: a denied docker.sock (e.g. wrong group_add GID on macOS Docker
+        # Desktop) raises here; swallowing it silently showed "No agents" in the
+        # UI with nothing in the logs. WARN so the failure is diagnosable — but
+        # throttled (see _SOCKET_WARN_THROTTLE_S) so a persistent denial on this
+        # per-poll hot path doesn't flood the logs. The broad catch can also see
+        # transient daemon restarts / timeouts (which likewise repeat on this hot
+        # path, so the throttle stays universal); the message stays generic rather
+        # than asserting "socket access denied", and carries the exception text —
+        # enough to identify the cause without exc_info.
+        global _last_socket_warn_monotonic
+        now = time.monotonic()
+        if (
+            _last_socket_warn_monotonic is None
+            or now - _last_socket_warn_monotonic >= _SOCKET_WARN_THROTTLE_S
+        ):
+            _last_socket_warn_monotonic = now
+            logger.warning("Failed to list agents from Docker: %s", e)
         return []
 
 

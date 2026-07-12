@@ -2,7 +2,11 @@
 import { ref, onMounted, onUnmounted } from 'vue'
 import SparklineChart from './SparklineChart.vue'
 
-const API_BASE = import.meta.env.VITE_API_BASE || ''
+// Relative, same-origin API base (nginx/Vite proxy) — matches api.js baseURL: ''.
+// Intentionally not an env var: VITE_API_BASE was never set anywhere, so this was
+// always '' (see #722 — do not point it at VITE_API_URL, that build-defaults to
+// http://localhost:8000 and would break same-origin calls).
+const API_BASE = ''
 
 // History configuration: 60 samples at 5s intervals = 5 minutes
 const MAX_POINTS = 60

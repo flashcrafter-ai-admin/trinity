@@ -9,6 +9,7 @@ from typing import List, Dict, Optional
 from datetime import datetime, timezone
 
 from .models import ChatMessage
+from .model_context import resolve_context_window
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +52,12 @@ class AgentState:
         self.session_total_cost: float = 0.0
         self.session_total_output_tokens: int = 0
         self.session_context_tokens: int = 0  # Latest context size
-        self.session_context_window: int = self._get_default_context_window()
-        # Model selection (persists across session)
+        # Model selection (persists across session). Set BEFORE the context
+        # window so the [1m]-aware catalog resolver can see it at init (#1521);
+        # otherwise a 1M ([1m]) agent would report a 200K window until its first
+        # turn overwrites session_context_window from the runtime value.
         self.current_model: Optional[str] = os.getenv("AGENT_RUNTIME_MODEL", None) or os.getenv("CLAUDE_MODEL", None)
+        self.session_context_window: int = self._get_default_context_window()
         # Session activity tracking (for real-time monitoring)
         self.session_activity = self._create_empty_activity()
         # Store full tool outputs for drill-down (separate from timeline summaries)
@@ -76,24 +80,37 @@ class AgentState:
             self.active_task_count += 1
             self.last_task_at = datetime.now(timezone.utc).isoformat()
 
-    def record_task_finish(self, success: bool) -> None:
-        """Mark an execution as finished. Resets the consecutive-failure
-        counter on success, increments it on failure — this is the signal the
-        dispatch circuit breaker (#526) consumes."""
+    def record_task_finish(self, success: Optional[bool]) -> None:
+        """Mark an execution as finished. Resets the consecutive-failure counter
+        on success, increments it on failure — this is the signal the dispatch
+        circuit breaker (#526) consumes.
+
+        #679 (F4): ``success=None`` is a NEUTRAL finish (a user cancel) — the
+        task still finishes (decrement the active count, stamp last_task_at) but
+        the failure counter is left untouched. A cancel is neither a failure (it
+        must not push a healthy agent toward an open breaker) nor a success (it
+        proves nothing about agent health), so it must not reset OR increment."""
         with self._health_lock:
             if self.active_task_count > 0:
                 self.active_task_count -= 1
             self.last_task_at = datetime.now(timezone.utc).isoformat()
+            if success is None:
+                return
             if success:
                 self.consecutive_failures = 0
             else:
                 self.consecutive_failures += 1
 
     def _get_default_context_window(self) -> int:
-        """Get default context window based on runtime"""
-        if self.agent_runtime == "gemini-cli" or self.agent_runtime == "gemini":
-            return 1000000  # 1M tokens for Gemini
-        return 200000  # 200K for Claude Code
+        """Fallback context window when the runtime hasn't reported one yet.
+
+        Resolves via the shared model catalog (#1521), keyed on the selected
+        model (so an ``[1m]`` agent gets 1M) and falling back to the runtime name
+        for the pre-first-turn / None-model case (``gemini-cli`` → 1M, else the
+        200K safe floor). The authoritative value is the runtime-reported window,
+        which overwrites ``session_context_window`` after each turn.
+        """
+        return resolve_context_window(self.current_model or self.agent_runtime)
 
     def _check_runtime_available(self) -> bool:
         """Check if the configured runtime CLI is available"""

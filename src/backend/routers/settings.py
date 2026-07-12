@@ -8,14 +8,27 @@ import logging
 import os
 import re
 import httpx
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 from urllib.parse import urlparse
 from fastapi import APIRouter, Depends, HTTPException, Request
-from pydantic import BaseModel
 
 logger = logging.getLogger(__name__)
 
-from models import User, AgentDefaultResourcesUpdate, AgentDefaultAccessPolicyUpdate
+from models import (
+    AgentDefaultAccessPolicyUpdate,
+    AgentDefaultResourcesUpdate,
+    AgentQuotaUpdate,
+    ApiKeyTest,
+    ApiKeyUpdate,
+    BrainOrbSettingsUpdate,
+    GitHubTemplatesUpdate,
+    MaxParallelTasksCeilingUpdate,
+    McpUrlUpdate,
+    OpsSettingsUpdate,
+    SlackConnectRequest,
+    SlackSettingsUpdate,
+    User,
+)
 from database import db, SystemSetting, SystemSettingUpdate
 from dependencies import get_current_user
 from services.platform_audit_service import platform_audit_service, AuditEventType
@@ -38,23 +51,19 @@ from services.settings_service import (
     AGENT_DEFAULT_REQUIRE_EMAIL_KEY,
     AGENT_DEFAULT_REQUIRE_EMAIL,
     get_agent_default_require_email,
+    MAX_PARALLEL_TASKS_CEILING_KEY,
+    MAX_PARALLEL_TASKS_CEILING_DEFAULT,
+    MAX_PARALLEL_TASKS_CEILING_MIN,
+    MAX_PARALLEL_TASKS_CEILING_MAX,
+    get_max_parallel_tasks_ceiling,
 )
 
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 
 # ============================================================================
-# API Keys Management - Helper Functions and Models
+# API Keys Management - Helper Functions
 # ============================================================================
-
-class ApiKeyUpdate(BaseModel):
-    """Request body for updating an API key."""
-    api_key: str
-
-
-class ApiKeyTest(BaseModel):
-    """Request body for testing an API key."""
-    api_key: str
 
 
 # Note: get_anthropic_api_key and get_github_pat are now imported from
@@ -74,11 +83,6 @@ def mask_api_key(key: str) -> str:
 
 # Note: OPS_SETTINGS_DEFAULTS and OPS_SETTINGS_DESCRIPTIONS are now imported from
 # services.settings_service for proper architecture
-
-
-class OpsSettingsUpdate(BaseModel):
-    """Request body for updating ops settings."""
-    settings: Dict[str, str]
 
 
 def require_admin(current_user: User):
@@ -128,9 +132,19 @@ async def get_public_feature_flags(
     Auth required (any role) — these flags reveal nothing sensitive but we
     still keep them out of the unauthenticated surface.
     """
-    from config import GEMINI_API_KEY, VOICE_ENABLED, VOIP_ENABLED
+    from config import (
+        GEMINI_API_KEY,
+        VOICE_ENABLED,
+        VOIP_ENABLED,
+        MCP_AGENT_CHAT_PULL_ENABLED,
+        REDELIVERY_GOVERNOR_ENABLED,
+    )
     from services.entitlement_service import entitlement_service
     voice_available = VOICE_ENABLED and bool(GEMINI_API_KEY)
+    # Brain Orb flags are RUNTIME-RESOLVED (#85): system_settings override →
+    # BRAIN_ORB_* env opt-in → OFF. An admin flip via PUT /api/settings/brain-orb
+    # is reflected here without a backend restart.
+    brain_orb_enabled = settings_service.is_brain_orb_enabled()
     return {
         "session_tab_enabled": settings_service.is_session_tab_enabled(),
         "voice_available": voice_available,
@@ -138,7 +152,44 @@ async def get_public_feature_flags(
         # VoIP telephony (VOIP-001, #1056) — default OFF, mirrors workspace_available.
         # Also requires a per-agent voip_bindings row to actually function.
         "voip_available": VOIP_ENABLED and bool(GEMINI_API_KEY),
+        # Brain Orb (#58, trinity-enterprise) — gates the per-agent /agents/:name/brain
+        # route + tab. Static render needs no Gemini; the per-agent capability gate is
+        # the template.yaml `brain-orb` token, checked frontend-side.
+        "brain_orb_available": brain_orb_enabled,
+        # Brain Orb voice tile (#58 Phase 3, trinity-enterprise#60) — client-held
+        # Gemini Live. Composes base AND voice AND a Gemini key (#85 — with base OFF
+        # the orb is down, so voice must read unavailable too; mirrors the write
+        # composition below). The frontend un-hides the voice tile only when this is
+        # on AND the agent carries the `brain-orb` capability. Default OFF.
+        "brain_orb_voice_available": brain_orb_enabled
+        and settings_service.is_brain_orb_voice_enabled()
+        and bool(GEMINI_API_KEY),
+        # Brain Orb KB-write surface (#58 Phase 4a, trinity-enterprise#61) — owner-gated
+        # capture/link. DISTINCT kill-switch from brain_orb_available so writes can be
+        # disabled without downing read/voice. UI-only hint (the write routes independently
+        # enforce the flag + owner gate); the orb only attempts initActions when on. The
+        # per-agent gate is still owner + the agent shipping a `brain-orb/action` hook.
+        # run_skill + the transcript pipeline are Phase 4b (#66). Default OFF.
+        "brain_orb_write_available": settings_service.is_brain_orb_write_enabled()
+        and brain_orb_enabled,
+        # Pull-pilot routing for agent→agent MCP chat (#946) — default OFF.
+        # Observability-only here: the routing gate is the MCP server's own read
+        # of the same env var. Lets an operator confirm, via the API, whether the
+        # treatment window is active during the soak. NOT a UI surface.
+        "mcp_agent_chat_pull_enabled": MCP_AGENT_CHAT_PULL_ENABLED,
+        # Re-delivery governor (#1085) — default OFF. Observability-only here:
+        # the actual gates live at the callback endpoint / reaper / drain read
+        # points. Lets an operator confirm via the API whether the correlated-
+        # failure controls are armed during a soak. NOT a UI surface.
+        "redelivery_governor_enabled": REDELIVERY_GOVERNOR_ENABLED,
         "platform_default_model": settings_service.get_platform_default_model(),
+        # Onboarding (trinity-enterprise#52) — is Claude auth configured at all?
+        # Trinity agents can't think without it, so the first-run wizard uses
+        # this to surface the one hard setup gate. True if a platform-wide
+        # Anthropic key exists (DB or env) OR any Claude subscription is
+        # registered. Non-sensitive: a boolean, never the key itself.
+        "claude_auth_configured": bool(settings_service.get_anthropic_api_key())
+        or db.has_any_subscription(),
         # #847 Phase 0 — enterprise entitlements. Empty list means OSS
         # build (or TRINITY_OSS_ONLY=1). UI uses this to hide
         # enterprise-only tabs cleanly without server-side conditional
@@ -593,13 +644,6 @@ async def get_slack_settings_status(
         raise HTTPException(status_code=500, detail=f"Failed to get Slack settings: {str(e)}")
 
 
-class SlackSettingsUpdate(BaseModel):
-    """Request body for updating Slack settings."""
-    client_id: str = None
-    client_secret: str = None
-    signing_secret: str = None
-
-
 @router.put("/slack")
 async def update_slack_settings(
     body: SlackSettingsUpdate,
@@ -674,12 +718,6 @@ async def delete_slack_settings(
 # ============================================================================
 # Slack Transport Management (Socket Mode / Webhook)
 # ============================================================================
-
-
-class SlackConnectRequest(BaseModel):
-    """Request body for connecting Slack transport."""
-    app_token: Optional[str] = None  # xapp-... for Socket Mode
-    transport_mode: Optional[str] = None  # "socket" or "webhook"
 
 
 @router.get("/slack/status")
@@ -945,17 +983,6 @@ async def remove_email_from_whitelist(
 # GitHub Templates Configuration (TMPL-001)
 # ============================================================================
 
-class GitHubTemplateEntry(BaseModel):
-    """A single GitHub template entry."""
-    github_repo: str
-    display_name: str = ""
-    description: str = ""
-
-
-class GitHubTemplatesUpdate(BaseModel):
-    """Request body for updating GitHub templates."""
-    templates: List[GitHubTemplateEntry]
-
 
 _REPO_PATTERN = re.compile(r'^[a-zA-Z0-9._-]+/[a-zA-Z0-9._-]+$')
 
@@ -1074,11 +1101,6 @@ async def delete_github_templates(
 MCP_URL_SETTING_KEY = "mcp_external_url"
 
 
-class McpUrlUpdate(BaseModel):
-    """Request body for updating the MCP server URL."""
-    url: str
-
-
 def _get_default_mcp_url(request: Request) -> str:
     """Compute the auto-detected MCP URL from the request hostname."""
     host = request.headers.get("host", "localhost:8080")
@@ -1086,6 +1108,15 @@ def _get_default_mcp_url(request: Request) -> str:
     if hostname in ("localhost", "127.0.0.1"):
         return "http://localhost:8080/mcp"
     return f"http://{hostname}:8080/mcp"
+
+
+def resolve_mcp_url(request: Request) -> str:
+    """Effective MCP URL: the operator-configured override, else auto-detected.
+
+    Public accessor so other modules (e.g. the entitled MCP connector) don't
+    reach into the private helper above.
+    """
+    return db.get_setting_value(MCP_URL_SETTING_KEY) or _get_default_mcp_url(request)
 
 
 def _validate_mcp_url(url: str) -> str:
@@ -1184,12 +1215,6 @@ async def delete_mcp_url(
 # Agent Quota Settings (QUOTA-001)
 # ============================================================================
 
-class AgentQuotaUpdate(BaseModel):
-    """Request body for updating per-role agent quotas."""
-    max_agents_creator: Optional[str] = None
-    max_agents_operator: Optional[str] = None
-    max_agents_user: Optional[str] = None
-
 
 @router.get("/agent-quotas")
 async def get_agent_quotas(
@@ -1263,8 +1288,11 @@ async def update_agent_quotas(
 # Agent Default Resources (RES-001)
 # ============================================================================
 
-VALID_CPU_VALUES = ["1", "2", "4", "8", "16"]
-VALID_MEMORY_VALUES = ["1g", "2g", "4g", "8g", "16g", "32g"]
+# Canonical allowed values live in the container-spec module so the admin
+# defaults endpoint and the agent create/recreate paths can't drift (#1197).
+from services.agent_service.capabilities import VALID_CPU, VALID_MEMORY
+VALID_CPU_VALUES = list(VALID_CPU)
+VALID_MEMORY_VALUES = list(VALID_MEMORY)
 
 
 @router.get("/agent-defaults/resources")
@@ -1411,6 +1439,222 @@ async def update_agent_default_access_policy(
     }
 
 
+# ============================================================================
+# Max Parallel Tasks Ceiling (#506 — fleet-wide per-agent concurrency cap)
+# ============================================================================
+
+@router.get("/max-parallel-tasks-ceiling")
+async def get_max_parallel_tasks_ceiling_setting(
+    request: Request,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get the fleet-wide ceiling on any single agent's max_parallel_tasks (#506).
+
+    Admin-only. Owners pick a per-agent value within this ceiling.
+    Registered before the `/{key}` catch-all (Invariant #4).
+    """
+    require_admin(current_user)
+
+    return {
+        "value": get_max_parallel_tasks_ceiling(),
+        "default": MAX_PARALLEL_TASKS_CEILING_DEFAULT,
+        "min": MAX_PARALLEL_TASKS_CEILING_MIN,
+        "max": MAX_PARALLEL_TASKS_CEILING_MAX,
+    }
+
+
+@router.put("/max-parallel-tasks-ceiling")
+async def update_max_parallel_tasks_ceiling_setting(
+    body: MaxParallelTasksCeilingUpdate,
+    request: Request,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Set the fleet-wide ceiling on per-agent max_parallel_tasks (#506).
+
+    Admin-only. Validates MIN ≤ value ≤ MAX (1–32). The clamp applies at
+    runtime (CapacityManager facade + bypasses); stored per-agent values are
+    never rewritten. Existing agents above the new ceiling are clamped on the
+    next admit.
+    """
+    require_admin(current_user)
+
+    if (
+        not isinstance(body.value, int)
+        or body.value < MAX_PARALLEL_TASKS_CEILING_MIN
+        or body.value > MAX_PARALLEL_TASKS_CEILING_MAX
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"max_parallel_tasks_ceiling must be an integer between "
+                f"{MAX_PARALLEL_TASKS_CEILING_MIN} and {MAX_PARALLEL_TASKS_CEILING_MAX}"
+            ),
+        )
+
+    db.set_setting(MAX_PARALLEL_TASKS_CEILING_KEY, str(body.value))
+
+    # SEC-001: audit this fleet-wide capacity change (mirrors the access-policy
+    # default audit path) — it caps concurrency for every agent on the host.
+    await platform_audit_service.log(
+        event_type=AuditEventType.CONFIGURATION,
+        event_action="settings_change",
+        source="api",
+        actor_user=current_user,
+        actor_ip=request.client.host if request.client else None,
+        endpoint=str(request.url.path),
+        request_id=getattr(request.state, "request_id", None),
+        details={
+            "setting": MAX_PARALLEL_TASKS_CEILING_KEY,
+            "action": "update",
+            "value": body.value,
+        },
+    )
+
+    return {
+        "success": True,
+        "value": get_max_parallel_tasks_ceiling(),
+        "default": MAX_PARALLEL_TASKS_CEILING_DEFAULT,
+        "min": MAX_PARALLEL_TASKS_CEILING_MIN,
+        "max": MAX_PARALLEL_TASKS_CEILING_MAX,
+    }
+
+
+# ============================================================================
+# Brain Orb Feature Flags (trinity-enterprise#85 — admin-configurable)
+# ============================================================================
+
+def _brain_orb_flag_state() -> Dict[str, Any]:
+    """Per-flag effective value + source for the admin panel.
+
+    `source` tells the UI whether a DB override is active — critical because a
+    stored row makes the BRAIN_ORB_* env var silently dead until cleared:
+    - "override": a system_settings row exists (env ignored)
+    - "env":      no row; the env var opts the flag in
+    - "default":  neither; the code default (OFF) applies
+    """
+    from services.settings_service import BRAIN_ORB_FLAGS
+
+    state: Dict[str, Any] = {}
+    for field, (setting_key, env_var) in BRAIN_ORB_FLAGS.items():
+        stored = db.get_setting_value(setting_key, None)
+        env_on = os.getenv(env_var, "").strip().lower() in ("true", "1", "yes")
+        if stored is not None:
+            value = str(stored).lower() in ("true", "1", "yes")
+            source = "override"
+        else:
+            value = env_on
+            source = "env" if env_on else "default"
+        state[field] = {"value": value, "source": source}
+    return state
+
+
+@router.get("/brain-orb")
+async def get_brain_orb_settings(
+    request: Request,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Get the Brain Orb platform flags with per-flag source (trinity-enterprise#85).
+
+    Admin-only. Registered before the `/{key}` catch-all (Invariant #4).
+    `gemini_key_configured` reflects the env-only GEMINI_API_KEY secret the
+    voice tile additionally requires (boolean only — never the key).
+    """
+    require_admin(current_user)
+
+    from config import GEMINI_API_KEY
+
+    return {
+        "flags": _brain_orb_flag_state(),
+        "gemini_key_configured": bool(GEMINI_API_KEY),
+    }
+
+
+@router.put("/brain-orb")
+async def update_brain_orb_settings(
+    body: BrainOrbSettingsUpdate,
+    request: Request,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Update the Brain Orb platform flags (trinity-enterprise#85).
+
+    Admin-only, audit-logged with per-flag old→new values. Partial update:
+    only provided booleans are written. `clear: [flag,...]` deletes a flag's
+    stored override, reverting it to its env/default value. Takes effect on
+    the next request — route gates resolve at request time, no restart.
+    """
+    require_admin(current_user)
+
+    from config import GEMINI_API_KEY
+    from services.settings_service import BRAIN_ORB_FLAGS
+
+    clear = body.clear or []
+    unknown = [f for f in clear if f not in BRAIN_ORB_FLAGS]
+    if unknown:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown flag(s) in clear: {', '.join(sorted(unknown))}. "
+                   f"Valid: {', '.join(BRAIN_ORB_FLAGS)}",
+        )
+    conflict = [f for f in clear if getattr(body, f, None) is not None]
+    if conflict:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Flag(s) both set and cleared: {', '.join(sorted(conflict))}",
+        )
+
+    before = _brain_orb_flag_state()
+    updated = []
+    cleared = []
+    # getattr default: a registry flag missing from the model must read as
+    # "not provided", never AttributeError→500 (drift-guarded by test too).
+    for field, (setting_key, _env_var) in BRAIN_ORB_FLAGS.items():
+        value = getattr(body, field, None)
+        if value is not None:
+            db.set_setting(setting_key, "true" if value else "false")
+            updated.append(field)
+        elif field in clear:
+            db.delete_setting(setting_key)
+            cleared.append(field)
+    after = _brain_orb_flag_state()
+
+    if updated or cleared:
+        # SEC-001: the write flag gates an exec-adjacent surface (the agent's
+        # action hook), so every change must leave a per-flag old→new trace.
+        await platform_audit_service.log(
+            event_type=AuditEventType.CONFIGURATION,
+            event_action="settings_change",
+            source="api",
+            actor_user=current_user,
+            actor_ip=request.client.host if request.client else None,
+            endpoint=str(request.url.path),
+            request_id=getattr(request.state, "request_id", None),
+            details={
+                "setting": "brain_orb_flags",
+                "action": "update",
+                "changes": {
+                    field: {
+                        "old": before[field]["value"],
+                        "new": after[field]["value"],
+                    }
+                    for field in updated + cleared
+                },
+                "cleared": cleared,
+            },
+        )
+
+    return {
+        "success": True,
+        "updated": updated,
+        "cleared": cleared,
+        "flags": after,
+        "gemini_key_configured": bool(GEMINI_API_KEY),
+    }
+
+
 @router.get("/{key}")
 async def get_setting(
     key: str,
@@ -1451,6 +1695,18 @@ async def update_setting(
     Admin-only endpoint. Creates the setting if it doesn't exist.
     """
     require_admin(current_user)
+
+    # #506: the fleet ceiling must go through the dedicated range-validated
+    # route; block the generic PUT so it can't be written to junk/out-of-range
+    # (same pattern as the skills_library_url SSRF special-case below).
+    if key == MAX_PARALLEL_TASKS_CEILING_KEY:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "max_parallel_tasks_ceiling must be set via "
+                "PUT /api/settings/max-parallel-tasks-ceiling (range-validated 1–32)"
+            ),
+        )
 
     # Validate URL-based settings to prevent SSRF (SEC-179)
     if key == "skills_library_url" and body.value:
@@ -1660,5 +1916,3 @@ async def reset_ops_settings(
 
 
 # Note: get_ops_setting is now imported from services.settings_service
-
-

@@ -84,7 +84,7 @@
       <!-- Ops prerequisite notice -->
       <div class="p-3 rounded-lg text-xs bg-state-autonomous-50 dark:bg-state-autonomous-900/30 text-state-autonomous-800 dark:text-state-autonomous-200">
         <strong>Deployment prerequisite:</strong> Cloudflare Tunnel ingress must route
-        <code class="font-mono">/api/whatsapp/webhook/*</code> to the frontend service.
+        <code class="font-mono">/api/whatsapp/webhook/*</code> to the <strong>backend</strong> service (<code class="font-mono">http://backend:8000</code>).
         See <em>docs/requirements/PUBLIC_EXTERNAL_ACCESS_SETUP.md</em>.
       </div>
 
@@ -104,6 +104,9 @@
           to <code class="font-mono">{{ binding.from_number }}</code>. Check your Twilio Console → Messaging → Try WhatsApp for the keyword.
         </p>
       </div>
+
+      <!-- Voice replies (epic #24 / trinity-enterprise#56) — shared agent-level TTS control -->
+      <VoiceRepliesControl :agent-name="agentName" class="mt-2" />
     </div>
 
     <!-- Disconnected State — Credentials Form -->
@@ -187,6 +190,7 @@
 <script setup>
 import { ref, computed, onMounted, watch } from 'vue'
 import api from '../api'
+import VoiceRepliesControl from './VoiceRepliesControl.vue'
 
 const props = defineProps({
   agentName: {

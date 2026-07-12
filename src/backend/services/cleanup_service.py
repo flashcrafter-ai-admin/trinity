@@ -21,8 +21,10 @@ from typing import Optional, Dict, List
 import httpx
 
 from database import db
-from models import TaskExecutionStatus
+from models import ActivityState, TaskExecutionStatus
+from services.agent_auth import build_agent_auth_headers
 from services.capacity_manager import get_capacity_manager
+from services.slot_service import SLOT_TTL_BUFFER
 from utils.helpers import utc_now, utc_now_iso, parse_iso_timestamp
 from utils.credential_sanitizer import sanitize_text
 
@@ -31,6 +33,12 @@ logger = logging.getLogger(__name__)
 # Configuration
 CLEANUP_INTERVAL_SECONDS = 300  # 5 minutes
 EXECUTION_STALE_TIMEOUT_MINUTES = 120  # SCHED-ASYNC-001: increased from 30 to support long-running tasks
+# #1083: prefix tagged onto the slot-reclaim FAILED message so a fire-and-forget
+# lease expiry (no result callback before the slot TTL) is identifiable. Mirrors
+# TaskExecutionErrorCode.LEASE_EXPIRED.value; kept as a literal to avoid importing
+# the execution service into the cleanup background loop. The existing descriptive
+# text is preserved after the prefix (substring assertions stay green).
+_LEASE_EXPIRED_TAG = "lease_expired"
 ACTIVITY_STALE_TIMEOUT_MINUTES = 120  # SCHED-ASYNC-001: increased from 30 to support long-running tasks
 NO_SESSION_TIMEOUT_SECONDS = 60  # Issue #106: fast-fail executions that never got a Claude session
 WATCHDOG_HTTP_TIMEOUT = 15.0  # Timeout for agent HTTP calls during reconciliation (#869: increased from 5s to handle agents under load)
@@ -92,14 +100,15 @@ def _extract_agent_known_ids(payload: Dict) -> set:
     return ids
 
 
-def _read_retention_settings() -> tuple[int, int, int]:
-    """Read retention windows from ops settings (#772).
+def _read_retention_settings() -> tuple[int, int, int, int]:
+    """Read retention windows from ops settings (#772, #918).
 
     Returns:
         (execution_log_retention_days, execution_row_retention_days,
-         health_check_retention_days). 0 means the sweep is disabled.
-        Invalid (non-integer or negative) values are coerced to 0 so a
-        malformed setting can't accidentally enable an unbounded prune.
+         health_check_retention_days, agent_reports_retention_days).
+        0 means the corresponding sweep is disabled. Invalid (non-integer or
+        negative) values are coerced to 0 so a malformed setting can't
+        accidentally enable an unbounded prune.
     """
     from services.settings_service import OPS_SETTINGS_DEFAULTS
 
@@ -115,6 +124,7 @@ def _read_retention_settings() -> tuple[int, int, int]:
         _read("execution_log_retention_days"),
         _read("execution_row_retention_days"),
         _read("health_check_retention_days"),
+        _read("agent_reports_retention_days"),
     )
 
 
@@ -171,6 +181,8 @@ class CleanupReport:
     soft_deleted_schedules_purged: int = 0
     # RELIABILITY-006 / #525: idempotency keys purged past their 24h TTL
     idempotency_keys_purged: int = 0
+    # Issue #918: agent_reports rows pruned past their retention window
+    agent_reports_pruned: int = 0
 
     @property
     def total(self) -> int:
@@ -180,7 +192,8 @@ class CleanupReport:
                 self.stale_slot_executions + self.shared_files_purged +
                 self.execution_logs_pruned + self.execution_rows_pruned +
                 self.health_checks_pruned + self.soft_deleted_agents_purged +
-                self.soft_deleted_schedules_purged + self.idempotency_keys_purged)
+                self.soft_deleted_schedules_purged + self.idempotency_keys_purged +
+                self.agent_reports_pruned)
 
     def to_dict(self) -> Dict:
         return {
@@ -199,6 +212,7 @@ class CleanupReport:
             "soft_deleted_agents_purged": self.soft_deleted_agents_purged,
             "soft_deleted_schedules_purged": self.soft_deleted_schedules_purged,
             "idempotency_keys_purged": self.idempotency_keys_purged,
+            "agent_reports_pruned": self.agent_reports_pruned,
             "total": self.total,
         }
 
@@ -266,7 +280,7 @@ class CleanupService:
         self._sweep_rate_limit_events()
         self._sweep_shared_files(report)
         self._sweep_retention_772(report)
-        self._sweep_soft_deleted_agents(report)
+        await self._sweep_soft_deleted_agents(report)
         self._sweep_soft_deleted_schedules(report)
         self._sweep_idempotency_keys(report)
         self._maybe_wal_checkpoint(report)
@@ -311,9 +325,21 @@ class CleanupService:
             return set()
 
     def _sweep_stale_executions(self, report: CleanupReport) -> None:
-        """1. Mark stale executions failed (agent-unreachable safety net)."""
+        """1. Mark stale executions failed (agent-unreachable safety net).
+
+        #1083 Finding 1: use the per-agent ``timeout + SLOT_TTL_BUFFER`` window
+        (same as the slot reaper / E-01) instead of the flat 120-min default, so
+        a legitimately-running max-timeout async turn isn't failed ~5 min early.
+        ``EXECUTION_STALE_TIMEOUT_MINUTES`` stays the fallback for any agent
+        absent from the timeout map (e.g. soft-deleted).
+        """
         try:
-            count = db.mark_stale_executions_failed(EXECUTION_STALE_TIMEOUT_MINUTES)
+            agent_timeouts = db.get_all_execution_timeouts()
+            count = db.mark_stale_executions_failed(
+                EXECUTION_STALE_TIMEOUT_MINUTES,
+                agent_timeouts=agent_timeouts,
+                buffer_seconds=SLOT_TTL_BUFFER,
+            )
             report.stale_executions = count
             if count > 0:
                 logger.info(f"[Cleanup] Marked {count} stale executions as failed")
@@ -356,7 +382,29 @@ class CleanupService:
         """3. Reclaim stale Redis slots + fail their execution records.
 
         (#219, #226, #378 — see _process_stale_slot_reclaims docstring.)
+
+        #1085: while the re-delivery governor's shared-cause pause is armed, hold
+        off this destructive sweep entirely. During a fleet outage an async row's
+        callback is being throttled/held (not lost) — failing it to LEASE_EXPIRED
+        now would race the throttled-then-resumed callback. The pause TTL (300s)
+        stays well under the lease window (timeout + SLOT_TTL_BUFFER), and a late
+        SUCCESS still corrects any reaper FAIL via the apply_result CAS — but the
+        hold-off avoids the churn. Fail-open: governor degrades to not-paused.
         """
+        try:
+            import config
+
+            if config.REDELIVERY_GOVERNOR_ENABLED:
+                from services.redelivery_governor import get_redelivery_governor
+
+                if get_redelivery_governor().should_hold_reaper():
+                    logger.info(
+                        "[Cleanup] stale-slot reaper held — re-delivery paused (#1085)"
+                    )
+                    return
+        except Exception as e:  # noqa: BLE001 — never block the sweep on a gate error
+            logger.debug("[Cleanup] governor reaper-gate skipped: %s", e)
+
         try:
             capacity = get_capacity_manager()
 
@@ -430,10 +478,10 @@ class CleanupService:
         spans multiple cycles instead of holding the write lock end-to-end.
         """
         try:
-            log_days, row_days, hc_days = _read_retention_settings()
+            log_days, row_days, hc_days, reports_days = _read_retention_settings()
         except Exception as e:
             logger.error(f"[Cleanup] Error reading retention settings: {e}")
-            log_days = row_days = hc_days = 0
+            log_days = row_days = hc_days = reports_days = 0
 
         if log_days > 0:
             try:
@@ -480,13 +528,34 @@ class CleanupService:
             except Exception as e:
                 logger.error(f"[Cleanup] Error pruning health checks: {e}")
 
-    def _sweep_soft_deleted_agents(self, report: CleanupReport) -> None:
+        if reports_days > 0:
+            try:
+                pruned = db.prune_agent_reports(
+                    retention_days=reports_days,
+                    chunk_size=RETENTION_CHUNK_SIZE_PER_CYCLE,
+                )
+                report.agent_reports_pruned = pruned
+                if pruned > 0:
+                    logger.info(
+                        f"[Cleanup] Deleted {pruned} agent_reports rows "
+                        f"older than {reports_days} days (#918)"
+                    )
+            except Exception as e:
+                logger.error(f"[Cleanup] Error pruning agent_reports: {e}")
+
+    async def _sweep_soft_deleted_agents(self, report: CleanupReport) -> None:
         """4c-bis. Issue #834 Phase 1a: hard-purge soft-deleted agents past
         their retention window. `purge_agent_ownership` runs the #816
         cascade_delete primitive so every per-agent child row goes with the
         parent in a single transaction. Bounded by the same 5000-row/cycle cap
         as the other sweeps so a backlog after a long-disabled retention
         setting drains gradually.
+
+        Purge is also the moment an agent name becomes *reusable* — up to here
+        `is_agent_name_reserved` still matches the soft-deleted row and blocks
+        creation. So each purged name gets its per-agent Redis state swept too
+        (#1560): the container is long gone, and anything left keyed to the name
+        would be inherited by whatever agent claims it next.
         """
         try:
             from services.settings_service import OPS_SETTINGS_DEFAULTS
@@ -509,11 +578,15 @@ class CleanupService:
                     retention_days=sd_days,
                     limit=RETENTION_CHUNK_SIZE_PER_CYCLE,
                 )
+                from services.agent_runtime_state import clear_agent_runtime_state
+
                 purged = 0
                 for name in names:
                     try:
                         if db.purge_agent_ownership(name):
                             purged += 1
+                            # #1560: the name is reusable from this instant on.
+                            await clear_agent_runtime_state(name)
                     except Exception as e:
                         logger.warning(
                             f"[Cleanup] Failed to purge soft-deleted agent {name}: {e}"
@@ -600,12 +673,39 @@ class CleanupService:
                            + report.health_checks_pruned
                            + report.soft_deleted_agents_purged
                            + report.soft_deleted_schedules_purged
-                           + report.idempotency_keys_purged)
+                           + report.idempotency_keys_purged
+                           + report.agent_reports_pruned)
         if retention_total > 0:
             try:
                 _wal_checkpoint_truncate()
             except Exception as e:
                 logger.warning(f"[Cleanup] WAL checkpoint failed: {e}")
+
+    async def _close_stale_slot_activity(self, execution_id: str) -> None:
+        """Close the open dispatch activity for a reclaimed-slot execution (#1083).
+
+        Under fire-and-forget dispatch the ``execute_task`` coroutine returns at
+        the 202 ACK, so its ``finally`` never runs to complete the activity. When
+        the lease reaper FAILs the row we close the activity here instead — using
+        the filtered ``get_open_activity_id_for_execution`` so a shared-eid
+        tool_call row is never cross-closed (Codex #8). Best-effort: a failure
+        here never blocks the reaper.
+        """
+        try:
+            activity_id = db.get_open_activity_id_for_execution(execution_id)
+            if not activity_id:
+                return
+            from services.activity_service import activity_service
+            await activity_service.complete_activity(
+                activity_id=activity_id,
+                status=ActivityState.FAILED,
+                error=f"{_LEASE_EXPIRED_TAG}: slot lease expired (no result callback)",
+            )
+        except Exception as e:  # pragma: no cover - best-effort
+            logger.debug(
+                f"[Cleanup] Could not close activity for stale-slot execution "
+                f"{execution_id}: {e}"
+            )
 
     async def _process_stale_slot_reclaims(
         self,
@@ -635,6 +735,11 @@ class CleanupService:
           partial-outage conditions. The race guard preserves any
           SUCCESS that arrived between slot reclaim and this write.
         """
+        # #1082 status-as-projection: the reclaimed slots are only *candidates*.
+        # Authority for "is running" is the agent registry — every FAILED write
+        # below goes through a just-in-time re-verify and the race-guarded
+        # `fail_stale_slot_execution` (WHERE status='running'); status is never
+        # the standalone authority for a destructive write.
         if not reclaimed:
             return
 
@@ -696,9 +801,9 @@ class CleanupService:
                             updated = db.fail_stale_slot_execution(
                                 execution_id=execution_id,
                                 error=(
-                                    f"Stale execution — agent '{agent_name}' "
-                                    f"unresponsive during cleanup re-verify, "
-                                    f"slot TTL expired (#497)"
+                                    f"{_LEASE_EXPIRED_TAG}: Stale execution — agent "
+                                    f"'{agent_name}' unresponsive during cleanup "
+                                    f"re-verify, slot TTL expired (#497)"
                                 ),
                             )
                             if updated:
@@ -708,6 +813,9 @@ class CleanupService:
                                     f"agent '{agent_name}' "
                                     f"(slot reclaimed, agent unreachable during re-verify)"
                                 )
+                                # #1083: close the dispatch activity the (now-absent)
+                                # fire-and-forget coroutine `finally` would have closed.
+                                await self._close_stale_slot_activity(execution_id)
                             else:
                                 # Race-guard refused — a real terminal write
                                 # arrived first. Expected and benign.
@@ -748,7 +856,7 @@ class CleanupService:
 
                         updated = db.fail_stale_slot_execution(
                             execution_id=execution_id,
-                            error=f"Stale execution — slot TTL expired for agent '{agent_name}', cleaned by cleanup service",
+                            error=f"{_LEASE_EXPIRED_TAG}: Stale execution — slot TTL expired for agent '{agent_name}', cleaned by cleanup service",
                         )
                         if updated:
                             report.stale_slot_executions += 1
@@ -756,6 +864,9 @@ class CleanupService:
                                 f"[Cleanup] Failed execution {execution_id} for agent "
                                 f"'{agent_name}' (slot reclaimed)"
                             )
+                            # #1083: close the dispatch activity the (now-absent)
+                            # fire-and-forget coroutine `finally` would have closed.
+                            await self._close_stale_slot_activity(execution_id)
                     except Exception as e:
                         logger.error(
                             f"[Cleanup] Error failing {execution_id} after slot reclaim: {e}"
@@ -782,6 +893,11 @@ class CleanupService:
             where confirmed_running_ids is the set of execution IDs verified as still
             running on their agents (used by slot cleanup to avoid false failures, #226).
         """
+        # #1082 status-as-projection: status='running' is a *candidate filter*
+        # only — the runtime authority for "is running" is the agent process
+        # registry (queried below via _get_agent_running_ids). We never fail a
+        # row on its status alone; a destructive write requires the agent to
+        # confirm the execution is absent.
         running_executions = db.get_running_executions_with_agent_info()
         if not running_executions:
             return (0, 0, set())
@@ -914,7 +1030,8 @@ class CleanupService:
         """
         try:
             response = await client.get(
-                f"http://agent-{agent_name}:8000/api/executions/running"
+                f"http://agent-{agent_name}:8000/api/executions/running",
+                headers=build_agent_auth_headers(agent_name),
             )
             if response.status_code == 200:
                 # #921: union of currently-running + recently-completed via
@@ -954,6 +1071,7 @@ class CleanupService:
             response = await client.get(
                 f"http://agent-{agent_name}:8000/api/executions/{execution_id}/last-error",
                 timeout=ERROR_FETCH_TIMEOUT,
+                headers=build_agent_auth_headers(agent_name),
             )
             if response.status_code == 200:
                 data = response.json()
@@ -1059,7 +1177,8 @@ class CleanupService:
         """
         try:
             response = await client.post(
-                f"http://agent-{agent_name}:8000/api/executions/{execution_id}/terminate"
+                f"http://agent-{agent_name}:8000/api/executions/{execution_id}/terminate",
+                headers=build_agent_auth_headers(agent_name),
             )
             if response.status_code < 300:
                 return True
@@ -1404,6 +1523,11 @@ async def _reconcile_orphaned_slots() -> Dict[str, int]:
                         # whose SQL row hasn't been written yet.
                         continue
 
+                    # #1082 status-as-projection: the Redis slot member is the
+                    # candidate; SQL status only *protects* a slot here (a
+                    # non-terminal row is left alone). A slot is reclaimed solely
+                    # when its row is terminal or missing — status is never read
+                    # as authority to fail a running execution.
                     row = db.get_execution(execution_id)
                     if row is not None and row.status not in _TERMINAL_EXECUTION_STATUSES:
                         # Still active — leave the slot alone.

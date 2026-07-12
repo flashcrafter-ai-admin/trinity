@@ -8,7 +8,15 @@ Each agent has independent configuration options that control its behavior, reso
 
 ### The Settings Tab
 
-The Agent Detail page has a **Settings** tab (visible to owners only) -- a sectioned home for per-agent configuration. Its first section is **Guardrails** (see [Agent Guardrails](agent-guardrails.md)); more configuration sections will move here over time. Until then, the settings below are managed from the agent header controls, toggles on the Dashboard and Agents pages, or the API.
+The Agent Detail page has a **Settings** tab (visible to owners only) -- a sectioned home for per-agent configuration. Current sections: **Guardrails** (see [Agent Guardrails](agent-guardrails.md)), **Parallel Capacity** (below), and **Expose via MCP** (publish the agent as a dedicated MCP tool — see [MCP Server](../integrations/mcp-server.md#dedicated-agent-tools-expose-via-mcp)). The remaining settings below are managed from the agent header controls, toggles on the Dashboard and Agents pages, or the API.
+
+### Parallel Capacity
+
+How many tasks the agent may run concurrently (`max_parallel_tasks`, default 3). Work beyond the limit queues and drains as slots free up.
+
+- Set it in the Settings tab's **Parallel Capacity** section; the panel shows current slot usage ("using X / Y slots").
+- **Fleet ceiling (admin):** an admin caps the whole fleet via `GET`/`PUT /api/settings/max-parallel-tasks-ceiling` (default 10, range 1–32). Owners pick any value up to the ceiling. If an agent's stored value exceeds a later-lowered ceiling, the stored value is kept but the *effective* limit is clamped to the ceiling — the panel shows a notice when this applies.
+- API: `GET /api/agents/{name}/capacity` returns the stored value, the ceiling, and the effective limit.
 
 ### Autonomy Mode
 
@@ -38,6 +46,8 @@ Per-agent memory and CPU limits, enforced at the container level (Linux cgroups)
 - **Full capabilities mode**: grants containers system-level access (Docker socket, network tools) when needed
 
 **Fleet-wide defaults (admin):** the default CPU and memory for *new* agent containers are set platform-wide via `GET`/`PUT /api/settings/agent-defaults/resources` (admin-only; CPU 1/2/4/8/16, memory 1g--32g). Changes apply to new containers only -- restart existing agents to pick up new defaults.
+
+**Scratch space (`/tmp`):** each agent's `/tmp` is a RAM-backed tmpfs, hardened `noexec,nosuid`. Its size is operator-configurable via the `AGENT_TMP_SIZE` environment variable on the backend (default `512m`; accepts `<int>m`/`<int>g`); the `noexec,nosuid` flags are fixed. Because the tmpfs counts against the agent's memory limit and blocks execution, heavy build/scratch work (pip and npm installs, compiling extensions) is redirected to a disk-backed `TMPDIR` at `/home/developer/.tmp` on the home volume. The `/tmp` size is applied at container create, so a changed `AGENT_TMP_SIZE` is picked up on recreate, not a plain restart.
 
 ### Execution Timeout
 
@@ -91,6 +101,9 @@ Set via `runtime.type` in `template.yaml`.
 
 - `claude-code` (default)
 - `gemini-cli`
+- `codex` (OpenAI Codex)
+
+See [Agent Runtimes](agent-runtimes.md) for capability differences (session resume, cost reporting, MCP support).
 
 ## For Agents
 

@@ -21,6 +21,7 @@ from services.docker_service import (
     get_agent_container,
 )
 from services.docker_utils import volume_get
+from services.agent_auth import derive_agent_token, merge_auth_headers
 from services.settings_service import get_anthropic_api_key, get_github_pat, get_agent_full_capabilities, settings_service
 from utils.helpers import sanitize_agent_name
 
@@ -30,6 +31,49 @@ logger = logging.getLogger(__name__)
 DEFAULT_BASE_IMAGE_ALLOWLIST = [
     "trinity-agent-base:*",
 ]
+
+# #1187: runtime classification. Subscriptions are Claude-OAuth tokens, so the
+# auto-assign (crud) and the CLAUDE_CODE_OAUTH_TOKEN / ANTHROPIC_API_KEY juggle
+# (lifecycle recreate) apply ONLY to the Claude Code runtime. Gemini and Codex
+# bring their own credentials via .env (CRED-002).
+CLAUDE_RUNTIME_NAMES = frozenset({"claude-code", "claude"})
+
+
+def is_claude_runtime(runtime: Optional[str]) -> bool:
+    """True for the Claude Code runtime, INCLUDING the default (unset/empty →
+    claude-code). Non-Claude runtimes (gemini-cli, gemini, codex) return False.
+    """
+    return (runtime or "claude-code").lower() in CLAUDE_RUNTIME_NAMES
+
+
+# #1187: every runtime the platform can launch. Mirrors the agent-side
+# `runtime_adapter.KNOWN_RUNTIMES` (which lives in the base image and isn't
+# importable from the backend). Keep the two in sync when adding a runtime.
+KNOWN_RUNTIME_NAMES = CLAUDE_RUNTIME_NAMES | frozenset({"gemini-cli", "gemini", "codex"})
+
+
+def validate_runtime(runtime: Optional[str]) -> None:
+    """Reject an unknown ``runtime`` at create time.
+
+    The agent-side ``get_runtime()`` already fails loud on a bad
+    ``AGENT_RUNTIME``, but only when the container boots — by then the agent
+    exists and the failure is a cryptic crash-loop. Catching a typo'd
+    ``runtime:`` here turns it into a clear 400 at creation. Unset/empty is
+    valid (defaults to claude-code).
+
+    Raises:
+        HTTPException(400): if ``runtime`` is set to an unrecognized value.
+    """
+    if not runtime:
+        return
+    if runtime.lower() not in KNOWN_RUNTIME_NAMES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Unknown runtime {runtime!r}. "
+                f"Supported runtimes: {sorted(KNOWN_RUNTIME_NAMES)}."
+            ),
+        )
 
 
 def validate_base_image(image: str) -> None:
@@ -103,6 +147,10 @@ async def agent_http_request(
         httpx.TimeoutException: If request times out
     """
     agent_url = f"http://agent-{agent_name}:8000{path}"
+
+    # #1159: stamp the per-agent auth token (overriding any caller-supplied
+    # value case-insensitively) so every retry attempt carries it.
+    kwargs["headers"] = merge_auth_headers(agent_name, kwargs.get("headers"))
 
     last_error = None
     for attempt in range(max_retries):
@@ -197,6 +245,7 @@ def get_accessible_agents(current_user: User) -> list:
         agent_dict["github_repo"] = metadata.get("github_repo")
         agent_dict["memory_limit"] = metadata.get("memory_limit")
         agent_dict["cpu_limit"] = metadata.get("cpu_limit")
+        agent_dict["mcp_exposed"] = metadata.get("mcp_exposed", False)  # #846
 
         # Avatar URL (AVATAR-001)
         avatar_updated_at = metadata.get("avatar_updated_at")
@@ -442,6 +491,43 @@ def check_guardrails_env_matches(container, agent_name: str) -> bool:
         return False
 
 
+def check_agent_auth_token_env_matches(container, agent_name: str) -> bool:
+    """#1159: verify the container's ``TRINITY_AGENT_AUTH_TOKEN`` matches the
+    token derived for the agent's CURRENT name. Returns ``True`` if it matches,
+    ``False`` (→ recreate) when the env is missing or stale.
+
+    Catches two cases:
+      * old-image / pre-#1159 container with no token → recreate injects it;
+      * a renamed container still carrying ``derive(old_name)`` → recreate
+        re-derives under the new name so it stops 401-ing once enforcement is on.
+
+    Deterministic derive means the value this checks is exactly what the
+    create/recreate inject writes, so the recreate converges in a single pass
+    (no infinite recreate loop — same contract as the guardrails/PAT matchers).
+    """
+    env_list = container.attrs.get("Config", {}).get("Env", [])
+    env_dict = {e.split("=", 1)[0]: e.split("=", 1)[1] for e in env_list if "=" in e}
+    return env_dict.get("TRINITY_AGENT_AUTH_TOKEN") == derive_agent_token(agent_name)
+
+
+def needs_per_agent_pat_injection(agent_name: str) -> bool:
+    """#1264: True when the agent has a **per-agent** GitHub PAT configured AND
+    git sync — i.e. the container SHOULD carry that token.
+
+    Gated on ``db.get_agent_github_pat`` (the per-agent PAT only), NOT
+    ``get_github_pat_for_agent`` (which falls back to the global platform PAT).
+    Using the global fallback here would force-recreate / inject into every
+    tokenless git agent the moment an operator sets a global PAT — that's #211's
+    deliberate opt-in `.env` path, not this one's job, and is out of #1264 scope.
+
+    Shared by the recreate matcher (:func:`check_github_pat_env_matches`) and the
+    lifecycle recreate inject gate so the two predicates cannot drift — if they
+    did, the matcher could keep requesting a recreate the inject never satisfies
+    (infinite recreate loop).
+    """
+    return bool(db.get_agent_github_pat(agent_name)) and bool(db.get_git_config(agent_name))
+
+
 def check_github_pat_env_matches(container, agent_name: str) -> bool:
     """
     Check if container's GITHUB_PAT env var matches the effective PAT for this agent.
@@ -455,9 +541,15 @@ def check_github_pat_env_matches(container, agent_name: str) -> bool:
 
     container_pat = env_dict.get("GITHUB_PAT")
     if not container_pat:
-        # Agent doesn't use GITHUB_PAT — no update needed
-        return True
+        # #1264: a tokenless container needs a recreate ONLY when a per-agent PAT
+        # is configured (so creation/recreate will inject it). A global-only PAT
+        # must NOT force tokenless agents to recreate — see
+        # needs_per_agent_pat_injection. Recreate converges in one pass because
+        # the lifecycle inject gate uses the SAME predicate.
+        return not needs_per_agent_pat_injection(agent_name)
 
+    # Container already has a token — keep it in sync with the effective PAT
+    # (per-agent first, then the global fallback for already-tokened containers).
     current_pat = get_github_pat_for_agent(agent_name)
     if not current_pat:
         # No PAT configured anywhere — can't update, leave as-is

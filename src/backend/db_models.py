@@ -60,6 +60,22 @@ class AgentShare(BaseModel):
     allow_proactive: bool = False  # Can agent send proactive messages to this user
 
 
+class AgentOperatorAccess(BaseModel):
+    """A Trinity operator (user) with access to an agent — #17 Access tab.
+
+    Built by resolving an ``agent_sharing`` allow-list email against ``users``:
+    ``status='active'`` when it resolves to an account (``username``/``role``/
+    ``last_active`` populated), ``status='pending'`` for an allow-listed email
+    with no account yet.
+    """
+    email: str
+    username: Optional[str] = None
+    role: Optional[str] = None
+    last_active: Optional[str] = None  # ISO-Z last_login; None until first login
+    status: str                        # 'active' | 'pending'
+    allow_proactive: bool = False
+
+
 class AgentShareRequest(BaseModel):
     email: str  # Email of user to share with
 
@@ -162,6 +178,13 @@ class Schedule(BaseModel):
     # carried these fields — every webhook trigger raised AttributeError.
     webhook_enabled: bool = False
     webhook_token: Optional[str] = None
+    # trinity-enterprise#77: optional HMAC signature auth. `webhook_auth_enabled`
+    # gates verification in the public trigger; `webhook_secret_encrypted` is the
+    # AES-256-GCM envelope the trigger decrypts to verify the signature. Neither
+    # is ever surfaced in an API response model (the plaintext secret is returned
+    # exactly once, at mint time, and never persisted in the clear).
+    webhook_auth_enabled: bool = False
+    webhook_secret_encrypted: Optional[str] = None
 
 
 class ScheduleExecution(BaseModel):
@@ -268,7 +291,7 @@ class ChatSession(BaseModel):
     message_count: int = 0
     total_cost: float = 0.0
     total_context_used: int = 0
-    total_context_max: int = 200000
+    total_context_max: int = 200000  # #1521: == model_context.DEFAULT_CONTEXT_WINDOW (safe floor). Leaf model — not imported to avoid a services↔db_models cycle; only the no-metadata default.
     status: str = "active"  # "active" or "closed"
     subscription_id: Optional[str] = None  # SUB-004: subscription active when session started
 
@@ -309,7 +332,7 @@ class AgentSession(BaseModel):
     message_count: int = 0
     total_cost: float = 0.0
     total_context_used: int = 0
-    total_context_max: int = 200000
+    total_context_max: int = 200000  # #1521: == model_context.DEFAULT_CONTEXT_WINDOW (safe floor). Leaf model — not imported to avoid a services↔db_models cycle; only the no-metadata default.
     status: str = "active"  # "active" | "archived" | "reset"
     subscription_id: Optional[str] = None
     cached_claude_session_id: Optional[str] = None
@@ -563,6 +586,9 @@ class PublicChatMessage(BaseModel):
     content: str
     timestamp: datetime
     cost: Optional[float] = None
+    # #903: per-message speaker attribution (thread-scoped channel sessions).
+    sender_email: Optional[str] = None
+    sender_label: Optional[str] = None
 
 
 # =========================================================================
@@ -873,6 +899,9 @@ class BusinessHealthCheck(BaseModel):
     stuck_execution_count: int = 0
     recent_error_rate: float = 0.0  # 0.0 - 1.0
     credential_status: Optional[str] = None  # null, "ok", "missing" (SUB-001/MON-001)
+    # #1439: identity-clone status from /health ("ok"|"failed"). None when the
+    # agent image predates #1439 (older images omit the key) — treated as healthy.
+    clone_status: Optional[str] = None
     # #1020: richer /health signal. None when the agent image predates #1020
     # (older agents omit these keys). `consecutive_failures` is the signal the
     # dispatch circuit breaker (#526) consumes; `last_task_at` powers liveness.
@@ -1106,7 +1135,7 @@ class SlackOAuthState(BaseModel):
 
 class CapacityUpdate(BaseModel):
     """Request model for updating agent parallel capacity."""
-    max_parallel_tasks: int  # Must be 1-10
+    max_parallel_tasks: int  # Must be 1..ceiling (#506; default ceiling 10)
 
 
 class SlotInfo(BaseModel):
@@ -1119,9 +1148,18 @@ class SlotInfo(BaseModel):
 
 
 class AgentCapacity(BaseModel):
-    """Response model for agent capacity status."""
+    """Response model for agent capacity status.
+
+    #506: ``max_parallel_tasks`` is the stored, editable per-agent value;
+    ``ceiling`` is the fleet-wide admin cap; ``effective_max_parallel_tasks``
+    is ``min(stored, ceiling)`` — the value the runtime actually admits against.
+    ``available_slots`` is computed from the effective value so
+    ``available_slots + active_slots == effective_max_parallel_tasks`` holds.
+    """
     agent_name: str
     max_parallel_tasks: int
+    ceiling: int
+    effective_max_parallel_tasks: int
     active_slots: int
     available_slots: int
     slots: List[SlotInfo] = []

@@ -1,6 +1,7 @@
 """
 Authentication routes for the Trinity backend.
 """
+import asyncio
 import logging
 from datetime import timedelta
 from typing import Optional
@@ -16,12 +17,25 @@ from config import (
     ALGORITHM,
     ACCESS_TOKEN_EXPIRE_MINUTES,
     EMAIL_AUTH_ENABLED,
+    PUBLIC_ACCESS_REQUESTS_ENABLED,
     REDIS_URL,
 )
 from database import db
-from dependencies import authenticate_user, create_access_token
+from dependencies import (
+    authenticate_user,
+    create_access_token,
+    get_current_user,
+    is_token_revoked,
+    oauth2_scheme,
+    revoke_token_jti,
+)
+from models import User
 
 logger = logging.getLogger(__name__)
+
+# Strong refs for fire-and-forget email dispatch tasks (#186) so an in-flight
+# send isn't garbage-collected before it completes (the asyncio GC footgun).
+_email_dispatch_tasks: set = set()
 
 # Login rate limiting — split per-account (tight) + per-IP (loose).
 #
@@ -289,6 +303,26 @@ async def login(request: Request, form_data: OAuth2PasswordRequestForm = Depends
     # Update last login timestamp
     db.update_last_login(user["username"])
 
+    # #5 — enterprise 2FA gate. Password is the first factor; if a second
+    # factor is required (user enrolled OR policy mandates it for the role)
+    # return a challenge instead of an access token. OSS-only builds have no
+    # provider registered → returns None → unchanged behaviour.
+    from services import mfa_gate
+    challenge = mfa_gate.gate_login(user, mode="admin")
+    if challenge:
+        await platform_audit_service.log(
+            event_type=AuditEventType.AUTHENTICATION,
+            event_action="mfa_challenge_issued",
+            source="api",
+            actor_ip=client_ip,
+            target_type="user",
+            target_id=user["username"],
+            endpoint=str(request.url.path),
+            request_id=getattr(request.state, "request_id", None),
+            details={"method": "admin"},
+        )
+        return challenge
+
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
         data={"sub": user["username"]},
@@ -352,7 +386,7 @@ async def validate_token(request: Request):
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         username: str = payload.get("sub")
         user = db.get_user_by_username(username) if username else None
-        if username is None or user is None:
+        if username is None or user is None or is_token_revoked(payload.get("jti")):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid token",
@@ -365,6 +399,28 @@ async def validate_token(request: Request):
             detail="Invalid token",
             headers={"WWW-Authenticate": "Bearer"}
         )
+
+
+@router.post("/api/auth/logout")
+async def logout(
+    current_user: User = Depends(get_current_user),
+    token: str = Depends(oauth2_scheme),
+):
+    """Revoke the caller's JWT so it can no longer be used (#187).
+
+    `get_current_user` guarantees the bearer is a valid, non-revoked session
+    token (an MCP API key authenticates too, but carries no `jti` — logging out
+    a key is a no-op here; keys are revoked via key management). We then stamp
+    its `jti` into the Redis blacklist until the token's own expiry, so an
+    exfiltrated 7-day token stops working immediately on logout. Idempotent.
+    """
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        # Not a JWT (e.g. an MCP API key) — nothing to revoke by jti.
+        return {"status": "logged_out"}
+    revoke_token_jti(payload.get("jti"), payload.get("exp"))
+    return {"status": "logged_out"}
 
 
 # =========================================================================
@@ -404,32 +460,49 @@ async def request_email_login_code(request: Request):
     login_request = EmailLoginRequest(**body)
     email = login_request.email.lower()
 
-    # Check if email is whitelisted
-    if not db.is_email_whitelisted(email):
-        # For security, return generic message (don't reveal if email is whitelisted)
-        # Return success to prevent email enumeration
-        return {"success": True, "message": "If your email is registered, you'll receive a code shortly"}
+    # #186: every branch below returns a byte-identical body + status, and the
+    # email send is dispatched fire-and-forget, so a caller cannot distinguish a
+    # whitelisted (registered) email from a non-whitelisted one by body, status,
+    # or response latency. Do NOT reintroduce a distinct message, extra fields
+    # (e.g. expires_in_seconds), a 429, or a blocking send — each re-opens the
+    # enumeration oracle (pentest 3.3.3).
+    generic_response = {
+        "success": True,
+        "message": "If your email is registered, you'll receive a code shortly",
+    }
 
-    # Check rate limit
+    # Non-whitelisted: return the generic body without revealing membership.
+    if not db.is_email_whitelisted(email):
+        return generic_response
+
+    # Rate limit: over-limit returns the SAME generic body (not a 429) so a
+    # repeat-request status differential can't be used as a membership oracle.
+    # WARN server-side (fail-loud) so ops can still distinguish a rate-limit
+    # suppression from a mail outage.
     recent_requests = db.count_recent_code_requests(email, minutes=10)
     if recent_requests >= 3:
-        raise HTTPException(
-            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
-            detail="Too many requests. Please try again in 10 minutes"
-        )
+        logger.warning("email-code suppressed: rate limit for %s", email)
+        return generic_response
 
     # Generate code
     code_data = db.create_login_code(email, expiry_minutes=10)
 
-    # Send email
-    email_service = EmailService()
-    success = await email_service.send_verification_code(email, code_data["code"], context_label="Trinity login")
+    # Dispatch the email fire-and-forget so the whitelisted path's latency matches
+    # the immediate-return non-whitelisted / rate-limited paths (#186 timing oracle).
+    async def _dispatch_code(target_email: str, code: str) -> None:
+        try:
+            email_service = EmailService()
+            await email_service.send_verification_code(
+                target_email, code, context_label="Trinity login"
+            )
+        except Exception:
+            logger.exception("Failed to send email login code")
 
-    return {
-        "success": True,
-        "message": "Verification code sent to your email",
-        "expires_in_seconds": code_data["expires_in_seconds"]
-    }
+    task = asyncio.create_task(_dispatch_code(email, code_data["code"]))
+    _email_dispatch_tasks.add(task)
+    task.add_done_callback(_email_dispatch_tasks.discard)
+
+    return generic_response
 
 
 @router.post("/api/auth/email/verify")
@@ -506,6 +579,25 @@ async def verify_email_login_code(request: Request):
     # Update last login
     db.update_last_login(user["username"])
 
+    # #5 — enterprise 2FA gate. The verified email code is the first factor;
+    # if a second factor is required, return a challenge instead of a token.
+    # OSS-only builds have no provider → returns None → unchanged behaviour.
+    from services import mfa_gate
+    challenge = mfa_gate.gate_login(user, mode="email")
+    if challenge:
+        await platform_audit_service.log(
+            event_type=AuditEventType.AUTHENTICATION,
+            event_action="mfa_challenge_issued",
+            source="api",
+            actor_ip=client_ip,
+            target_type="user",
+            target_id=user["username"],
+            endpoint=str(request.url.path),
+            request_id=getattr(request.state, "request_id", None),
+            details={"method": "email", "email": email},
+        )
+        return challenge
+
     # Create JWT token
     access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
     access_token = create_access_token(
@@ -547,10 +639,17 @@ async def verify_email_login_code(request: Request):
 @router.post("/api/access/request")
 async def request_access(request: Request):
     """
-    Request access to this Trinity instance.
+    Public self-signup for this Trinity instance (CLI onboarding).
 
-    Unauthenticated endpoint. Auto-approves the email by adding it to the
-    whitelist. Idempotent — returns success if already whitelisted.
+    Unauthenticated. **Disabled by default** (trinity-enterprise#10): when the
+    `public_access_requests_enabled` setting / `PUBLIC_ACCESS_REQUESTS_ENABLED`
+    env is not explicitly enabled, this returns 403 and does NOT whitelist the
+    email — the email whitelist stays authoritative against self-enrollment.
+    When an operator opts in, the submitted email is auto-added to the login
+    whitelist (role `user`) for frictionless onboarding. Idempotent.
+
+    This does not affect login-code requests for already-whitelisted emails
+    (POST /api/auth/email/request), which remain available regardless of the flag.
 
     Rate limit: 5 requests per 10 minutes per IP.
     """
@@ -559,6 +658,20 @@ async def request_access(request: Request):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="setup_required"
+        )
+
+    # Secure default (trinity-enterprise#10): public self-signup is OFF unless the
+    # operator explicitly enables it. Env default via PUBLIC_ACCESS_REQUESTS_ENABLED;
+    # overridable at runtime via the system_settings key. When off, do NOT
+    # auto-whitelist — return 403 so the whitelist remains the real access gate.
+    self_signup_setting = db.get_setting_value(
+        "public_access_requests_enabled", str(PUBLIC_ACCESS_REQUESTS_ENABLED).lower()
+    )
+    if self_signup_setting.lower() != "true":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Public access requests are disabled on this instance. "
+                   "Ask an administrator to add your email to the whitelist."
         )
 
     # Check if email auth is enabled (access request only makes sense with email auth)
@@ -585,7 +698,7 @@ async def request_access(request: Request):
     # Auto-approve: add to whitelist if not already present
     if db.is_email_whitelisted(email):
         record_login_attempt(client_ip, success=True)
-        return {"success": True, "message": "Access granted", "already_registered": True}
+        return {"success": True, "message": "Email already on the access whitelist", "already_registered": True}
 
     try:
         # Public self-signup — default to `user`. Owners who want a collaborator
@@ -601,5 +714,5 @@ async def request_access(request: Request):
         )
 
     record_login_attempt(client_ip, success=True)
-    logger.info(f"CLI access granted: {email}")
-    return {"success": True, "message": "Access granted", "already_registered": False}
+    logger.info(f"CLI self-signup (operator-enabled): {email} added to access whitelist")
+    return {"success": True, "message": "Email added to the access whitelist", "already_registered": False}

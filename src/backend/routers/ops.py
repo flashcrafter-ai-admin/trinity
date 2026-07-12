@@ -450,12 +450,15 @@ async def list_all_schedules(
     if enabled_only:
         schedules = [s for s in schedules if s.enabled]
 
+    # #1265: one bulk query for the latest execution of every schedule, instead
+    # of a get_schedule_executions() call per schedule (N+1 that grew with the
+    # total schedule count across the fleet).
+    latest_by_schedule = db.get_latest_execution_per_schedule([s.id for s in schedules])
+
     # Build response with schedule details
     schedule_list = []
     for schedule in schedules:
-        # Get recent executions for this schedule
-        recent_executions = db.get_schedule_executions(schedule.id, limit=5)
-        last_execution = recent_executions[0] if recent_executions else None
+        last_execution = latest_by_schedule.get(schedule.id)
 
         schedule_data = {
             "id": schedule.id,
@@ -469,14 +472,9 @@ async def list_all_schedules(
             "created_at": schedule.created_at.isoformat() if schedule.created_at else None,
             "last_run_at": schedule.last_run_at.isoformat() if schedule.last_run_at else None,
             "next_run_at": schedule.next_run_at.isoformat() if schedule.next_run_at else None,
-            "last_execution": {
-                "id": last_execution.id,
-                "status": last_execution.status,
-                "started_at": last_execution.started_at.isoformat(),
-                "completed_at": last_execution.completed_at.isoformat() if last_execution.completed_at else None,
-                "duration_ms": last_execution.duration_ms,
-                "error": last_execution.error
-            } if last_execution else None
+            # last_execution is the slim dict from get_latest_execution_per_schedule
+            # (#1265): only dashboard fields, timestamps already ISO-normalised.
+            "last_execution": last_execution
         }
         schedule_list.append(schedule_data)
 

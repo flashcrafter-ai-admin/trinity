@@ -44,6 +44,7 @@ class CredentialUpdateRequest(BaseModel):
     credentials: dict  # {"VAR_NAME": "value", ...}
     mcp_config: Optional[str] = None  # Pre-generated .mcp.json content (if provided)
     files: Optional[Dict[str, str]] = None  # File-type credentials: {"path": "content", ...}
+    files_b64: Optional[Dict[str, str]] = None  # Binary file creds: {"path": base64(content)} (#11)
 
 
 # ============================================================================
@@ -109,6 +110,12 @@ class ExecutionMetadata(BaseModel):
     compact_events: List[CompactEvent] = []  # Auto-compact events observed mid-turn
     recovered_from_jsonl: bool = False  # Stdout race + JSONL fallback fired (response from disk, not stream)
     model_name: Optional[str] = None  # Actual model id from assistant.message.model (e.g., "claude-sonnet-4-5") — #678
+    # #1187: typed terminal-result seed (the #945 taxonomy). Populated by
+    # newer runtimes (Codex) and currently UNUSED by the backend in the MVP —
+    # the backend still infers AUTH from the HTTP status. A fast-follow makes
+    # the backend read error_code directly and retire status-inference.
+    status: Optional[str] = None  # "success" | "error"
+    error_code: Optional[str] = None  # "AUTH" | "RATE_LIMIT" | "TIMEOUT" | "AGENT_ERROR" | "RUNTIME_UNAVAILABLE"
 
 
 # ============================================================================
@@ -227,6 +234,11 @@ class ParallelTaskRequest(BaseModel):
     resume_session_id: Optional[str] = None  # Claude Code session ID for --resume (EXEC-023)
     persist_session: Optional[bool] = False  # Session tab: write the JSONL so future --resume works
     images: Optional[List[Dict[str, str]]] = None  # Vision images: [{"media_type": "image/jpeg", "data": "<base64>"}]
+    # #1083 fire-and-forget: when true AND this agent runs the Claude runtime,
+    # accept the turn with 202 and report the terminal via the backend's
+    # result-callback endpoint. Ignored by non-Claude runtimes / old images
+    # (they run synchronously and return 200 — the backend's non-202 fallback).
+    async_result: Optional[bool] = False
 
 
 class ParallelTaskResponse(BaseModel):
@@ -249,15 +261,45 @@ class CredentialReadRequest(BaseModel):
 
 class CredentialReadResponse(BaseModel):
     """Response with credential file contents"""
-    files: Dict[str, str]  # {path: content} for files that exist
+    files: Dict[str, str]  # {path: text content} for files that exist
+    files_b64: Dict[str, str] = {}  # {path: base64} for non-UTF-8 (binary) files (#11)
 
 
 class CredentialInjectRequest(BaseModel):
     """Request to inject credential files into workspace"""
-    files: Dict[str, str]  # {path: content} to write
+    files: Dict[str, str] = {}      # {path: text content} to write
+    files_b64: Dict[str, str] = {}  # {path: base64(content)} for binary creds (#11)
 
 
 class CredentialInjectResponse(BaseModel):
     """Response from credential injection"""
     status: str  # "success"
     files_written: List[str]
+
+
+class CredentialListItem(BaseModel):
+    """One discovered credential file (#11 — drives export-captures-all)."""
+    path: str
+    size: int
+    binary: bool
+
+
+class CredentialListResponse(BaseModel):
+    files: List[CredentialListItem]
+
+
+class TokenReloadRequest(BaseModel):
+    """Request to hot-reload the subscription OAuth token (#1089).
+
+    Surgical alternative to a container recreate: mutates the agent-server
+    process env so the NEXT claude subprocess uses the rotated token while
+    in-flight turns keep their already-inherited old token and finish.
+    """
+    token: str  # CLAUDE_CODE_OAUTH_TOKEN value to apply
+    remove_api_key: bool = False  # also drop ANTHROPIC_API_KEY from env
+
+
+class TokenReloadResponse(BaseModel):
+    """Response from a subscription token hot-reload"""
+    status: str  # "success"
+    reloaded: bool

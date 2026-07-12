@@ -8,21 +8,38 @@ defined BEFORE dynamic routes like /{name}/schedules to avoid FastAPI matching
 "scheduler" as an agent name.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, Request, status
-from typing import List, Optional
-from pydantic import BaseModel
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
+from typing import List
 from datetime import datetime
 import json
 import os
 import logging
 import httpx
 
-from models import User, ScheduleAnalyticsResponse
+from models import (
+    AgentSchedulesSummaryResponse,
+    ExecutionResponse,
+    ExecutionSummary,
+    ScheduleAnalyticsResponse,
+    ScheduleResponse,
+    ScheduleUpdateRequest,
+    User,
+    WebhookStatusResponse,
+)
 from dependencies import get_current_user, get_authorized_agent, AuthorizedAgent, CurrentUser
 from database import db, Schedule, ScheduleCreate, ScheduleExecution
 from services.platform_audit_service import platform_audit_service, AuditEventType
+from services.schedule_validation import (
+    ScheduleValidationError,
+    validate_cron_expression,
+    validate_timezone,
+)
+from services.webhook_signature import SIGNATURE_HEADER as WEBHOOK_SIGNATURE_HEADER
 
 _ANALYTICS_VALID_WINDOWS = frozenset({24, 168, 720})  # #868
+# #1115: Overview/Schedules-tab scorecard windows → hours (matches the #1107
+# Overview selector: 7 / 14 / 30 days).
+_SUMMARY_WINDOW_HOURS = {"7d": 168, "14d": 336, "30d": 720}
 
 logger = logging.getLogger(__name__)
 
@@ -74,148 +91,6 @@ async def get_scheduler_status(
         return {"running": False, "error": "Scheduler timeout"}
 
 
-# Request/Response Models
-
-class ScheduleUpdateRequest(BaseModel):
-    """Request model for updating a schedule."""
-    name: Optional[str] = None
-    cron_expression: Optional[str] = None
-    message: Optional[str] = None
-    enabled: Optional[bool] = None
-    timezone: Optional[str] = None
-    description: Optional[str] = None
-    timeout_seconds: Optional[int] = None
-    allowed_tools: Optional[List[str]] = None
-    model: Optional[str] = None  # Model override (MODEL-001)
-    # Retry configuration (RETRY-001)
-    max_retries: Optional[int] = None
-    retry_delay_seconds: Optional[int] = None
-    # Validation configuration (VALIDATE-001)
-    validation_enabled: Optional[bool] = None
-    validation_prompt: Optional[str] = None
-    validation_timeout_seconds: Optional[int] = None
-
-
-class ScheduleResponse(BaseModel):
-    """Response model for schedule data."""
-    id: str
-    agent_name: str
-    name: str
-    cron_expression: str
-    message: str
-    enabled: bool
-    timezone: str
-    description: Optional[str]
-    created_at: datetime
-    updated_at: datetime
-    last_run_at: Optional[datetime]
-    next_run_at: Optional[datetime]
-    # #913: null means "inherit from agent_ownership.execution_timeout_seconds".
-    timeout_seconds: Optional[int] = None
-    allowed_tools: Optional[List[str]] = None
-    model: Optional[str] = None  # Model override (MODEL-001)
-    # Validation configuration (VALIDATE-001)
-    validation_enabled: bool = False
-    validation_prompt: Optional[str] = None
-    validation_timeout_seconds: int = 120
-
-    class Config:
-        from_attributes = True
-
-
-class ExecutionSummary(BaseModel):
-    """Lightweight execution response for list views - excludes large text fields.
-
-    Used by GET /api/agents/{name}/executions for fast list loading.
-    Full details available via GET /api/agents/{name}/executions/{id}.
-    """
-    id: str
-    schedule_id: str
-    agent_name: str
-    status: str
-    started_at: datetime
-    completed_at: Optional[datetime]
-    duration_ms: Optional[int]
-    message: str
-    triggered_by: str
-    # Observability fields (small)
-    context_used: Optional[int] = None
-    context_max: Optional[int] = None
-    cost: Optional[float] = None
-    # Origin tracking (small) - AUDIT-001
-    source_user_id: Optional[int] = None
-    source_user_email: Optional[str] = None
-    source_agent_name: Optional[str] = None
-    source_mcp_key_id: Optional[str] = None
-    source_mcp_key_name: Optional[str] = None
-    # Session resume (small) - EXEC-023
-    claude_session_id: Optional[str] = None
-    # Model selection (small) - MODEL-001
-    model_used: Optional[str] = None
-    # Fan-out linkage (small) - FANOUT-001
-    fan_out_id: Optional[str] = None
-    # Validation tracking (small) - VALIDATE-001
-    business_status: Optional[str] = None  # pending_validation, validated, failed_validation, skipped
-    validation_execution_id: Optional[str] = None
-    # Auto-compact observability (Bundle B) - small JSON list
-    compact_metadata: Optional[str] = None
-
-    # EXCLUDED (large fields - fetch via /executions/{id}):
-    # - response: Optional[str]      # Full response text
-    # - error: Optional[str]         # Full error text
-    # - tool_calls: Optional[str]    # JSON array of tool calls
-    # - execution_log: Optional[str] # Full Claude Code transcript
-
-    class Config:
-        from_attributes = True
-
-
-class ExecutionResponse(BaseModel):
-    """Full response model for execution data - includes all fields.
-
-    Used by GET /api/agents/{name}/executions/{id} for single execution details.
-    """
-    id: str
-    schedule_id: str
-    agent_name: str
-    status: str
-    started_at: datetime
-    completed_at: Optional[datetime]
-    duration_ms: Optional[int]
-    message: str
-    response: Optional[str]
-    error: Optional[str]
-    triggered_by: str
-    # Observability fields
-    context_used: Optional[int] = None
-    context_max: Optional[int] = None
-    cost: Optional[float] = None
-    tool_calls: Optional[str] = None
-    execution_log: Optional[str] = None  # Full Claude Code execution transcript (JSON)
-    # Origin tracking - AUDIT-001
-    source_user_id: Optional[int] = None
-    source_user_email: Optional[str] = None
-    source_agent_name: Optional[str] = None
-    source_mcp_key_id: Optional[str] = None
-    source_mcp_key_name: Optional[str] = None
-    # Session resume - EXEC-023
-    claude_session_id: Optional[str] = None
-    # Model selection - MODEL-001
-    model_used: Optional[str] = None
-    # Fan-out linkage - FANOUT-001
-    fan_out_id: Optional[str] = None
-    # Validation tracking - VALIDATE-001
-    business_status: Optional[str] = None
-    validated_at: Optional[datetime] = None
-    validation_execution_id: Optional[str] = None
-    validates_execution_id: Optional[str] = None
-    # Auto-compact observability (Bundle B)
-    compact_metadata: Optional[str] = None
-
-    class Config:
-        from_attributes = True
-
-
 # Schedule CRUD Endpoints
 
 
@@ -261,15 +136,32 @@ async def create_schedule(
     current_user: User = Depends(get_current_user)
 ):
     """Create a new schedule for an agent."""
-    # Validate cron expression
+    # #1472: validate cron + timezone with the SAME parser the dedicated
+    # scheduler uses to register the job (5-field + CronTrigger + pytz), not a
+    # looser bare croniter() — else an expression that clears croniter but fails
+    # _add_job (@daily, a 6-field seconds-cron, quartz L/#, or a bad timezone)
+    # would be silently orphaned and its next_run_at would freeze.
     try:
-        from croniter import croniter
-        croniter(schedule_data.cron_expression)
-    except Exception as e:
+        validate_cron_expression(
+            schedule_data.cron_expression,
+            getattr(schedule_data, "timezone", None) or "UTC",
+        )
+    except ScheduleValidationError as e:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Invalid cron expression: {str(e)}"
+            detail=str(e),
         )
+
+    # #1445: fail-loud no-orphan gate. Access-check FIRST so a low-priv caller
+    # gets a uniform 403 whether or not the agent exists (no 404-vs-403
+    # name-enumeration oracle); only an admin/owner — not a tenant boundary —
+    # ever reaches the 404 that actually blocks orphan-schedule creation.
+    # Ordered BEFORE the #929 timeout check (which reads the agent cap) so the
+    # gate can't be probed via the timeout-validation path.
+    if not db.can_user_access_agent(current_user.username, name):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    if not db.is_agent_live(name):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
 
     # #929: schedule timeout cannot exceed the agent cap. Validated here so
     # the operator gets the 400 at config time instead of a SIGKILL at run time.
@@ -281,7 +173,7 @@ async def create_schedule(
     if not schedule:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Cannot create schedule - access denied or agent not found"
+            detail="Cannot create schedule - access denied"
         )
 
     # Dedicated scheduler syncs from database automatically
@@ -341,6 +233,34 @@ async def get_schedule_analytics(
     return ScheduleAnalyticsResponse(**analytics)
 
 
+@router.get(
+    "/{name}/schedules/analytics-summary",
+    response_model=AgentSchedulesSummaryResponse,
+)
+async def get_agent_schedules_summary(
+    name: AuthorizedAgent,
+    window: str = Query("7d", description="One of 7d, 14d, 30d"),
+):
+    """Per-schedule performance rollups for the agent over a window (#1115).
+
+    ONE compact row per non-deleted schedule — consumed by BOTH the Overview
+    "Schedules performance" section and the Schedules-tab inline stats from a
+    single call (no N per-schedule round-trips). Zero-run schedules are
+    included. Read-only / DB-sourced (renders when the agent is stopped). The
+    #868 per-schedule deep view stays the drill-in target.
+
+    NOTE: declared BEFORE `/{name}/schedules/{schedule_id}` so the literal
+    `analytics-summary` segment isn't captured as a schedule_id (Invariant #4).
+    """
+    hours = _SUMMARY_WINDOW_HOURS.get(window)
+    if hours is None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"window must be one of {sorted(_SUMMARY_WINDOW_HOURS)}",
+        )
+    return AgentSchedulesSummaryResponse(**db.get_agent_schedules_summary(name, hours))
+
+
 @router.get("/{name}/schedules/{schedule_id}", response_model=ScheduleResponse)
 async def get_schedule(
     name: AuthorizedAgent,
@@ -372,15 +292,24 @@ async def update_schedule(
             detail="Schedule not found"
         )
 
-    # Validate cron expression if being updated
-    if updates.cron_expression:
+    # #1472: validate cron + timezone with the scheduler's parser (see
+    # create_schedule). Cron-field validity is timezone-independent, so a cron
+    # update is checked under UTC; a timezone update is checked on its own.
+    if updates.cron_expression is not None:
         try:
-            from croniter import croniter
-            croniter(updates.cron_expression)
-        except Exception as e:
+            validate_cron_expression(updates.cron_expression, "UTC")
+        except ScheduleValidationError as e:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Invalid cron expression: {str(e)}"
+                detail=str(e),
+            )
+    if updates.timezone is not None:
+        try:
+            validate_timezone(updates.timezone)
+        except ScheduleValidationError as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(e),
             )
 
     # #929: validate timeout against agent cap only when this PUT actually
@@ -560,13 +489,6 @@ async def trigger_schedule(
 
 # Webhook Management Endpoints (WEBHOOK-001, #291)
 
-class WebhookStatusResponse(BaseModel):
-    """Webhook configuration for a schedule."""
-    schedule_id: str
-    has_token: bool
-    webhook_enabled: bool
-    webhook_url: Optional[str] = None
-
 
 def _build_webhook_url(request_base_url: str, token: str) -> str:
     """Construct the full webhook URL from base URL and token."""
@@ -576,7 +498,7 @@ def _build_webhook_url(request_base_url: str, token: str) -> str:
 
 @router.post("/{name}/schedules/{schedule_id}/webhook", response_model=WebhookStatusResponse)
 async def generate_webhook(
-    name: str,
+    name: AuthorizedAgent,
     schedule_id: str,
     request: Request,
     current_user: User = Depends(get_current_user)
@@ -585,13 +507,23 @@ async def generate_webhook(
 
     Creates an opaque 32-byte random token stored in the DB.
     Calling again replaces the old token, immediately invalidating the old URL.
+
+    Agent access is validated by AuthorizedAgent first (uniform 404), so the
+    schedule-not-found 404 below is only ever reached by an authorized accessor
+    — never an existence oracle for a stranger (#186).
     """
     schedule = db.get_schedule(schedule_id)
     if not schedule or schedule.agent_name != name:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found")
 
-    if not db.can_user_access_agent(current_user.username, name):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
+    # #1445: defense-in-depth — never mint a token for a schedule whose agent
+    # has no live ownership row (that token would 404 at trigger time). Runs
+    # AFTER the AuthorizedAgent uniform-404 access gate (#186), so it's not a
+    # pre-auth existence probe. In practice the schedule can't exist without a
+    # live agent post-gate, but this holds for any pre-existing orphan
+    # schedules and future creation paths.
+    if not db.is_agent_live(name):
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Agent not found")
 
     token = db.generate_webhook_token(schedule_id)
     if not token:
@@ -603,28 +535,33 @@ async def generate_webhook(
     webhook_url = _build_webhook_url(request.base_url, token)
     logger.info(f"Webhook token generated for schedule {schedule_id} by {current_user.username}")
 
+    # ent#77: rotating the token clears any prior signing secret (revoke path in
+    # db resets auth), so a freshly-minted token always reports auth off — the
+    # caller re-enables signing via POST .../webhook/secret.
     return WebhookStatusResponse(
         schedule_id=schedule_id,
         has_token=True,
         webhook_enabled=True,
         webhook_url=webhook_url,
+        auth_enabled=False,
+        has_secret=False,
     )
 
 
 @router.get("/{name}/schedules/{schedule_id}/webhook", response_model=WebhookStatusResponse)
 async def get_webhook_status(
-    name: str,
+    name: AuthorizedAgent,
     schedule_id: str,
     request: Request,
-    current_user: User = Depends(get_current_user)
 ):
-    """Get webhook configuration for a schedule."""
+    """Get webhook configuration for a schedule.
+
+    AuthorizedAgent gives a uniform 404 for a non-existent/inaccessible agent, so
+    the schedule-not-found 404 is accessor-only — not an existence oracle (#186).
+    """
     schedule = db.get_schedule(schedule_id)
     if not schedule or schedule.agent_name != name:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found")
-
-    if not db.can_user_access_agent(current_user.username, name):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
     status_data = db.get_webhook_status(schedule_id)
     if status_data is None:
@@ -638,22 +575,112 @@ async def get_webhook_status(
         has_token=status_data["has_token"],
         webhook_enabled=status_data["webhook_enabled"],
         webhook_url=webhook_url,
+        auth_enabled=status_data.get("auth_enabled", False),
+        has_secret=status_data.get("has_secret", False),
+        signature_header=WEBHOOK_SIGNATURE_HEADER,
+    )
+
+
+@router.post(
+    "/{name}/schedules/{schedule_id}/webhook/secret",
+    response_model=WebhookStatusResponse,
+)
+async def generate_webhook_secret(
+    name: AuthorizedAgent,
+    schedule_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    """Mint (or rotate) the HMAC signing secret and turn on signature auth.
+
+    Returns the plaintext `signing_secret` **exactly once** — it is never
+    persisted in the clear (only an AES-256-GCM envelope is stored) and never
+    returned by GET. Requires an existing webhook token (signing a schedule
+    with no webhook is meaningless → 409).
+
+    Access: `AuthorizedAgent`, matching schedule management + webhook token
+    minting (the credential-issuance model for this feature — settled per
+    ent#77 AC). Rotating the secret invalidates the previous one immediately.
+    """
+    schedule = db.get_schedule(schedule_id)
+    if not schedule or schedule.agent_name != name:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found")
+
+    if not schedule.webhook_token:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Enable the webhook (generate a URL) before adding signature auth",
+        )
+
+    secret = db.set_webhook_secret(schedule_id)
+    if secret is None:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to generate webhook signing secret",
+        )
+
+    webhook_url = _build_webhook_url(request.base_url, schedule.webhook_token)
+    logger.info(
+        f"Webhook signing secret generated for schedule {schedule_id} by {current_user.username}"
+    )
+    return WebhookStatusResponse(
+        schedule_id=schedule_id,
+        has_token=True,
+        webhook_enabled=True,
+        webhook_url=webhook_url,
+        auth_enabled=True,
+        has_secret=True,
+        signing_secret=secret,  # shown exactly once
+        signature_header=WEBHOOK_SIGNATURE_HEADER,
+    )
+
+
+@router.delete(
+    "/{name}/schedules/{schedule_id}/webhook/secret",
+    response_model=WebhookStatusResponse,
+)
+async def disable_webhook_secret(
+    name: AuthorizedAgent,
+    schedule_id: str,
+    request: Request,
+    current_user: User = Depends(get_current_user),
+):
+    """Turn signature auth off and drop the stored secret. The webhook URL stays
+    live (unauthenticated again); use DELETE .../webhook to revoke it entirely."""
+    schedule = db.get_schedule(schedule_id)
+    if not schedule or schedule.agent_name != name:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found")
+
+    db.clear_webhook_secret(schedule_id)
+    logger.info(
+        f"Webhook signature auth disabled for schedule {schedule_id} by {current_user.username}"
+    )
+    token = schedule.webhook_token
+    return WebhookStatusResponse(
+        schedule_id=schedule_id,
+        has_token=token is not None,
+        webhook_enabled=schedule.webhook_enabled,
+        webhook_url=_build_webhook_url(request.base_url, token) if token else None,
+        auth_enabled=False,
+        has_secret=False,
+        signature_header=WEBHOOK_SIGNATURE_HEADER,
     )
 
 
 @router.delete("/{name}/schedules/{schedule_id}/webhook", status_code=status.HTTP_204_NO_CONTENT)
 async def revoke_webhook(
-    name: str,
+    name: AuthorizedAgent,
     schedule_id: str,
     current_user: User = Depends(get_current_user)
 ):
-    """Revoke the webhook token for a schedule, immediately invalidating the URL."""
+    """Revoke the webhook token for a schedule, immediately invalidating the URL.
+
+    AuthorizedAgent gives a uniform 404 for a non-existent/inaccessible agent, so
+    the schedule-not-found 404 is accessor-only — not an existence oracle (#186).
+    """
     schedule = db.get_schedule(schedule_id)
     if not schedule or schedule.agent_name != name:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Schedule not found")
-
-    if not db.can_user_access_agent(current_user.username, name):
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Access denied")
 
     db.revoke_webhook_token(schedule_id)
     logger.info(f"Webhook token revoked for schedule {schedule_id} by {current_user.username}")

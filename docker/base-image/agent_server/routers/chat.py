@@ -8,14 +8,15 @@ import asyncio
 import logging
 from datetime import datetime
 
-from fastapi import APIRouter, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse, JSONResponse
 
 from ..models import ChatRequest, ModelRequest, ParallelTaskRequest
 from ..state import agent_state
 from ..services.claude_code import get_execution_lock
 from ..services.runtime_adapter import get_runtime
 from ..services.process_registry import get_process_registry
+from ..services import result_callback
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -126,6 +127,18 @@ async def execute_task(request: ParallelTaskRequest):
     else:
         logger.info(f"[Task] Executing parallel task: {request.message[:50]}...")
 
+    # #1083 fire-and-forget: when the backend requests async AND this is the
+    # Claude runtime, accept with 202 and run the turn in a detached task that
+    # reports the terminal to the backend's result-callback endpoint. The detached
+    # task owns its own record_task_start/finish. try_spawn_async returns False
+    # (→ synchronous handling below) for non-Claude runtimes, a missing
+    # execution_id, or absent callback creds — the non-202 fallback.
+    if result_callback.try_spawn_async(request):
+        return JSONResponse(
+            status_code=202,
+            content={"execution_id": request.execution_id, "status": "accepted"},
+        )
+
     # Execute via runtime adapter in headless mode (no lock, no --continue)
     runtime = get_runtime()
     # #1020: feed the richer /health signal — count this execution and record
@@ -144,12 +157,49 @@ async def execute_task(request: ParallelTaskRequest):
             persist_session=bool(request.persist_session),  # Session tab: write JSONL for future --resume
             images=request.images,  # Vision images from channel adapters (#562)
         )
+    except HTTPException as exc:
+        # #679 (F3): a terminated turn that surfaces a non-auth/non-rate terminal
+        # is a user cancel, not a failure. SIGINT→graceful-exit-0 with no output,
+        # or SIGKILL escalation, lands here as a 504 (signal exits) / 502 (empty
+        # result) / 500 — relabel ALL of them to a `cancelled` 200, mirroring the
+        # async result-callback's `_is_auth_or_rate` guard. 503/429/auth and any
+        # unterminated terminal re-raise unchanged (Issue 6/C6) so SUB-003 + the
+        # AUTH dispatch breaker still fire. The label is what matters — the cancel
+        # is non-billable, so we drop metadata (dict detail → empty response).
+        is_cancel = (
+            exc.status_code not in (503, 429)
+            and bool(request.execution_id)
+            and get_process_registry().was_terminated(request.execution_id)
+        )
+        # #679 (F4): a cancel is neutral for the failure counter (never trips the
+        # dispatch breaker); a genuine failure still increments it.
+        agent_state.record_task_finish(success=None if is_cancel else False)
+        if is_cancel:
+            logger.info(f"[Task] Task {request.execution_id} cancelled by user (status {exc.status_code})")
+            return {
+                "response": exc.detail if isinstance(exc.detail, str) else "",
+                "execution_log": [],
+                "metadata": {},
+                "session_id": None,
+                "status": "cancelled",
+                "timestamp": datetime.now().isoformat(),
+            }
+        raise
     except BaseException:
         agent_state.record_task_finish(success=False)
         raise
-    agent_state.record_task_finish(success=True)
 
-    logger.info(f"[Task] Task {session_id} completed successfully")
+    # #679 graceful path: Claude catches SIGINT, emits a final message, and exits
+    # 0 — the return code can't distinguish that from genuine success. Cross-check
+    # the cancel marker, keyed off the backend `execution_id` (NEVER the returned
+    # session_id, which can differ on a resumed/forked turn). Compute BEFORE
+    # record_task_finish so the cancel is recorded neutrally (F4).
+    cancelled = bool(request.execution_id) and get_process_registry().was_terminated(request.execution_id)
+    agent_state.record_task_finish(success=None if cancelled else True)
+    if cancelled:
+        logger.info(f"[Task] Task {request.execution_id} cancelled by user")
+    else:
+        logger.info(f"[Task] Task {session_id} completed successfully")
 
     # raw_messages contains the full Claude Code JSON stream (init, assistant, user, result)
     # This is the complete execution transcript showing thinking, tool calls, and results
@@ -158,6 +208,7 @@ async def execute_task(request: ParallelTaskRequest):
         "execution_log": raw_messages,  # Full JSON transcript from Claude Code
         "metadata": metadata.model_dump(),
         "session_id": session_id,
+        "status": "cancelled" if cancelled else "success",
         "timestamp": datetime.now().isoformat()
     }
 
@@ -200,8 +251,8 @@ async def get_model():
         return {
             "model": agent_state.current_model,
             "runtime": runtime,
-            "available_models": ["sonnet", "opus", "haiku"],
-            "note": "Claude model aliases: sonnet (Sonnet 4.5), opus (Opus 4.5), haiku. Add [1m] suffix for 1M context."
+            "available_models": ["sonnet", "opus", "haiku", "fable"],
+            "note": "Claude model aliases (Anthropic API): sonnet (Sonnet 5), opus (Opus 4.8), haiku (Haiku 4.5), fable (Fable 5). Add [1m] suffix for the 1M extended-context beta (e.g. sonnet[1m])."
         }
 
 
@@ -439,42 +490,3 @@ async def stream_execution_log(execution_id: str):
             "X-Accel-Buffering": "no"
         }
     )
-
-
-# ============================================================================
-# WebSocket Endpoints
-# ============================================================================
-
-@router.websocket("/ws/chat")
-async def websocket_chat(websocket: WebSocket):
-    """WebSocket endpoint for streaming chat (internal use)"""
-    await websocket.accept()
-    try:
-        while True:
-            data = await websocket.receive_text()
-            message = json.loads(data)
-
-            # Add user message
-            agent_state.add_message("user", message["content"])
-
-            # Send response via runtime adapter
-            runtime = get_runtime()
-            # Use model from message if provided, otherwise use current_model from state
-            effective_model = message.get("model") or agent_state.current_model
-            response_text, execution_log, metadata, raw_messages = await runtime.execute(
-                prompt=message["content"],
-                model=effective_model,
-                continue_session=True,
-                stream=True
-            )
-            agent_state.add_message("assistant", response_text)
-
-            await websocket.send_json({
-                "type": "message",
-                "role": "assistant",
-                "content": response_text,
-                "execution_log": raw_messages,  # Full Claude Code stream-json format
-                "metadata": metadata.model_dump()
-            })
-    except WebSocketDisconnect:
-        logger.info("WebSocket disconnected")

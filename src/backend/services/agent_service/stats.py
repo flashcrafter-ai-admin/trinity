@@ -8,15 +8,19 @@ import logging
 import os
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import datetime
+from typing import Optional
 
 import httpx
 from fastapi import HTTPException
 
 from models import User
 from database import db
+from services.agent_auth import build_agent_auth_headers
+from services.model_context import DEFAULT_CONTEXT_WINDOW
 from services.docker_service import get_agent_container
 from services.docker_utils import container_reload, container_stats
+from utils.helpers import iso_cutoff
 from .helpers import get_accessible_agents
 
 logger = logging.getLogger(__name__)
@@ -147,65 +151,57 @@ def invalidate_agent_stats_cache(agent_name: str) -> None:
     entry.gen += 1
 
 
-async def _fetch_single_agent_context(agent: dict, client: httpx.AsyncClient) -> dict:
-    """Fetch context stats for a single agent (used for concurrent fetching)."""
+async def _fetch_single_agent_context(
+    agent: dict,
+    client: httpx.AsyncClient,
+    last_activity: Optional[dict],
+    active_cutoff: str,
+) -> dict:
+    """Fetch context stats for one running agent (used for concurrent fetching).
+
+    #1265: this coroutine now performs ONLY the genuinely-async HTTP call so
+    asyncio.gather actually runs concurrently. The previous blocking work —
+    a per-agent Docker container lookup and a per-agent DB query — used to run
+    on the event-loop thread and serialised the whole "concurrent" fan-out
+    (10 agents x ~1-2s = the reported 20s). The container hostname is now
+    derived from the agent name (Docker DNS resolves `agent-{name}` on the
+    shared network, the same convention list_all_agents_fast trusts), and the
+    latest activity is pre-fetched in one bulk query by the caller.
+    """
     agent_name = agent["name"]
     status = agent["status"]
 
-    # Initialize default stats
     stats = {
         "name": agent_name,
         "status": status,
-        "activityState": "offline",
+        "activityState": "idle",
         "contextPercent": 0,
         "contextUsed": 0,
-        "contextMax": 200000,
-        "lastActivityTime": None
+        "contextMax": DEFAULT_CONTEXT_WINDOW,
+        "lastActivityTime": None,
     }
 
-    # Only fetch context stats for running agents
-    if status != "running":
-        return stats
-
-    # Fetch context stats from agent's internal API
+    # Fetch context window stats from the agent's internal API. No Docker call:
+    # the container is reachable at `agent-{name}:8000` via Docker DNS.
     try:
-        container = get_agent_container(agent_name)
-        if container:
-            agent_url = f"http://{container.name}:8000/api/chat/session"
-            response = await client.get(agent_url)
-            if response.status_code == 200:
-                session_data = response.json()
-                stats["contextPercent"] = session_data.get("context_percent", 0)
-                stats["contextUsed"] = session_data.get("context_tokens", 0)
-                stats["contextMax"] = session_data.get("context_window", 200000)
+        agent_url = f"http://agent-{agent_name}:8000/api/chat/session"
+        response = await client.get(agent_url, headers=build_agent_auth_headers(agent_name))
+        if response.status_code == 200:
+            session_data = response.json()
+            stats["contextPercent"] = session_data.get("context_percent", 0)
+            stats["contextUsed"] = session_data.get("context_tokens", 0)
+            stats["contextMax"] = session_data.get("context_window") or DEFAULT_CONTEXT_WINDOW
     except Exception as e:
         logger.debug(f"Error fetching context stats for {agent_name}: {e}")
 
-    # Determine active/idle state based on recent activity
-    try:
-        cutoff_time = (datetime.utcnow() - timedelta(seconds=60)).isoformat()
-        recent_activities = db.get_agent_activities(
-            agent_name=agent_name,
-            limit=1
-        )
-
-        if recent_activities and len(recent_activities) > 0:
-            last_activity = recent_activities[0]
-            activity_time = last_activity.get("created_at")
-            stats["lastActivityTime"] = activity_time
-
-            if activity_time and activity_time > cutoff_time:
-                if last_activity.get("activity_state") == "started":
-                    stats["activityState"] = "active"
-                else:
-                    stats["activityState"] = "idle"
-            else:
-                stats["activityState"] = "idle"
-        else:
-            stats["activityState"] = "idle"
-    except Exception as e:
-        logger.debug(f"Error determining activity state for {agent_name}: {e}")
-        stats["activityState"] = "idle"
+    # Determine active/idle state from the pre-fetched latest activity (no DB
+    # call here — that query is batched once for all agents by the caller).
+    if last_activity:
+        activity_time = last_activity.get("created_at")
+        stats["lastActivityTime"] = activity_time
+        if (activity_time and activity_time > active_cutoff
+                and last_activity.get("activity_state") == "started"):
+            stats["activityState"] = "active"
 
     return stats
 
@@ -246,15 +242,31 @@ async def get_agents_context_stats_logic(
         "activityState": "offline",
         "contextPercent": 0,
         "contextUsed": 0,
-        "contextMax": 200000,
+        "contextMax": DEFAULT_CONTEXT_WINDOW,
         "lastActivityTime": None
     } for a in stopped_agents]
 
     # Fetch running agent stats concurrently using a shared client
     running_stats = []
     if running_agents:
-        async with httpx.AsyncClient(timeout=2.0) as client:
-            tasks = [_fetch_single_agent_context(agent, client) for agent in running_agents]
+        # #1265: one bulk query for every running agent's latest activity,
+        # instead of a per-agent query inside each (now truly concurrent) task.
+        running_names = [a["name"] for a in running_agents]
+        latest_activity = db.get_latest_activity_for_agents(running_names)
+        active_cutoff = iso_cutoff(minutes=1)
+        # #1265: we deliberately no longer do a per-agent Docker lookup to pre-check
+        # liveness (that blocking call was the bottleneck). To keep a stale-`running`
+        # agent (container died between the status snapshot and now) from eating the
+        # full read timeout, cap the CONNECT timeout tightly — a dead in-network host
+        # fails connect fast — while still allowing a slow-but-alive agent 2s to reply.
+        timeout = httpx.Timeout(2.0, connect=0.5)
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            tasks = [
+                _fetch_single_agent_context(
+                    agent, client, latest_activity.get(agent["name"]), active_cutoff
+                )
+                for agent in running_agents
+            ]
             results = await asyncio.gather(*tasks, return_exceptions=True)
 
         for i, result in enumerate(results):
@@ -267,7 +279,7 @@ async def get_agents_context_stats_logic(
                     "activityState": "idle",
                     "contextPercent": 0,
                     "contextUsed": 0,
-                    "contextMax": 200000,
+                    "contextMax": DEFAULT_CONTEXT_WINDOW,
                     "lastActivityTime": None
                 })
             else:

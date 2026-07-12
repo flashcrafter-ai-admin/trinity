@@ -6,70 +6,108 @@ name: Schema Parity Gate
 # SQLite snapshots (schema-only vs full init_database lifecycle) and diffs
 # tables/columns/indexes/triggers.
 #
-# REQUIRED-CHECK SAFE (#1222): path filtering lives on the `changes` job below
-# (job-level `if:`), NOT on `on.pull_request.paths`. The workflow runs on every
-# PR, so the `schema-parity` context is always produced: on an unrelated PR the
-# job is SKIPPED, which GitHub counts as a passing required check; when DB paths
-# change it runs for real and can block. This supersedes the earlier "do not
-# make this required" note — a required check filtered via `on.paths` posts NO
-# status on unrelated PRs, which froze the entire dev merge queue (#1222).
+# REQUIRED-CHECK SAFETY (self-skip): this job is a REQUIRED status check on
+# `dev`. A purely path-filtered workflow that doesn't run on an unrelated PR
+# leaves the required context ABSENT, which GitHub holds at "Expected — waiting
+# for status" forever — bricking every PR that doesn't touch DB files (this is
+# exactly what regressed the merge queue, hence this rewrite superseding the
+# original "do NOT mark required" maintainer note). So the job now runs on
+# EVERY PR and self-skips the expensive parity test when no schema-shaped file
+# changed: it then passes trivially, satisfying the required check without
+# doing work. When a relevant file changes, the real test runs and can fail.
+# Change detection is pure `git diff` — no third-party action and no token
+# scope beyond `contents: read`.
+#
+# CROSS-TRACK ALEMBIC GUARD (#1342): the pytest above guards only the SQLite
+# track. PostgreSQL is a SECOND track — `init_database()` runs
+# `alembic_runner.upgrade_to_head()`, which applies revision files only (it does
+# NOT autogenerate from `tables.py`). A SQLite-only schema change therefore
+# merges green yet PG-broken. The extra step below (`scripts/ci/check_alembic_parity.py`)
+# fails a PR that ADDS schema DDL to db/{migrations,schema,tables}.py without a
+# net-new revision under src/backend/migrations/versions/. Heuristic & false-
+# positive guard (comments / data-only / down migrations carry no DDL keyword,
+# so they don't trip) are documented in that script's module docstring. PR-only
+# (it needs the PR base/head to diff); pure stdlib, no extra deps.
 
 on:
   pull_request:
   push:
     branches: [main, dev]
+    paths:
+      - 'src/backend/db/**'
+      - 'src/backend/migrations/**'
+      - 'src/backend/database.py'
+      - 'src/backend/utils/helpers.py'
+      - 'tests/unit/test_schema_parity.py'
+      - 'tests/unit/test_alembic_parity_guard.py'
+      - 'scripts/ci/check_alembic_parity.py'
+      - 'tests/requirements-test.txt'
+      - '.github/workflows/schema-parity.yml'
   workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  # Cheap path detector — runs on every PR/push so the required `schema-parity`
-  # context is ALWAYS produced. The heavy job below is gated on its output, so an
-  # unrelated PR skips it (→ passing required check) instead of leaving the
-  # context "expected" forever (the #1222 freeze).
-  changes:
-    runs-on: ubuntu-latest
-    # paths-filter resolves the PR's changed-file list via the API; the heavy
-    # schema-parity job keeps the workflow-level least-privilege contents: read.
-    permissions:
-      contents: read
-      pull-requests: read
-    outputs:
-      db: ${{ steps.filter.outputs.db }}
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dorny/paths-filter@v3
-        id: filter
-        with:
-          filters: |
-            db:
-              - 'src/backend/db/**'
-              - 'src/backend/database.py'
-              - 'src/backend/utils/helpers.py'
-              - 'tests/unit/test_schema_parity.py'
-              - 'tests/requirements-test.txt'
-              - '.github/workflows/schema-parity.yml'
-
   schema-parity:
-    needs: changes
-    # Skipped (→ reported as a passing required check) when no DB paths changed;
-    # runs for real and can block when they did. See #1222.
-    if: needs.changes.outputs.db == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # need base history to diff the PR's changed paths
+
+      # Cross-track guard (#1342): SQLite-track DDL must ship a paired Alembic
+      # revision. PR-only — needs the PR base/head SHAs to diff. Pure stdlib.
+      - name: Alembic (Postgres) parity guard
+        if: github.event_name == 'pull_request'
+        env:
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 scripts/ci/check_alembic_parity.py
+
+      - name: Detect schema-relevant changes
+        id: changes
+        env:
+          GH_EVENT: ${{ github.event_name }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          # Only PRs self-skip. push is already path-filtered to the relevant
+          # surface, and dispatch is a deliberate manual run — both run fully.
+          if [ "$GH_EVENT" != "pull_request" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            echo "event=$GH_EVENT — running the full parity check."
+            exit 0
+          fi
+          if [ -z "$PR_BASE_SHA" ] || [ "$PR_BASE_SHA" = "0000000000000000000000000000000000000000" ]; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            echo "no base sha available — running the full parity check."
+            exit 0
+          fi
+          CHANGED="$(git diff --name-only "$PR_BASE_SHA...$PR_HEAD_SHA")"
+          echo "Changed files in PR:"; echo "$CHANGED"
+          if printf '%s\n' "$CHANGED" | grep -qE '^(src/backend/db/|src/backend/database\.py$|src/backend/utils/helpers\.py$|tests/unit/test_schema_parity\.py$|tests/unit/test_alembic_parity_guard\.py$|scripts/ci/check_alembic_parity\.py$|tests/requirements-test\.txt$|\.github/workflows/schema-parity\.yml$)'; then
+            echo "relevant=true" >> "$GITHUB_OUTPUT"
+            echo "schema-relevant files changed — running the parity check."
+          else
+            echo "relevant=false" >> "$GITHUB_OUTPUT"
+            echo "No schema-relevant files changed — required check trivially satisfied (self-skip)."
+          fi
 
       - uses: actions/setup-python@v6
+        if: steps.changes.outputs.relevant == 'true'
         with:
           python-version: '3.11'
           cache: 'pip'
           cache-dependency-path: 'tests/requirements-test.txt'
 
       - name: Install test deps
+        if: steps.changes.outputs.relevant == 'true'
         run: pip install -r tests/requirements-test.txt
 
       - name: Run schema parity check
+        if: steps.changes.outputs.relevant == 'true'
         env:
           # Migration _migrate_slack_bot_token_encryption (migrations.py:1898)
           # imports services.credential_encryption. The key is only accessed
@@ -83,4 +121,4 @@ jobs:
           REDIS_URL: "redis://test:test@redis:6379"
           REDIS_PASSWORD: "test"
           REDIS_BACKEND_PASSWORD: "test"
-        run: pytest tests/unit/test_schema_parity.py -v --tb=short
+        run: pytest tests/unit/test_schema_parity.py tests/unit/test_alembic_parity_guard.py -v --tb=short

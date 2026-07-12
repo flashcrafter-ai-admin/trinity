@@ -11,27 +11,33 @@ Related routers (same /api/agents prefix):
 - agent_ssh.py     — SSH access
 """
 import json
-import docker
 import logging
-from pathlib import Path
+import random
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, Query, WebSocket
-from pydantic import BaseModel
 
-from models import AgentConfig, AgentStatus, User, DeployLocalRequest, CircuitBreakerConfigUpdate
+from models import (
+    AgentConfig,
+    AgentStatus,
+    CircuitBreakerConfigUpdate,
+    DeployLocalRequest,
+    ExecutionResultEnvelope,
+    HeartbeatPayload,
+    McpExposedUpdate,
+    VoiceRepliesUpdate,
+    TaskExecutionStatus,
+    User,
+)
 from database import db
 from dependencies import get_current_user, decode_token, require_role, AuthorizedAgentByName, OwnedAgentByName, CurrentUser
 from services.docker_service import (
-    docker_client,
     get_agent_container,
     get_agent_by_name,
 )
 from services.docker_utils import (
-    container_stop, container_remove, container_reload,
-    volume_get, volume_remove
+    container_stop, container_remove,
 )
-from services import git_service
-from services.image_generation_prompts import AVATAR_EMOTIONS
+from services import heartbeat_service
 from services.platform_audit_service import (
     platform_audit_service,
     AuditEventType,
@@ -41,14 +47,8 @@ from services.platform_audit_service import (
 from services.agent_service import (
     # Helpers - re-exported for external modules
     get_accessible_agents,
-    get_agents_by_prefix,
-    get_next_version_name,
-    get_latest_version,
-    check_shared_folder_mounts_match,
-    check_api_key_env_matches,
     # Lifecycle
     start_agent_internal,
-    recreate_container_with_updated_config,
     # CRUD
     create_agent_internal as _create_agent_internal,
     # Deploy
@@ -500,16 +500,17 @@ async def delete_agent_endpoint(agent_name: str, request: Request, current_user:
     except Exception as e:
         logger.warning(f"Failed to cancel backlog for agent {agent_name}: {e}")
 
-    # RELIABILITY-004 / #307: clear the agent's heartbeat Redis keys now. The
-    # `seen` marker has no TTL, so without this it would leak past delete; the
-    # hb/misses keys self-expire but are cleared too for cleanliness. The
-    # watch loop bounds itself to live agents, so a stopped container is never
-    # read regardless — this just stops the slow key accumulation. Best-effort.
+    # #1560 / RELIABILITY-004 (#307): clear every per-agent Redis keyspace in one
+    # sweep — heartbeat markers (the `seen` key has no TTL), both circuit
+    # breakers, and the execution slots. The breakers are keyed by name, so
+    # leaving them behind hands a dead agent's verdict to whatever agent next
+    # takes this name. The container was removed above, so clearing slots cannot
+    # race a live execution. Best-effort: never blocks the delete.
     try:
-        from services import heartbeat_service
-        heartbeat_service.clear_heartbeat(agent_name)
+        from services.agent_runtime_state import clear_agent_runtime_state
+        await clear_agent_runtime_state(agent_name)
     except Exception as e:
-        logger.warning(f"Failed to clear heartbeat keys for agent {agent_name}: {e}")
+        logger.warning(f"Failed to clear Redis runtime state for agent {agent_name}: {e}")
 
     # Mark the row as soft-deleted. Children stay until the retention
     # sweep; the unique constraint on agent_name naturally blocks reuse
@@ -773,22 +774,152 @@ async def set_circuit_breaker_endpoint(
         target_id=agent_name,
         details={"enabled": body.enabled},
     )
-    return {
+    result = {
         "agent_name": agent_name,
         "enabled": body.enabled,
         "global_enabled": bool(DISPATCH_BREAKER_ENABLED),
+    }
+    # #1491: the breaker is two-tier gated — turning the per-agent toggle on
+    # while the platform-wide DISPATCH_BREAKER_ENABLED flag is off saves the
+    # preference but does nothing. Surface a non-fatal advisory so the owner
+    # isn't caught by the "switch is on but nothing happens" trap. The write
+    # still succeeds; the stored preference applies once the global flag flips on.
+    if body.enabled and not DISPATCH_BREAKER_ENABLED:
+        result["warning"] = (
+            "Per-agent toggle saved, but the breaker stays inactive until the "
+            "platform-wide DISPATCH_BREAKER_ENABLED flag is enabled."
+        )
+    return result
+
+
+# ============================================================================
+# MCP Exposure Toggle (#846)
+# ============================================================================
+
+
+@router.get("/{agent_name}/mcp-exposed")
+async def get_mcp_exposed_endpoint(
+    agent_name: AuthorizedAgentByName,
+    current_user: CurrentUser,
+):
+    """Whether the agent is exposed as a dedicated MCP tool (#846).
+
+    Returns the current flag plus the deterministic ``tool_name`` the MCP server
+    would register, resolved over the live exposed set so the name shown matches
+    the suffixed tool actually registered when another exposed agent shares the
+    same base slug (#846).
+    """
+    from services.agent_service.mcp_tool_names import resolve_tool_name
+
+    enabled = db.get_mcp_exposed(agent_name)
+    exposed_names = [a["agent_name"] for a in db.get_mcp_exposed_agents()]
+    return {
+        "agent_name": agent_name,
+        "enabled": enabled,
+        "tool_name": resolve_tool_name(agent_name, exposed_names),
+    }
+
+
+@router.put("/{agent_name}/mcp-exposed")
+async def set_mcp_exposed_endpoint(
+    agent_name: OwnedAgentByName,
+    body: McpExposedUpdate,
+    current_user: CurrentUser,
+):
+    """Enable/disable exposing the agent as a dedicated MCP tool (#846). Owner-only.
+
+    Refuses the system agent (it already bypasses all permission checks). The MCP
+    server polls the internal endpoint and adds/removes the dedicated tool within
+    one poll interval — no MCP-server restart.
+    """
+    from services.agent_service.mcp_tool_names import resolve_tool_name
+
+    if db.is_system_agent(agent_name):
+        raise HTTPException(status_code=403, detail="Cannot expose the system agent via MCP")
+
+    db.set_mcp_exposed(agent_name, body.enabled)
+    await platform_audit_service.log(
+        event_type=AuditEventType.CONFIGURATION,
+        event_action="mcp_exposed_config",
+        source="api",
+        actor_user=current_user,
+        target_type="agent",
+        target_id=agent_name,
+        details={"enabled": body.enabled},
+    )
+    # Resolve over the now-current exposed set so the returned name reflects any
+    # collision suffix the MCP server will actually register (#846).
+    exposed_names = [a["agent_name"] for a in db.get_mcp_exposed_agents()]
+    return {
+        "agent_name": agent_name,
+        "enabled": body.enabled,
+        "tool_name": resolve_tool_name(agent_name, exposed_names),
+    }
+
+
+# ============================================================================
+# Outbound voice replies (TTS) — shared agent-level config (epic #24 / #25)
+# ============================================================================
+
+
+@router.get("/{agent_name}/voice-replies")
+async def get_voice_replies_endpoint(
+    agent_name: AuthorizedAgentByName,
+    current_user: CurrentUser,
+):
+    """Shared per-agent outbound-voice config (epic #24 / #25).
+
+    Returns the toggle + configured ElevenLabs voice id, plus ``available`` —
+    whether the platform has TTS configured at all (``ELEVENLABS_API_KEY``) — so
+    the UI can show an inactive state instead of a dead toggle.
+    """
+    import services.tts_service as tts_service
+
+    cfg = db.get_tts_config(agent_name)
+    return {
+        "agent_name": agent_name,
+        "enabled": cfg["enabled"],
+        "voice_id": cfg["voice_id"],
+        "available": tts_service.is_available(),
+    }
+
+
+@router.put("/{agent_name}/voice-replies")
+async def set_voice_replies_endpoint(
+    agent_name: OwnedAgentByName,
+    body: VoiceRepliesUpdate,
+    current_user: CurrentUser,
+):
+    """Enable/disable spoken replies and set the ElevenLabs voice id (owner-only).
+
+    Enabling requires a ``voice_id``. When on, channel adapters (Telegram first)
+    speak replies via the shared TTS service, falling back to text on any failure
+    or when the reply exceeds the shared cost cap.
+    """
+    if body.enabled and not body.voice_id:
+        raise HTTPException(status_code=400, detail="voice_id is required to enable voice replies")
+
+    db.set_tts_config(agent_name, body.enabled, body.voice_id)
+    await platform_audit_service.log(
+        event_type=AuditEventType.CONFIGURATION,
+        event_action="voice_replies_config",
+        source="api",
+        actor_user=current_user,
+        target_type="agent",
+        target_id=agent_name,
+        details={"enabled": body.enabled, "has_voice_id": bool(body.voice_id)},
+    )
+    cfg = db.get_tts_config(agent_name)
+    return {
+        "agent_name": agent_name,
+        "enabled": cfg["enabled"],
+        "voice_id": cfg["voice_id"],
     }
 
 
 # ============================================================================
 # Heartbeat Endpoint (RELIABILITY-004 / #307)
 # ============================================================================
-
-class HeartbeatPayload(BaseModel):
-    """Lightweight liveness payload POSTed by the agent every ~5s."""
-    memory_mb: Optional[float] = None
-    active_executions: Optional[int] = None
-    uptime_s: Optional[float] = None
 
 
 @router.post("/{agent_name}/heartbeat")
@@ -820,6 +951,236 @@ async def agent_heartbeat(agent_name: str, payload: HeartbeatPayload, request: R
         agent_name, payload.model_dump(exclude_none=True)
     )
     return {"ok": True, "stored": stored}
+
+
+# ============================================================================
+# Fire-and-Forget Result Callback (#1083)
+# ============================================================================
+
+# Field caps for the result callback — well above a legitimate large transcript
+# (the synchronous /api/task path already accepts these), low enough to bound a
+# buggy/compromised agent. Enforced as a clean 413 (not a Pydantic 422) so the
+# agent's status-code-driven retry logic treats it as a permanent reject.
+_MAX_CALLBACK_RESPONSE_CHARS = 4_000_000
+_MAX_CALLBACK_LOG_BYTES = 16_000_000
+
+# Authoritative terminals a callback must NOT overwrite — short-circuit as an
+# idempotent replay. FAILED is deliberately EXCLUDED: a row FAILED by the lease
+# reaper (LEASE_EXPIRED) must still let a genuinely-late SUCCESS callback through
+# to `apply_result`, whose CAS lets SUCCESS overwrite a non-cancelled terminal
+# (#378 / Codex #2 — "not guarded against"). A duplicate FAILED callback on an
+# already-FAILED row is harmless: the non-success CAS blocks it (won=False) so no
+# side-effect re-runs. SUCCESS/CANCELLED/SKIPPED are final and replay-safe to ACK.
+_AUTHORITATIVE_TERMINALS = frozenset({
+    TaskExecutionStatus.SUCCESS,
+    TaskExecutionStatus.CANCELLED,
+    TaskExecutionStatus.SKIPPED,
+})
+
+# The durable async marker set at dispatch (PR2.F) — the ONLY RUNNING rows the
+# callback may finalize. Keeps the callback from terminal-writing a sync /
+# interactive execution the backend is mid-await on (Codex #3 / decision 2).
+_ASYNC_DISPATCH_MARKER = "dispatched_async"
+
+
+def _jittered_retry_after(base_seconds: int) -> int:
+    """A jittered Retry-After (seconds) for a paused/throttled callback (#1085).
+
+    Spreads ±50% around ``base`` so throttled agents don't realign on the same
+    backoff edge and re-storm in lockstep when the hint elapses. Floored at 1."""
+    base = max(1, int(base_seconds))
+    return max(1, int(random.uniform(base * 0.5, base * 1.5)))
+
+
+@router.post("/{agent_name}/executions/{execution_id}/result")
+async def agent_execution_result(
+    agent_name: str,
+    execution_id: str,
+    payload: ExecutionResultEnvelope,
+    request: Request,
+):
+    """Receive a fire-and-forget turn's terminal from the agent (#1083).
+
+    Fully hardened and fail-closed. Auth mirrors the heartbeat endpoint
+    (decision 2): the agent's OWN agent-scoped MCP key (Bearer), validated with
+    ``track_usage=False`` and ``authorize_heartbeat`` (an agent may only report
+    its own executions). Then an execution-ownership check and a **durable
+    async-marker gate**.
+
+    Acceptance rules (fail-closed):
+      * Missing/non-Bearer auth, or a user/system/wrong-agent key → 403.
+      * Execution missing or not owned by ``agent_name`` → 404.
+      * Execution already terminal → idempotent replay → 200 ``{replayed: true}``
+        (the row is final; no write happens — safe to ACK so the agent stops
+        retrying).
+      * Execution RUNNING but NOT carrying the ``dispatched_async`` marker → 409.
+        This is the cross-path guard: a synchronous/interactive execution the
+        backend is mid-await on must never be finalized from here. **In PR1 no
+        execution is ever marked async, so every live RUNNING callback hits this
+        409 — the endpoint ships hardened but inert until PR2 sets the marker.**
+      * Oversized ``response``/``execution_log`` → 413.
+
+    On accept the terminal flows through ``apply_result`` (release_slot=True — the
+    callback owns the lease), which CAS-gates every side effect, so a duplicate
+    callback is a no-op (no double activity close / breaker churn / slot drain).
+    """
+    from services import heartbeat_service
+    from services.task_execution_service import (
+        TaskExecutionErrorCode,
+        TerminalEnvelope,
+        dispatch_breaker_active,
+        get_task_execution_service,
+    )
+
+    # ---- Auth: agent's own MCP key (mirror heartbeat) -----------------------
+    auth_header = request.headers.get("Authorization")
+    if not auth_header or not auth_header.startswith("Bearer "):
+        raise HTTPException(status_code=403, detail="Result callback requires the agent's own MCP key")
+    token = auth_header[7:]
+    res = db.validate_mcp_api_key(token, track_usage=False)
+    if not heartbeat_service.authorize_heartbeat(res, agent_name):
+        raise HTTPException(status_code=403, detail="Result callback requires the agent's own MCP key")
+
+    # ---- Ownership: the execution must exist and belong to this agent -------
+    execution = db.get_execution(execution_id)
+    if not execution or execution.agent_name != agent_name:
+        # 404 (not 403) — don't leak existence of another agent's execution id.
+        raise HTTPException(status_code=404, detail="Execution not found")
+
+    # ---- Idempotent replay: an authoritative terminal is a no-op ACK --------
+    # (FAILED falls through — a late SUCCESS may still correct a reaper
+    # LEASE_EXPIRED via the CAS; a duplicate FAILED is CAS-blocked downstream.)
+    if execution.status in _AUTHORITATIVE_TERMINALS:
+        return {"ok": True, "replayed": True, "status": execution.status}
+
+    # ---- Durable async-marker gate (fail-closed cross-path guard) ----------
+    # RUNNING-sync / interactive rows (marker 'dispatched' / real-uuid / NULL) and
+    # any non-async FAILED row are rejected — the callback only finalizes rows it
+    # owns. A reaper-FAILED async row keeps its 'dispatched_async' marker, so a
+    # late SUCCESS still passes here.
+    if execution.claude_session_id != _ASYNC_DISPATCH_MARKER:
+        raise HTTPException(
+            status_code=409,
+            detail="Execution was not async-dispatched; result callback rejected",
+        )
+
+    # ---- Body-size hardening ------------------------------------------------
+    if payload.response is not None and len(payload.response) > _MAX_CALLBACK_RESPONSE_CHARS:
+        raise HTTPException(status_code=413, detail="response too large")
+    if payload.execution_log is not None:
+        try:
+            log_bytes = len(json.dumps(payload.execution_log))
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=422, detail="execution_log is not JSON-serializable")
+        if log_bytes > _MAX_CALLBACK_LOG_BYTES:
+            raise HTTPException(status_code=413, detail="execution_log too large")
+
+    # ---- #1085 re-delivery governor: shared-cause pause + rate caps --------
+    # Master-flag gated (inert when OFF). Placed AFTER the replay-ACK (an
+    # already-final row still ACKs 200 while paused) and the marker-409 (a
+    # non-async row is still permanently rejected) so ONLY a legit accepted async
+    # terminal is ever throttled. Throttle/pause raises **503 + Retry-After**,
+    # NOT 429: 503 ∉ result_callback._PERMANENT_STATUSES, so a throttled callback
+    # stays persisted on disk and retries on its jittered backoff — the startup
+    # sweep and lease reaper remain the never-drop backstops. Fail-open:
+    # rate_limiter.check / is_paused degrade to allow on a Redis outage.
+    import config
+    if config.REDELIVERY_GOVERNOR_ENABLED:
+        from services import rate_limiter
+        from services.redelivery_governor import get_redelivery_governor
+
+        if get_redelivery_governor().is_paused():
+            retry_after = _jittered_retry_after(config.REDELIVERY_PAUSE_RETRY_AFTER_SECONDS)
+            logger.warning(
+                "[#1085] result callback for %s held — fleet re-delivery paused (shared cause)",
+                execution_id,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Re-delivery paused (shared cause); retry later",
+                headers={"Retry-After": str(retry_after)},
+            )
+        fleet = rate_limiter.check(
+            "redelivery:fleet",
+            config.REDELIVERY_FLEET_LIMIT,
+            config.REDELIVERY_FLEET_WINDOW_SECONDS,
+        )
+        per_agent = rate_limiter.check(
+            f"redelivery:agent:{agent_name}",
+            config.REDELIVERY_AGENT_LIMIT,
+            config.REDELIVERY_AGENT_WINDOW_SECONDS,
+        )
+        if not fleet.allowed or not per_agent.allowed:
+            retry_after = max(fleet.retry_after, per_agent.retry_after, 1)
+            logger.warning(
+                "[#1085] result callback for %s throttled (fleet_ok=%s agent_ok=%s)",
+                execution_id, fleet.allowed, per_agent.allowed,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="Re-delivery rate limit exceeded; retry later",
+                headers={"Retry-After": str(retry_after)},
+            )
+
+    # ---- Build the normalized terminal + apply -----------------------------
+    # #679: 3-way map — success→SUCCESS, cancelled→CANCELLED, everything else
+    # (incl. unknown forward-compat values) →FAILED. CANCELLED flows through
+    # apply_result (release_slot=True); the replay gate above already short-
+    # circuits a terminate-wrote-first CANCELLED row, and the reverse race
+    # (callback CANCELLED first) makes the later terminate write a CAS no-op.
+    #
+    # Finding 2 (CSO 2026-06-22): an auth/rate terminal must NOT be reclassified
+    # as a clean cancellation even when the agent labels it "cancelled". The
+    # agent side already guards this (result_callback._is_auth_or_rate), but the
+    # callback is the backend trust boundary — a buggy or mixed-version agent
+    # that POSTs status:"cancelled" carrying error_code:"auth" (or an auth/
+    # rate_limit terminal_reason) would otherwise silently dodge the AUTH
+    # dispatch breaker / SUB-003 auto-switch. Mirror the guard so the invariant
+    # ("auth/rate is never cancellation") holds regardless of the caller image.
+    is_auth_or_rate = (
+        payload.error_code == TaskExecutionErrorCode.AUTH.value
+        or payload.terminal_reason in ("auth", "rate_limit")
+    )
+    if payload.status == "success":
+        status = TaskExecutionStatus.SUCCESS
+    elif payload.status == "cancelled" and not is_auth_or_rate:
+        status = TaskExecutionStatus.CANCELLED
+    else:
+        status = TaskExecutionStatus.FAILED
+    error_code = None
+    if payload.error_code:
+        try:
+            error_code = TaskExecutionErrorCode(payload.error_code)
+        except ValueError:
+            # Unknown codes are non-fatal — apply_result only special-cases AUTH.
+            error_code = None
+
+    envelope = TerminalEnvelope(
+        execution_id=execution_id,
+        status=status,
+        response=payload.response,
+        error=payload.error,
+        error_code=error_code,
+        metadata=payload.metadata or {},
+        execution_log=payload.execution_log,
+        session_id=payload.session_id,
+        execution_time_ms=payload.execution_time_ms,
+    )
+
+    svc = get_task_execution_service()
+    result = await svc.apply_result(
+        agent_name,
+        envelope,
+        activity_id=db.get_open_activity_id_for_execution(execution_id),
+        breaker_enabled=dispatch_breaker_active(agent_name),
+        release_slot=True,
+    )
+    if payload.terminal_reason:
+        logger.info(
+            "[#1083] result callback for %s applied: status=%s terminal_reason=%s",
+            execution_id, result.status, payload.terminal_reason,
+        )
+    return {"ok": True, "replayed": False, "status": result.status}
 
 
 # ============================================================================

@@ -9,7 +9,7 @@ websockets>=13.0
 python-dotenv>=1.0.1
 docker>=7.1.0
 apscheduler>=3.11.0
-pydantic>=2.10.0
+pydantic[email]>=2.10.0
 fastapi>=0.115.0
 pyyaml>=6.0.0
 python-jose[cryptography]>=3.3.0
@@ -43,13 +43,17 @@ twilio>=9.10.0
 Pillow>=11.1.0
 tenacity>=9.0.0
 passlib[bcrypt]>=1.7.4
-bcrypt>=4.2.0
+# Cap bcrypt <5: bcrypt 5.0.0 removed the `__about__` shim passlib 1.7.4 reads at
+# import, so an uncapped fresh venv breaks every test at conftest DB-init. Pin
+# until passlib ships a 5.x-compatible release.
+bcrypt>=4.2.0,<5
 pydantic-settings>=2.0.0
 google-genai>=1.0.0
 payments-py>=1.0.0
-# CLI package — required for test_cli_admin_login.py and test_cli_profiles.py.
-# Editable so changes to src/cli/ are picked up without reinstall. pip resolves
-# this path against the current working directory (not the requirements file),
-# so `pip install -r tests/requirements-test.txt` must be invoked from the repo
-# root — which is what every CI workflow does.
--e ./src/cli
+# NOTE: trinity-cli (needed by test_cli_*.py) is intentionally NOT listed here.
+# An editable local path (`-e ./src/cli`) breaks GitHub's dependency-graph
+# updater — it resolves `-e` targets relative to THIS file's dir (tests/src/cli,
+# which doesn't exist), erroring the repo's "Dependency Graph" check on every
+# release. The local run-*.sh wrappers install the editable CLI via
+# tests/setup-env.sh instead; unit/ (the #660 one-liner contract) never imports
+# trinity_cli, so CI — which only runs unit/ — is unaffected.

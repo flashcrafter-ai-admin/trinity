@@ -7,6 +7,7 @@ import os
 import json
 import logging
 import subprocess
+import tomllib  # py3.11+; agent base image is python 3.13
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -31,6 +32,8 @@ def inject_trinity_mcp_if_configured() -> bool:
 
     runtime = os.getenv("AGENT_RUNTIME", "claude-code").lower()
 
+    if runtime == "codex":
+        return _inject_codex_mcp(trinity_mcp_url, trinity_mcp_api_key)
     if runtime == "gemini-cli":
         return _inject_gemini_mcp(trinity_mcp_url, trinity_mcp_api_key)
     else:
@@ -143,6 +146,8 @@ def configure_mcp_servers(mcp_servers: dict) -> bool:
 
     runtime = os.getenv("AGENT_RUNTIME", "claude-code").lower()
 
+    if runtime == "codex":
+        return _configure_codex_mcp_servers(mcp_servers)
     if runtime == "gemini-cli":
         return _configure_gemini_mcp_servers(mcp_servers)
     else:
@@ -211,3 +216,224 @@ def _configure_gemini_mcp_servers(mcp_servers: dict) -> bool:
 
     logger.info(f"Configured {success_count}/{len(mcp_servers)} MCP servers for Gemini CLI")
     return success_count > 0 or len(mcp_servers) == 0
+
+
+# ---------------------------------------------------------------------------
+# Codex CLI MCP configuration (#1187 Phase F)
+#
+# Codex reads MCP servers from ``$CODEX_HOME/config.toml`` under
+# ``[mcp_servers.<name>]``. We write that file DIRECTLY (the same approach the
+# Gemini path uses for its settings.json — deterministic, avoids `codex mcp
+# add` CLI-syntax drift) and MERGE so the Trinity-MCP injection and the
+# template-MCP configuration (two separate calls) don't clobber each other.
+#
+# CODEX_HOME is the relocated, gitignored scratch path (see codex_runtime.py);
+# both this config writer and the runtime resolve it via the same helper so the
+# file we write is the file Codex reads.
+# ---------------------------------------------------------------------------
+
+def _codex_config_path() -> Path:
+    from .codex_runtime import _codex_home  # lazy: avoid an import cycle
+
+    return Path(_codex_home()) / "config.toml"
+
+
+def _read_codex_config(path: Path) -> dict:
+    try:
+        with open(path, "rb") as fh:
+            return tomllib.load(fh)
+    except (IOError, OSError):
+        return {}
+    except tomllib.TOMLDecodeError as exc:
+        # Do NOT silently reset on a decode error. If we returned {} here, the
+        # next _upsert_codex_mcp_servers would rewrite the file from {} and
+        # drop every previously-written server — including the Trinity MCP
+        # wiring — with no trace. Back the bad file up and log loudly so the
+        # corruption is recoverable and visible; the caller re-injects its
+        # servers onto a clean slate on this run.
+        try:
+            backup = path.with_name(path.name + ".corrupt")
+            path.replace(backup)
+            logger.error(
+                "Codex config.toml is malformed (%s); backed it up to %s and "
+                "starting from an empty config. MCP servers are re-written this "
+                "run.",
+                exc, backup,
+            )
+        except OSError as backup_err:
+            logger.error(
+                "Codex config.toml is malformed (%s) and the backup also failed "
+                "(%s); rewriting from an empty config.",
+                exc, backup_err,
+            )
+        return {}
+
+
+# Bare TOML keys are limited to ASCII letters, digits, '_' and '-'. Anything
+# else (space, '.', ']', '#', control chars) must be a quoted basic-string key.
+_BARE_KEY_CHARS = frozenset(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-"
+)
+
+# Basic-string escapes with TOML shorthand. Everything else < 0x20 (plus 0x7F)
+# becomes a \uXXXX escape; otherwise an out-of-band character (e.g. a newline
+# in a server name or env value) yields invalid TOML.
+_TOML_SHORTHAND_ESCAPES = {
+    "\\": "\\\\",
+    '"': '\\"',
+    "\b": "\\b",
+    "\t": "\\t",
+    "\n": "\\n",
+    "\f": "\\f",
+    "\r": "\\r",
+}
+
+
+def _toml_escape(value: str) -> str:
+    out: list[str] = []
+    for ch in value:
+        shorthand = _TOML_SHORTHAND_ESCAPES.get(ch)
+        if shorthand is not None:
+            out.append(shorthand)
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append(f"\\u{ord(ch):04X}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _toml_key(key: str) -> str:
+    """Render a TOML key segment: bare when it is a valid bare key, otherwise a
+    quoted basic-string key. Used for both ``key = ...`` lines and the dotted
+    segments of ``[table.header]`` lines so a server name or env key with a
+    space/dot/special char can't produce unparseable TOML."""
+    if key and all(c in _BARE_KEY_CHARS for c in key):
+        return key
+    return f'"{_toml_escape(key)}"'
+
+
+def _toml_scalar(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, list):
+        # A list of dicts is a TOML array-of-tables ([[name]]), which this
+        # writer never emits. Stringifying the dicts would silently corrupt a
+        # pre-existing config on round-trip. Raise instead: the caller
+        # (_upsert_codex_mcp_servers) serializes BEFORE write_text, so a raise
+        # leaves the original file intact and logs a warning — a safe no-op
+        # rather than a mangled rewrite (#1187 review).
+        if any(isinstance(item, dict) for item in value):
+            raise TypeError(
+                "codex config writer does not support TOML array-of-tables; "
+                "refusing to serialize to avoid corrupting the existing file"
+            )
+        return "[" + ", ".join(_toml_scalar(item) for item in value) + "]"
+    if isinstance(value, dict):
+        # _serialize_table routes dicts to sub-tables, so a dict reaching here
+        # is an unexpected nesting. Raise rather than emit a stringified dict.
+        raise TypeError(
+            "codex config writer received a dict where a scalar was expected"
+        )
+    return f'"{_toml_escape(str(value))}"'
+
+
+def _serialize_table(path: list[str], table: dict, lines: list[str]) -> None:
+    """Recursively emit a TOML table. ``path`` is the header segments (empty for
+    the document root). Scalar keys are always emitted before any nested-table
+    headers (TOML requires it). A table with only sub-tables is left as an
+    implicit super-table (no redundant ``[parent]`` header), matching the
+    hand-written output this replaced."""
+    scalars = {k: v for k, v in table.items() if not isinstance(v, dict)}
+    sub_tables = {k: v for k, v in table.items() if isinstance(v, dict)}
+    # Emit a header for a non-root table that has its own scalar keys, or that
+    # is entirely empty (so an explicit empty table round-trips). Skip it for a
+    # pure super-table whose only contents are nested tables.
+    emit_header = bool(path) and (bool(scalars) or not sub_tables)
+    if emit_header:
+        lines.append("[" + ".".join(_toml_key(seg) for seg in path) + "]")
+    for key, value in scalars.items():
+        lines.append(f"{_toml_key(key)} = {_toml_scalar(value)}")
+    if emit_header or (scalars and sub_tables):
+        lines.append("")
+    for key, sub in sub_tables.items():
+        _serialize_table(path + [key], sub, lines)
+
+
+def _serialize_codex_config(config: dict) -> str:
+    """Serialize the codex config we manage to TOML: arbitrary top-level scalars
+    and tables (preserved on round-trip) plus the ``[mcp_servers.<name>]``
+    tables we write. Table/key names and string values are quoted/escaped so a
+    special character can never yield unparseable TOML."""
+    lines: list[str] = []
+    _serialize_table([], config, lines)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def _upsert_codex_mcp_servers(servers: dict) -> bool:
+    """Merge ``servers`` into ``$CODEX_HOME/config.toml`` ``[mcp_servers.*]``,
+    preserving any existing servers + top-level settings."""
+    path = _codex_config_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        config = _read_codex_config(path)
+        config.setdefault("mcp_servers", {})
+        config["mcp_servers"].update(servers)
+        path.write_text(_serialize_codex_config(config))
+        return True
+    except Exception as e:  # noqa: BLE001
+        logger.warning(f"Failed to write codex config.toml: {e}")
+        return False
+
+
+def _inject_codex_mcp(trinity_mcp_url: str, trinity_mcp_api_key: str) -> bool:
+    """Wire the Trinity HTTP MCP server into the codex config.
+
+    The bearer token is referenced by ENV VAR (``bearer_token_env_var``), NOT
+    written as a literal — the secret stays in the agent's environment and is
+    never persisted to config.toml (#1187 Phase F).
+    """
+    # trinity_mcp_api_key is intentionally unused: Codex reads it from the
+    # TRINITY_MCP_API_KEY env var at run time. Accepting it keeps the
+    # _inject_*_mcp signatures uniform across runtimes.
+    del trinity_mcp_api_key
+    server = {
+        "url": trinity_mcp_url,
+        "bearer_token_env_var": "TRINITY_MCP_API_KEY",
+    }
+    if _upsert_codex_mcp_servers({"trinity": server}):
+        logger.info("Injected Trinity MCP server into codex config.toml")
+        return True
+    return False
+
+
+def _configure_codex_mcp_servers(mcp_servers: dict) -> bool:
+    """Configure template-supplied MCP servers for Codex via config.toml.
+
+    Stdio servers (command + args) are supported, matching the Gemini path's
+    scope. A server with no command is skipped with a warning.
+    """
+    servers: dict = {}
+    for server_name, config in mcp_servers.items():
+        command = config.get("command", "")
+        if not command:
+            logger.warning(f"Skipping MCP server '{server_name}': no command specified")
+            continue
+        entry: dict = {"command": command}
+        args = config.get("args")
+        if args:
+            entry["args"] = args
+        env = config.get("env")
+        if isinstance(env, dict) and env:
+            entry["env"] = env
+        servers[server_name] = entry
+
+    if not servers:
+        return len(mcp_servers) == 0
+
+    ok = _upsert_codex_mcp_servers(servers)
+    logger.info(
+        f"Configured {len(servers)}/{len(mcp_servers)} MCP servers for Codex"
+    )
+    return ok

@@ -15,6 +15,7 @@ Refactored for better concern separation:
 import asyncio
 import json
 import os
+import random
 from datetime import datetime
 from typing import Dict, List, Optional
 from contextlib import asynccontextmanager
@@ -44,7 +45,9 @@ from opentelemetry.instrumentation.redis import RedisInstrumentor
 from routers.auth import router as auth_router
 from routers.agents import router as agents_router, set_websocket_manager as set_agents_ws_manager, set_filtered_websocket_manager as set_agents_filtered_ws_manager
 from routers.agent_config import router as agent_config_router
+from routers.agent_data import router as agent_data_router
 from routers.agent_files import router as agent_files_router
+from routers.agent_brain_orb import router as agent_brain_orb_router  # #58 Brain Orb proxy
 from routers.agent_rename import router as agent_rename_router, set_websocket_manager as set_agent_rename_ws_manager, set_filtered_websocket_manager as set_agent_rename_filtered_ws_manager
 from routers.agent_ssh import router as agent_ssh_router
 from routers.credentials import router as credentials_router
@@ -68,17 +71,21 @@ from routers.ops import router as ops_router
 from routers.public_links import router as public_links_router, set_websocket_manager as set_public_links_ws_manager
 from routers.public import router as public_router
 from routers.files import router as files_router  # FILES-001 — outbound file downloads
-from routers.setup import router as setup_router, get_setup_token as get_setup_setup_token
+from routers.setup import router as setup_router
 from routers.telemetry import router as telemetry_router
 from routers.logs import router as logs_router
 from routers.agent_dashboard import router as agent_dashboard_router
 from routers.audit_log import router as audit_log_router  # SEC-001 / Issue #20
 from routers.canary import router as canary_router  # CANARY-001 / Issue #411
+from routers.compatibility import router as compatibility_router  # #668 agent compatibility
 from routers.skills import router as skills_router
 from routers.internal import router as internal_router
 from routers.tags import router as tags_router
 from routers.system_views import router as system_views_router
 from routers.notifications import router as notifications_router, set_websocket_manager as set_notifications_ws_manager, set_filtered_websocket_manager as set_notifications_filtered_ws_manager
+from routers.reports import router as reports_router
+from services.report_service import set_websocket_manager as set_reports_ws_manager, set_filtered_websocket_manager as set_reports_filtered_ws_manager
+from routers.connector import router as connector_router  # per-agent MCP connector (ent#46, OSS-core #118)
 from routers.subscriptions import router as subscriptions_router
 from routers.monitoring import router as monitoring_router, set_websocket_manager as set_monitoring_ws_manager, set_filtered_websocket_manager as set_monitoring_filtered_ws_manager
 from routers.slack import public_router as slack_public_router, auth_router as slack_auth_router
@@ -112,6 +119,7 @@ from services.activity_service import activity_service
 
 # Import system agent service
 from services.system_agent_service import system_agent_service
+from services.cornelius_agent_service import cornelius_agent_service
 
 # Import log archive service
 from services.log_archive_service import log_archive_service
@@ -239,6 +247,8 @@ set_chat_ws_manager(manager)
 set_public_links_ws_manager(manager)
 set_notifications_ws_manager(manager)
 set_notifications_filtered_ws_manager(filtered_manager)
+set_reports_ws_manager(manager)
+set_reports_filtered_ws_manager(filtered_manager)
 set_monitoring_ws_manager(manager)
 set_monitoring_filtered_ws_manager(filtered_manager)
 set_operator_queue_ws_manager(manager)
@@ -316,21 +326,19 @@ async def lifespan(app: FastAPI):
     # Set up structured JSON logging (captured by Vector)
     setup_logging()
 
-    # Emit the first-time setup token as early as possible (SEC #177) — before any
-    # other startup step that could hang and suppress it. Only someone with access to
-    # server logs can read this token and complete setup, preventing installation
-    # hijack by unauthenticated remote attackers. Use logger.warning (not print): the
-    # logging StreamHandler flushes after every record, whereas print() is
-    # block-buffered to the Docker pipe without PYTHONUNBUFFERED=1 and the token is
-    # silently lost from `docker logs` (#858).
+    # Signal first-time setup as early as possible — before any other startup step
+    # that could hang and suppress it. The setup-token guard was removed in
+    # trinity-enterprise#49 (no token to print); the operator just opens the UI to
+    # create the admin account. Use logger.warning (not print): the logging
+    # StreamHandler flushes after every record, whereas print() is block-buffered
+    # to the Docker pipe without PYTHONUNBUFFERED=1 and is silently lost from
+    # `docker logs` (#858).
     from database import db as _db
     if _db.get_setting_value('setup_completed', 'false') != 'true':
-        _setup_token = get_setup_setup_token()
         logger.warning(
-            "TRINITY FIRST-TIME SETUP REQUIRED\n"
-            f"Setup token: {_setup_token}\n"
-            "Visit the Trinity UI and enter this token to set the admin password.\n"
-            "This token is only valid for this session."
+            "TRINITY FIRST-TIME SETUP REQUIRED — open the Trinity UI to create the "
+            "admin account. On an internet-reachable instance, keep it behind a "
+            "tunnel/VPN until setup completes (docs/DEPLOYMENT.md → Security)."
         )
 
     # Start Redis Streams event bus + dispatcher (RELIABILITY-003 / #306).
@@ -358,6 +366,19 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("OpenTelemetry tracing disabled (set OTEL_ENABLED=1 to enable)")
 
+    # #1159: surface a missing agent-auth master at boot, not per-request. The
+    # backend is fail-closed — derive_agent_token() raises on an empty secret, so
+    # without this warning the first symptom is a 500 on every backend→agent call
+    # (and the WARNING gives the operator a clear, immediate fix). start.sh
+    # auto-generates it; a deploy that bypasses start.sh must set it in .env and
+    # forward it to the backend service (it is, in both compose files).
+    if not os.getenv("AGENT_AUTH_SECRET"):
+        logger.warning(
+            "AGENT_AUTH_SECRET is not set — every backend→agent HTTP call will "
+            "fail with a 500 (#1159, fail-closed). Set it in .env and forward it "
+            "to the backend service (start.sh auto-generates it on first boot)."
+        )
+
 
     if docker_client:
         try:
@@ -377,6 +398,21 @@ async def lifespan(app: FastAPI):
         except Exception as e:
             logger.error(f"Error deploying system agent: {e}")
             # Don't fail startup - system agent is important but not critical for platform operation
+
+        # Seed the default Cornelius agent on a fresh install (ent#107). This is the
+        # UPGRADE / safety-net path: a fresh install's FIRST seed happens from the
+        # setup-completion hook (routers/setup.py, right after the admin is created),
+        # but an already-set-up empty install upgraded to this version has no such
+        # hook to fire — so seed here on the first post-upgrade boot. Gated on
+        # setup_completed (the admin owner must exist) and fire-and-forget via
+        # create_task so a container create never blocks readiness. The service is
+        # idempotent, first-run-only, fresh-install-scoped, and Redis-locked across
+        # workers, so scheduling it in every worker is safe.
+        try:
+            if _db.get_setting_value('setup_completed', 'false') == 'true':
+                asyncio.create_task(cornelius_agent_service.ensure_seeded())
+        except Exception as e:
+            logger.error(f"Error scheduling Cornelius seed: {e}")
     else:
         logger.info("Docker not available - running in demo mode")
 
@@ -469,14 +505,18 @@ async def lifespan(app: FastAPI):
         capacity = get_capacity_manager()
 
         async def _capacity_maintenance_loop():
-            # First tick after a short delay so startup stays snappy.
-            await asyncio.sleep(15)
+            # First tick after a short delay so startup stays snappy. #1085: a
+            # small startup jitter so replicas don't realign their maintenance
+            # ticks after a coordinated restart.
+            await asyncio.sleep(15 + random.uniform(0, 2))
             while True:
                 try:
                     await capacity.run_maintenance(max_age_hours=24)
                 except Exception as exc:
                     logger.warning(f"[Capacity] maintenance tick failed: {exc}")
-                await asyncio.sleep(60)
+                # #1085: jitter the loop period so concurrent replicas' drain
+                # sweeps spread out instead of firing in lockstep every 60s.
+                await asyncio.sleep(60 + random.uniform(0, 15))
 
         asyncio.create_task(_capacity_maintenance_loop())
         logger.info("CapacityManager initialised; maintenance loop running (60s)")
@@ -608,7 +648,7 @@ async def lifespan(app: FastAPI):
         from services.settings_service import settings_service
         public_url = settings_service.get_setting("public_chat_url", "")
         if public_url:
-            bindings = db.get_all_telegram_bindings()
+            bindings = _db.get_all_telegram_bindings()
             for binding in bindings:
                 try:
                     await register_webhook(binding["agent_name"], public_url)
@@ -645,7 +685,7 @@ async def lifespan(app: FastAPI):
         public_url = _settings_svc.get_setting("public_chat_url", "")
         if public_url:
             backfill_whatsapp_webhook_urls(public_url)
-            bindings = db.get_all_whatsapp_bindings()
+            bindings = _db.get_all_whatsapp_bindings()
             logger.info(f"WhatsApp transport ready ({len(bindings)} binding(s); webhook URLs refreshed)")
         else:
             logger.info("WhatsApp transport ready (no public URL — webhook URLs not computed)")
@@ -861,7 +901,9 @@ async def add_security_headers(request: Request, call_next):
 app.include_router(auth_router)
 app.include_router(agents_router)
 app.include_router(agent_config_router)
+app.include_router(agent_data_router)  # #1169: data export/import
 app.include_router(agent_files_router)
+app.include_router(agent_brain_orb_router)  # #58: Brain Orb read-only data proxy
 app.include_router(agent_rename_router)
 app.include_router(agent_ssh_router)
 app.include_router(activities_router)
@@ -891,11 +933,14 @@ app.include_router(logs_router)
 app.include_router(agent_dashboard_router)
 app.include_router(audit_log_router)  # SEC-001 / #20: Platform audit log (Phase 1)
 app.include_router(canary_router)  # CANARY-001 / #411: Invariant violations
+app.include_router(compatibility_router)  # #668: Agent compatibility validation
 app.include_router(skills_router) # Skills Management System
 app.include_router(internal_router)  # Internal agent-to-backend endpoints (no auth)
 app.include_router(tags_router)  # Agent Tags (ORG-001)
 app.include_router(system_views_router)  # System Views (ORG-001 Phase 2)
 app.include_router(notifications_router)  # Agent Notifications (NOTIF-001)
+app.include_router(reports_router)  # Agent Reports (#918)
+app.include_router(connector_router)  # Per-agent MCP connector (ent#46, OSS-core #118)
 app.include_router(messages_router)  # Proactive Messaging (#321)
 app.include_router(public_memory_router)  # MEM-001 write path (#888)
 app.include_router(subscriptions_router)  # Subscription Management (SUB-001)
@@ -930,19 +975,24 @@ app.include_router(ws_tickets_router)  # WebSocket auth tickets (#550)
 # at `src/backend/enterprise/`, repo `Abilityai/trinity-enterprise`).
 # The submodule is OPTIONAL: customers running the public repo without
 # enterprise access clone without it, and the ImportError below silently
-# no-ops. When mounted, `register_enterprise(app)` installs the SSO /
-# SCIM / SIEM routers under `/api/enterprise/*`. The function is
+# no-ops. When mounted, `register_enterprise(app)` installs the private
+# enterprise routers under `/api/enterprise/*`. The function is
 # idempotent (guards on `app.state.enterprise_registered`). Entitlement
 # gating happens per-endpoint via `requires_entitlement(feature_id)`
 # from `dependencies.py` — endpoints are mounted unconditionally and
 # the gate decides whether to serve them. This keeps the wiring
 # deterministic regardless of license state.
 #
+# The specific paid modules the submodule installs are intentionally NOT
+# enumerated here — this is a PUBLIC repo, and the paid-feature catalog
+# lives only in the private enterprise repo (trinity-enterprise#45). This
+# comment (and entitlement_service.py) are grepped by the enterprise-docs
+# guard, so keep it to the generic seam. See `docs/ENTERPRISE.md`.
+#
 # Import path is `enterprise.backend.register_enterprise`: the private
 # repo is restructured into `backend/` and `frontend/` subdirs so the
 # same repo can be dual-mounted (`src/backend/enterprise/` for Python,
-# `src/frontend/src/enterprise/` for Vite). See
-# `docs/planning/ENTERPRISE_ARCHITECTURE.md` for rationale.
+# `src/frontend/src/enterprise/` for Vite).
 try:
     from enterprise.backend import register_enterprise  # type: ignore[import-not-found]
     register_enterprise(app)
@@ -1126,34 +1176,49 @@ async def health_check():
     if not is_sqlite():
         return {"status": "healthy", "timestamp": utc_now_iso()}
 
+    from db.migrations import migration_health
+
     expected = len(MIGRATIONS)
     try:
         with get_db_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT COUNT(*) FROM schema_migrations")
-            applied = cursor.fetchone()[0]
+            applied, expected, first_pending = migration_health(conn.cursor())
     except Exception as e:
         logger.warning("health_check: could not query schema_migrations: %s", e)
+        # Can't read the tracking table — treat as incomplete and name the first
+        # registered migration as the suspect.
         applied = 0
+        first_pending = MIGRATIONS[0][0] if MIGRATIONS else None
 
     if applied < expected:
+        # first_pending names the stuck/pending migration so a 503 is actionable,
+        # not just a count (#1160).
         return JSONResponse(
             status_code=503,
             content={
                 "status": "unhealthy",
                 "timestamp": utc_now_iso(),
-                "migrations": {"applied": applied, "expected": expected},
+                "migrations": {
+                    "applied": applied,
+                    "expected": expected,
+                    "first_pending": first_pending,
+                },
             },
         )
     return {"status": "healthy", "timestamp": datetime.now()}
 
 
-def _build_version_payload(voice_enabled: bool) -> dict:
+def _build_version_payload(
+    voice_enabled: bool, edition: str, enterprise_features: list
+) -> dict:
     """Pure dict-builder for the `/api/version` payload (#926-testable).
 
     Extracted from the FastAPI handler so the env-var → response mapping
     can be tested without pulling main.py's full router graph through
-    importlib (opentelemetry, slack_sdk, twilio, …).
+    importlib (opentelemetry, slack_sdk, twilio, …). Keep it stdlib-only:
+    the unit tests exec-slice this function out of the source, so any
+    dependency on module state (e.g. entitlement_service) would break
+    them — `edition`/`enterprise_features` are computed by the handler
+    and threaded in as parameters (#1443).
     """
     import os
     from pathlib import Path
@@ -1183,12 +1248,19 @@ def _build_version_payload(voice_enabled: bool) -> dict:
     return {
         "version": version,
         "platform": "trinity",
+        # Effective edition (#1443): mirrors `enterprise_features`
+        # non-emptiness — "enterprise" iff ≥1 enterprise module is
+        # registered AND entitled at runtime. TRINITY_OSS_ONLY=1 or a
+        # fully-failed registration reports "oss"; consult the boot log
+        # for mounted-but-degraded states.
+        "edition": edition,
+        "enterprise_features": enterprise_features,
         "components": {
             "backend": version,
             "agent_server": version,
             "base_image": f"trinity-agent-base:{version}"
         },
-        "runtimes": ["claude-code", "gemini-cli"],
+        "runtimes": ["claude-code", "gemini-cli", "codex"],
         "build_date": os.getenv("BUILD_DATE", "unknown"),
         "git_commit": git_commit,
         "git_commit_short": git_commit_short,
@@ -1209,8 +1281,26 @@ async def get_version(current_user: User = Depends(get_current_user)):
     come from Dockerfile ARG/ENV wired through docker-compose
     `backend.build.args` and `scripts/deploy/start.sh`. Default to "unknown"
     when the build args are absent (local dev / volume-mount workflows).
+
+    `edition` (#1443) is the effective open-core edition: "enterprise" iff
+    `entitlement_service.list_entitled_features()` is non-empty (same source
+    as `enterprise_features` in GET /api/settings/feature-flags, so the two
+    surfaces can never diverge). It reflects runtime entitlement state, not
+    submodule presence on disk — a mounted-but-failed registration reports
+    "oss"; a partial registration reports "enterprise" with the surviving
+    modules listed in `enterprise_features`. See docs/ENTERPRISE.md.
     """
-    return _build_version_payload(VOICE_ENABLED and bool(GEMINI_API_KEY))
+    # Function-local import (matches routers/settings.py): the module
+    # global is rebound by `_set_for_testing`, so a top-level
+    # `from … import entitlement_service` would freeze the boot-time
+    # instance and bypass test stubs.
+    from services.entitlement_service import entitlement_service
+
+    features = entitlement_service.list_entitled_features()
+    edition = "enterprise" if features else "oss"
+    return _build_version_payload(
+        VOICE_ENABLED and bool(GEMINI_API_KEY), edition, features
+    )
 
 
 # User info endpoint

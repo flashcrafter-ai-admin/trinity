@@ -10,6 +10,7 @@ import docker
 import logging
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Optional
 
 import yaml
 from fastapi import HTTPException, Request
@@ -25,6 +26,7 @@ from services.docker_service import (
 from services.docker_utils import (
     volume_get, volume_create, containers_run
 )
+from services.agent_runtime_state import clear_agent_breakers
 from services.template_service import (
     get_github_template,
     generate_credential_files,
@@ -32,10 +34,17 @@ from services.template_service import (
 from services import git_service
 from services.settings_service import get_anthropic_api_key, get_github_pat, get_agent_full_capabilities, get_agent_quota_for_role, get_agent_default_resources, get_agent_default_require_email
 from services.github_service import GitHubService, GitHubError
+from services.agent_auth import derive_agent_token
 from utils.helpers import sanitize_agent_name, utc_now_iso
-from .helpers import validate_base_image
+from .fork_to_own import fork_template_to_own_repo
+from .helpers import validate_base_image, is_claude_runtime, validate_runtime
 from .lifecycle import RESTRICTED_CAPABILITIES, FULL_CAPABILITIES
-from .capabilities import AGENT_TMPFS_MOUNT, AGENT_DEFAULT_TMPDIR
+from .capabilities import (
+    AGENT_TMPFS_MOUNT,
+    AGENT_DEFAULT_TMPDIR,
+    normalize_cpu,
+    normalize_memory,
+)
 from services.platform_package_service import (
     PLATFORM_PACKAGES_LABEL,
     PlatformPackageError,
@@ -104,6 +113,24 @@ def _safe_local_template_path(template_name: str, root: Path) -> Path:
     return candidate
 
 
+def _fork_destination_in_use_message(destination: str, bound_agent: str, username: str) -> str:
+    """409 detail for a destination repo already bound to an agent (#93).
+
+    Names the bound agent only when the caller can access it — a creator-role
+    caller must not be able to map repo→agent bindings fleet-wide (#186
+    enumeration discipline).
+    """
+    try:
+        can_see = db.can_user_access_agent(username, bound_agent)
+    except Exception:
+        can_see = False
+    who = f"agent '{bound_agent}'" if can_see else "another agent"
+    return (
+        f"Repository '{destination}' is already the workspace of {who}. "
+        f"Each agent needs its own repository."
+    )
+
+
 def _get_default_resource(key: str) -> str:
     """Return system-default cpu or memory, falling back to hardcoded safe value."""
     defaults = get_agent_default_resources()
@@ -125,7 +152,7 @@ def get_platform_version() -> str:
 async def create_agent_internal(
     config: AgentConfig,
     current_user: User,
-    request: Request,
+    request: Optional[Request] = None,
     skip_name_sanitization: bool = False,
     ws_manager=None
 ) -> AgentStatus:
@@ -133,6 +160,10 @@ async def create_agent_internal(
     Internal function to create an agent.
 
     Used by both the API endpoint and system deployment.
+
+    `request` is optional: the HTTP request object is not dereferenced anywhere
+    in this function, so boot-time / background callers with no live request
+    (e.g. the Cornelius first-run seeder, ent#107) pass `request=None`.
 
     CRED-002: Credentials are no longer auto-injected during creation.
     They are added after creation via inject_credentials endpoint or
@@ -171,6 +202,14 @@ async def create_agent_internal(
     ):
         raise HTTPException(status_code=409, detail="Agent already exists")
 
+    # #1560: reaching here means the name is free — but `is_agent_name_reserved`
+    # only stops matching once the retention purge hard-deletes the row, and the
+    # breakers are keyed by name with no TTL. Clear any predecessor's verdict
+    # BEFORE the container exists, so nothing races the agent's first heartbeat.
+    # Breakers only: no slots exist for a name nothing is running under yet, and
+    # the full sweep is reserved for teardown paths.
+    clear_agent_breakers(config.name)
+
     # Agent quota enforcement: per-role limits (QUOTA-001)
     max_agents = get_agent_quota_for_role(current_user.role)
     if max_agents > 0:
@@ -198,8 +237,22 @@ async def create_agent_internal(
     github_pat_for_agent = None
     git_instance_id = None
     git_working_branch = None
+    # trinity-enterprise#93: template repo the fork-to-own copy came from —
+    # baked as GIT_UPSTREAM_REPO so `git pull upstream <branch>` works.
+    fork_upstream_repo = None
     # Phase 9.11: Track shared folder config from template
     template_shared_folders = None
+
+    # trinity-enterprise#93: fork-to-own only makes sense for a github:
+    # template (there must be a source repo to copy). Reject early and loud.
+    if config.fork_to_own and not (config.template or "").startswith("github:"):
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "fork_to_own requires a 'github:owner/repo' template.",
+                "code": "FORK_REQUIRES_GITHUB_TEMPLATE",
+            },
+        )
 
     # Load template configuration
     if config.template:
@@ -246,9 +299,11 @@ async def create_agent_internal(
                 github_repo = gh_template["github_repo"]
                 template_data = gh_template
 
-                # Get system GitHub PAT from settings (SQLite) or env var
+                # Get system GitHub PAT from settings (SQLite) or env var.
+                # Fork-to-own (#93) doesn't need it — the user's PAT is the
+                # write identity and public templates clone unauthenticated.
                 github_pat = get_github_pat()
-                if not github_pat:
+                if not github_pat and not config.fork_to_own:
                     raise HTTPException(
                         status_code=500,
                         detail="GitHub PAT not configured. Set GITHUB_PAT in .env or add via Settings."
@@ -272,7 +327,7 @@ async def create_agent_internal(
 
                 # Get system GitHub PAT from settings (SQLite) or env var
                 github_pat = get_github_pat()
-                if not github_pat:
+                if not github_pat and not config.fork_to_own:
                     raise HTTPException(
                         status_code=500,
                         detail="GitHub PAT not configured. Set GITHUB_PAT in .env or add via Settings."
@@ -281,6 +336,72 @@ async def create_agent_internal(
                 github_repo_for_agent = repo_path
                 github_pat_for_agent = github_pat
                 logger.info(f"Using dynamic GitHub template: {repo_path} (branch: {config.source_branch})")
+
+            # trinity-enterprise#93: fork-to-own — copy the template into a
+            # repo the USER owns, then create the agent FROM the copy. Runs
+            # here, BEFORE the docker try-block, so the structured FORK_*
+            # errors reach the UI (the catch-all below flattens everything
+            # inside it to a generic 500).
+            fork_meta = (gh_template or {}).get("fork_to_own")
+            if fork_meta == "required" and not config.fork_to_own:
+                raise HTTPException(
+                    status_code=400,
+                    detail={
+                        "error": (
+                            f"Template '{config.template}' requires fork-to-own "
+                            f"creation: provide fork_to_own.destination_repo and "
+                            f"fork_to_own.github_pat so the agent's repo is your "
+                            f"own, not the shared template."
+                        ),
+                        "code": "FORK_TO_OWN_REQUIRED",
+                    },
+                )
+            if config.fork_to_own:
+                if url_branch:
+                    raise HTTPException(
+                        status_code=400,
+                        detail={
+                            "error": (
+                                "fork_to_own copies the template's default branch; "
+                                "the github:owner/repo@branch form is not supported "
+                                "with it."
+                            ),
+                            "code": "FORK_BRANCH_UNSUPPORTED",
+                        },
+                    )
+                destination = config.fork_to_own.destination_repo
+                # Source-mode rows bypass the UNIQUE(repo, branch) index, so
+                # this is the guard against two agents auto-pushing the same
+                # destination main. (Re-checked after reservation below — this
+                # pre-check is check-then-act with the whole copy in between.)
+                bound_agents = db.get_git_config_agent_names_for_repo(destination)
+                if bound_agents:
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": _fork_destination_in_use_message(
+                                destination, bound_agents[0], current_user.username
+                            ),
+                            "code": "FORK_DESTINATION_IN_USE",
+                        },
+                    )
+                # Unwrap the SecretStr exactly once; plain str flows inward
+                # (docker env, GitHubService header, push auth).
+                user_pat = config.fork_to_own.github_pat.get_secret_value()
+                fork_result = await fork_template_to_own_repo(
+                    template_repo=github_repo_for_agent,
+                    destination_repo=destination,
+                    user_pat=user_pat,
+                    read_pat=github_pat_for_agent or "",
+                    private=config.fork_to_own.private,
+                )
+                fork_upstream_repo = github_repo_for_agent
+                github_repo_for_agent = fork_result.destination_repo
+                github_pat_for_agent = user_pat
+                # Pinned semantics: the user's default branch IS the brain —
+                # origin main holds captures; auto-sync pushes there.
+                config.source_branch = fork_result.default_branch
+                config.source_mode = True
 
             # Validate PAT has access to the repository before creating container
             # This prevents silent clone failures in startup.sh (#218)
@@ -340,6 +461,35 @@ async def create_agent_internal(
                     source_mode=config.source_mode,
                 )
             )
+
+            # trinity-enterprise#93: the destination-binding pre-check above is
+            # check-then-act with the entire fork copy (minutes) in between,
+            # and source-mode rows bypass the partial UNIQUE index — so two
+            # concurrent creates to the same destination can both reach here.
+            # Re-check now that our own row is inserted; losers (everyone but
+            # the lexicographically-first agent name) roll back deterministically,
+            # leaving exactly one winner.
+            if config.fork_to_own:
+                bound_now = db.get_git_config_agent_names_for_repo(github_repo_for_agent)
+                if len(bound_now) > 1 and min(bound_now) != config.name:
+                    try:
+                        db.delete_git_config(config.name)
+                    except Exception as cleanup_exc:
+                        logger.warning(
+                            "fork-to-own: failed to roll back git config for %s "
+                            "after destination race: %s", config.name, cleanup_exc,
+                        )
+                    raise HTTPException(
+                        status_code=409,
+                        detail={
+                            "error": _fork_destination_in_use_message(
+                                github_repo_for_agent,
+                                min(bound_now),
+                                current_user.username,
+                            ),
+                            "code": "FORK_DESTINATION_IN_USE",
+                        },
+                    )
         elif config.template.startswith("local:"):
             # Local template - strip "local:" prefix. Look in curated catalog
             # first (/agent-configs/templates), then in deploy-local writable
@@ -385,6 +535,7 @@ async def create_agent_internal(
                 except Exception as e:
                     logger.warning(f"Error loading template config: {e}")
 
+    # Resolve immutable platform packages before creating any resources.
     try:
         resolved_platform_packages = resolve_platform_packages(
             template_data.get("platform_packages") if isinstance(template_data, dict) else None
@@ -401,6 +552,22 @@ async def create_agent_internal(
             status_code=exc.status_code,
             detail={"code": exc.code, "error": str(exc)},
         ) from exc
+
+    # #1187: runtime is final here (request value, possibly overridden by the
+    # template). Reject an unknown one now (clear 400) instead of letting the
+    # agent container crash-loop on boot when get_runtime() can't resolve it.
+    validate_runtime(config.runtime)
+
+    # #1187: normalize the stored runtime to lowercase so the AGENT_RUNTIME env
+    # var and the `trinity.agent-runtime` label agree with the exact-case checks
+    # downstream — startup.sh's `[ "${AGENT_RUNTIME}" = "codex" ]` Codex setup
+    # block and the Gemini key-injection branch below (`config.runtime ==
+    # 'gemini-cli'`). validate_runtime() accepts mixed case (it lowercases only
+    # for the membership test) but does not normalize the stored value, so a
+    # template `runtime: Codex` would pass validation yet silently skip Codex's
+    # startup setup (AGENTS.md mirror / CODEX_HOME) or Gemini's credential inject.
+    if config.runtime:
+        config.runtime = config.runtime.lower()
 
     if config.port is None:
         config.port = get_next_available_port()
@@ -479,6 +646,25 @@ async def create_agent_internal(
         if generated_files:
             cred_files_volume = {str(cred_files_dir): {'bind': '/generated-creds', 'mode': 'ro'}}
 
+    # #1197: validate/normalize template resource fields against the allowed
+    # set BEFORE any side effects (MCP key, subscription, container). A
+    # Kubernetes-style `cpu: "0.5"` / `memory: "512Mi"` from a source repo's
+    # template.yaml used to reach the raw `int(cpu)` at container-create and
+    # abort with an opaque ValueError — leaving an orphaned mcp_api_keys row.
+    # Fail fast here with an actionable 400 instead, and write the canonical
+    # values back so the container labels + limits use them.
+    if config.resources is None:
+        config.resources = {}
+    try:
+        config.resources['cpu'] = normalize_cpu(
+            config.resources.get('cpu'), _get_default_resource('cpu')
+        )
+        config.resources['memory'] = normalize_memory(
+            config.resources.get('memory'), _get_default_resource('memory')
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
     # Phase: Agent-to-Agent Collaboration
     # Generate agent-scoped MCP API key for Trinity MCP access
     agent_mcp_key = None
@@ -512,6 +698,14 @@ async def create_agent_internal(
         'TMPDIR': AGENT_DEFAULT_TMPDIR,
     }
 
+    # #1369: operator-configurable headless per-tool stall-watchdog ceiling.
+    # Only propagate when the backend env sets it — an unset value leaves the
+    # agent-side default (1800s). Baked at create like AGENT_TMP_SIZE; existing
+    # agents pick up a change on their next recreate (not a plain restart).
+    _stall_limit = (os.getenv('AGENT_TOOL_STALL_LIMIT_S') or '').strip()
+    if _stall_limit:
+        env_vars['AGENT_TOOL_STALL_LIMIT_S'] = _stall_limit
+
     # GUARD-001: per-agent guardrails overrides (empty by default; baseline
     # is always applied inside the container).
     _guardrails = db.get_guardrails_config(config.name)
@@ -519,21 +713,33 @@ async def create_agent_internal(
         import json as _json
         env_vars['AGENT_GUARDRAILS'] = _json.dumps(_guardrails)
 
-    # Auto-assign subscription (round-robin) — #74
+    # Auto-assign subscription (round-robin) — #74.
+    # Subscriptions are Claude-OAuth tokens (CLAUDE_CODE_OAUTH_TOKEN) and apply
+    # ONLY to the Claude Code runtime. Non-Claude runtimes (Gemini, Codex) bring
+    # their own credentials via .env (CRED-002), so skip the assign entirely —
+    # otherwise a Codex agent would get a persisted subscription_id
+    # (has_subscription=True) and a spurious Claude token injected on every
+    # create/recreate (#1187 decision 7).
     auto_assigned_subscription_id = None
-    try:
-        least_used = db.get_least_used_subscription()
-        if least_used:
-            token = db.get_subscription_token(least_used.id)
-            if token:
-                env_vars['CLAUDE_CODE_OAUTH_TOKEN'] = token
-                env_vars.pop('ANTHROPIC_API_KEY', None)
-                auto_assigned_subscription_id = least_used.id
-                logger.info(f"Auto-assigned subscription '{least_used.name}' to agent {config.name}")
-            else:
-                logger.warning(f"Failed to decrypt subscription '{least_used.name}' token, using platform API key")
-    except Exception as e:
-        logger.warning(f"Subscription auto-assign failed for {config.name}: {e}")
+    if is_claude_runtime(config.runtime):
+        try:
+            least_used = db.get_least_used_subscription()
+            if least_used:
+                token = db.get_subscription_token(least_used.id)
+                if token:
+                    env_vars['CLAUDE_CODE_OAUTH_TOKEN'] = token
+                    env_vars.pop('ANTHROPIC_API_KEY', None)
+                    auto_assigned_subscription_id = least_used.id
+                    logger.info(f"Auto-assigned subscription '{least_used.name}' to agent {config.name}")
+                else:
+                    logger.warning(f"Failed to decrypt subscription '{least_used.name}' token, using platform API key")
+        except Exception as e:
+            logger.warning(f"Subscription auto-assign failed for {config.name}: {e}")
+    else:
+        logger.info(
+            f"Skipping subscription auto-assign for agent {config.name} "
+            f"(runtime={(config.runtime or 'claude-code')!r} is non-Claude — uses its own .env credentials)"
+        )
 
     # Add Google API key if using Gemini runtime
     # Gemini CLI expects GEMINI_API_KEY environment variable
@@ -564,6 +770,14 @@ async def create_agent_internal(
         # heartbeat is gated on both this URL and the MCP key being present.
         env_vars['TRINITY_BACKEND_URL'] = os.getenv('TRINITY_BACKEND_URL', 'http://backend:8000')
 
+    # #1159: per-agent in-container auth token. Derived from the stable master
+    # (AGENT_AUTH_SECRET); the agent middleware verifies it on every inbound
+    # call. Unconditional (NOT gated on the MCP key) so even MCP-less agents are
+    # protected; recomputed identically on recreate (lifecycle.py) and checked
+    # by check_agent_auth_token_env_matches so a rename re-derives under the new
+    # name. Raises if AGENT_AUTH_SECRET is unset — fail-closed, never tokenless.
+    env_vars['TRINITY_AGENT_AUTH_TOKEN'] = derive_agent_token(config.name)
+
     if github_repo_for_agent and github_pat_for_agent:
         env_vars['GITHUB_REPO'] = github_repo_for_agent
         env_vars['GITHUB_PAT'] = github_pat_for_agent
@@ -574,11 +788,18 @@ async def create_agent_internal(
         if _git_base:
             env_vars['TRINITY_GIT_BASE_URL'] = _git_base
 
+        # trinity-enterprise#93: startup.sh adds a credential-less `upstream`
+        # remote so `git pull upstream <branch>` adopts template updates.
+        if fork_upstream_repo:
+            env_vars['GIT_UPSTREAM_REPO'] = fork_upstream_repo
+
         # #389 S1a: 15-min auto-sync heartbeat. Only legacy (working-branch)
         # agents get it — source-mode agents track main read-only, and
         # auto-pushing to main would clobber protected branches. Operators
         # can toggle per-agent via PUT /api/agents/{name}/git/auto-sync.
-        if not config.source_mode:
+        # Exception (#93): fork-to-own agents own their repo — auto-pushing
+        # captures to their own main is the point.
+        if not config.source_mode or fork_upstream_repo:
             env_vars['GIT_SYNC_AUTO'] = 'true'
 
         # Source mode (default): Track source branch directly for pull-only sync
@@ -606,6 +827,18 @@ async def create_agent_internal(
 
     if docker_client:
         try:
+            # trinity-enterprise#93: persist the user's PAT as the per-agent
+            # PAT (#347) onto the agent_git_config row the reservation above
+            # just created. Inside this try so a failure hits the except
+            # below and rolls back the reserved row + MCP key. Fail-closed:
+            # a fork-to-own agent must never fall back to the platform PAT
+            # on recreate (get_github_pat_for_agent resolves per-agent first).
+            if config.fork_to_own and github_repo_for_agent:
+                if not db.set_agent_github_pat(config.name, github_pat_for_agent):
+                    raise RuntimeError(
+                        f"failed to persist per-agent GitHub PAT for {config.name}"
+                    )
+
             # Create per-agent persistent volume for /home/developer (Pillar III: Persistent Memory)
             # This ensures files created by the agent survive container restarts
             agent_volume_name = f"agent-{config.name}-workspace"
@@ -765,11 +998,13 @@ async def create_agent_internal(
                 # is redirected off this tiny tmpfs via the TMPDIR env var).
                 tmpfs=AGENT_TMPFS_MOUNT,
                 network='trinity-agent-network',
-                mem_limit=config.resources.get('memory') or _get_default_resource('memory'),
+                # #1197: cpu/memory normalized + validated above (raises 400 on
+                # a bad template value), so these are guaranteed Docker-valid.
+                mem_limit=config.resources['memory'],
                 # #1126: nano_cpus (Linux CFS quota), NOT cpu_count — the latter
                 # is Windows-only in docker-py and left NanoCpus=0, so newly
                 # created agents never got a CPU limit on Linux.
-                nano_cpus=int(config.resources.get('cpu') or _get_default_resource('cpu')) * 1_000_000_000,
+                nano_cpus=int(config.resources['cpu']) * 1_000_000_000,
             )
 
             agent_status = get_agent_status_from_container(container)
@@ -846,10 +1081,30 @@ async def create_agent_internal(
                     f"{config.name}: {e}"
                 )
 
+            # #1169: Materialize the declared `data_paths` into the agent.
+            # Opt-in (empty list = no-op), so undeclared agents are
+            # untouched. Writes `.trinity/data-paths.yaml` and gitignores the
+            # `data/` root in the agent's own .gitignore. Non-fatal — the
+            # home volume is already durable; the declaration just enables
+            # selective snapshot/export and keeps runtime data out of git.
+            data_paths = (template_data or {}).get(
+                "data_paths", git_service.DEFAULT_DATA_PATHS
+            )
+            try:
+                await git_service.materialize_data_paths(
+                    config.name, data_paths
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[#1169] Failed to materialize data-paths.yaml for "
+                    f"{config.name}: {e}"
+                )
+
             # #389 S1a: opt non-source-mode GitHub-template agents into the
             # auto-sync heartbeat by default. Source-mode agents stay opt-in
-            # (auto-pushing to main would clobber protected branches).
-            if github_repo_for_agent and not config.source_mode:
+            # (auto-pushing to main would clobber protected branches) —
+            # except fork-to-own agents (#93), which own their repo.
+            if github_repo_for_agent and (not config.source_mode or fork_upstream_repo):
                 try:
                     db.set_git_auto_sync_enabled(config.name, True)
                 except Exception as e:
@@ -869,6 +1124,19 @@ async def create_agent_internal(
                     logger.warning(
                         "Failed to roll back agent_git_config for %s after "
                         "creation failure: %s",
+                        config.name,
+                        cleanup_exc,
+                    )
+            # #1197: the agent-scoped MCP key is minted before container
+            # creation, so a failure here would otherwise leave an orphaned
+            # mcp_api_keys row (one per failed attempt). Roll it back too.
+            if agent_mcp_key:
+                try:
+                    db.delete_agent_mcp_api_key(config.name)
+                except Exception as cleanup_exc:
+                    logger.warning(
+                        "Failed to roll back MCP key for %s after creation "
+                        "failure: %s",
                         config.name,
                         cleanup_exc,
                     )

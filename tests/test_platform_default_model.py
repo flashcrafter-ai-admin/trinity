@@ -59,7 +59,7 @@ class TestGetPlatformDefaultModelUnit:
         sys.modules.pop("services.settings_service", None)
 
         import importlib
-        import src.backend.services.settings_service as svc_module
+        import services.settings_service as svc_module
         importlib.reload(svc_module)
 
         svc = svc_module.SettingsService()
@@ -81,7 +81,7 @@ class TestGetPlatformDefaultModelUnit:
         sys.modules.pop("services.settings_service", None)
 
         import importlib
-        import src.backend.services.settings_service as svc_module
+        import services.settings_service as svc_module
         importlib.reload(svc_module)
 
         svc = svc_module.SettingsService()
@@ -106,7 +106,7 @@ class TestGetPlatformDefaultModelUnit:
         sys.modules.pop("services.settings_service", None)
 
         import importlib
-        import src.backend.services.settings_service as svc_module
+        import services.settings_service as svc_module
         importlib.reload(svc_module)
 
         svc = svc_module.SettingsService()
@@ -177,6 +177,27 @@ class TestFeatureFlagsEndpoint:
         # False regardless — both conditions confirm the default-off behaviour.
         assert data["workspace_available"] is False, (
             "workspace_available should default to False unless explicitly enabled"
+        )
+
+    def test_feature_flags_includes_mcp_agent_chat_pull_enabled(self):
+        """feature-flags must expose mcp_agent_chat_pull_enabled (#946 observability)."""
+        headers = get_auth_headers()
+        resp = httpx.get(f"{BASE_URL}/api/settings/feature-flags", headers=headers, timeout=10)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "mcp_agent_chat_pull_enabled" in data, (
+            "feature-flags response missing 'mcp_agent_chat_pull_enabled' key"
+        )
+        assert isinstance(data["mcp_agent_chat_pull_enabled"], bool)
+
+    def test_mcp_agent_chat_pull_enabled_false_by_default(self):
+        """The #946 pull pilot must default OFF unless MCP_AGENT_CHAT_PULL_ENABLED is set."""
+        headers = get_auth_headers()
+        resp = httpx.get(f"{BASE_URL}/api/settings/feature-flags", headers=headers, timeout=10)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["mcp_agent_chat_pull_enabled"] is False, (
+            "mcp_agent_chat_pull_enabled should default to False (pilot is opt-in)"
         )
 
 

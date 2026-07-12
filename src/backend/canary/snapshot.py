@@ -39,6 +39,17 @@ don't share transactions, and our reads are sequential. The harness
 deliberately accepts sub-second inconsistencies (a real bug persists
 across a 5-minute cycle by definition; transient races self-resolve
 and are not what we're trying to catch).
+
+Backend seam (#300 / #1450): most collector reads still go through the raw
+sqlite3 `db.connection.get_db_connection()` at DB_PATH — a #300 follow-up
+migrates them to `get_engine()`/DATABASE_URL. B-01's queued Side B is the
+first read migrated: `_collect_queued_ids_via_engine` reads through
+`get_engine()` so both B-01 sides honor DATABASE_URL and stay
+backend-consistent on Postgres (the accessor already did). The collector is
+therefore *half-migrated* — B-01's queued id-set is engine-backed while the
+running-side / known-agents / orphan reads remain raw-sqlite. That split is
+invisible on SQLite (one file) and tracked for the running side in the
+collector-wide migration follow-up.
 """
 
 import logging
@@ -66,6 +77,34 @@ TERMINAL_EXECUTION_STATUSES = (
     TaskExecutionStatus.SKIPPED.value,
 )
 _TERMINAL_SQL_LIST = ", ".join(f"'{s}'" for s in TERMINAL_EXECUTION_STATUSES)
+
+
+# E-03 / G-03 (#1077) terminal subset — success/failed/cancelled ONLY, and
+# deliberately NOT reusing `TERMINAL_EXECUTION_STATUSES` / `_TERMINAL_SQL_LIST`
+# above, which include `skipped`. A `skipped` execution (an empty-stdout
+# pre-check, #454) legitimately has no `completed_at`/`duration_ms`, so pulling
+# it into the terminal-row set would make E-03 (completed_at populated) fire on
+# a perfectly healthy row.
+_E03_TERMINAL_STATUSES = (
+    TaskExecutionStatus.SUCCESS.value,
+    TaskExecutionStatus.FAILED.value,
+    TaskExecutionStatus.CANCELLED.value,
+)
+
+# Head-room past the per-agent execution timeout when sizing the terminal-row
+# window (see `_collect_terminal_rows`). Matches `SLOT_TTL_BUFFER` in
+# services/slot_service.py and the E-01 invariant's buffer — hard-coded so the
+# canary stays insulated from runtime config drift.
+TERMINAL_WINDOW_BUFFER_SECONDS = 300
+
+# Cap on terminal rows pulled per cycle. `schedule_executions` has no
+# (status, started_at) index and retains terminal rows 90 days, so an unbounded
+# window scan is a full scan every 5 min. E-03/G-03 are a leading-edge
+# regression tripwire — a live malformed-row bug fires continuously on fresh
+# rows — not a backfill audit, so bounding the scan is an accepted coverage
+# tradeoff (logged via a `sampled` flag when hit). Mirrors the analytics
+# 5000-row cap.
+_TERMINAL_ROWS_CAP = 5000
 
 
 # Tables whose `agent_name` column references `agent_ownership.agent_name`.
@@ -98,6 +137,9 @@ ORPHAN_SCAN_TABLES = [
     ("agent_public_links", "agent_name", None),
     ("operator_queue", "agent_name", "status = 'pending'"),
     ("access_requests", "agent_name", "status = 'pending'"),
+    # #918 — CASCADE table holding agent-published report payloads (can be
+    # sensitive); watch for orphans referencing a deleted agent.
+    ("agent_reports", "agent_name", None),
 ]
 
 
@@ -148,15 +190,44 @@ class AgentSnapshot:
     # `claude_session_id` per running id (str or None); used by E-05 to detect
     # dispatched rows that never acquired a backing session.
     running_claude_session_ids: Dict[str, Optional[str]] = field(default_factory=dict)
+    # Raw-sqlite queued id-set from `_collect_executions` (reads
+    # `db.connection.get_db_connection()` at DB_PATH). Consumed by B-02 and
+    # E-02. **No longer B-01's Side B** (#1450): on Postgres this raw-sqlite
+    # file diverges from the `get_engine()`/DATABASE_URL backend the accessor
+    # uses, so B-01 moved to `queued_ids_via_engine` below to keep both of its
+    # sides on the same backend.
     queued_exec_ids: Set[str] = field(default_factory=set)
     # `db.get_queued_count(name)` — the production accessor BacklogService
-    # calls on every enqueue/drain. B-01 compares this against
-    # `len(queued_exec_ids)` (independently collected by `_collect_executions`)
-    # so a divergence between the two query paths (e.g. a future cache layer
-    # on the accessor, or a status-filter regression) surfaces as a violation
-    # rather than going silent. `None` means the accessor was unavailable
-    # this cycle (import error in test mode) and B-01 must skip.
+    # calls on every enqueue/drain (goes through `get_engine()`, honoring
+    # DATABASE_URL). B-01 Side A. Compared against `len(queued_ids_via_engine)`
+    # (Side B, below) so a divergence between the two query paths (e.g. a
+    # future cache layer on the accessor, or a status-filter regression)
+    # surfaces as a violation rather than going silent. `None` means the
+    # accessor was unavailable this cycle (import error in test mode, or the
+    # collector's confirm-re-read could not be completed) and B-01 must skip.
     queued_count_via_service: Optional[int] = None
+    # B-01 Side B (#1450): queued execution ids read via the SAME `get_engine()`
+    # seam as `db.get_queued_count`, so both B-01 sides honor DATABASE_URL and
+    # compare like-for-like on Postgres (not raw-sqlite vs engine). Independent
+    # code path from the accessor (`SELECT id`/literal 'queued' here vs
+    # `COUNT(*)`/the TaskExecutionStatus.QUEUED enum in db/schedules.py) — shares
+    # a database, not a code path, so a cache/status-filter regression on the
+    # accessor still surfaces (non-tautology). `None` means the engine read
+    # failed this cycle (or the collector's confirm-re-read could not be
+    # completed) → B-01 skips this agent rather than comparing against a
+    # different backend's row set.
+    queued_ids_via_engine: Optional[Set[str]] = None
+    # E-04 / G-04 input (#1077): per-queued-execution metadata
+    # `{eid: {"queued_at": ..., "backlog_metadata": ...}}`, scoped STRICTLY to
+    # `status='queued'` rows in `_collect_executions` — never terminal rows, so
+    # #1449 (deferred; NULLs `backlog_metadata` on terminal rows) cannot make
+    # E-04 false-fire. Populated only when the `queued_at` + `backlog_metadata`
+    # columns both exist (BACKLOG-001); on an older/minimal DDL the map is left
+    # empty for that agent so E-04/G-04 skip its queued eids (older-image
+    # fail-open). An eid in `queued_exec_ids` but ABSENT from this map means the
+    # metadata columns weren't observable — E-04/G-04 skip it; a PRESENT entry
+    # with a NULL value is a real E-04 violation.
+    queued_meta: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     # Per-slot Redis TTL on the companion `agent:slot:{name}:{eid}` HASH.
     # Value semantics from `redis.ttl()`: positive int = seconds until
     # expiry; -2 = key does not exist; -1 = key exists with no TTL. S-03
@@ -164,6 +235,14 @@ class AgentSnapshot:
     # (#226 bug class). Empty dict means the per-slot read was skipped
     # this cycle (Redis unavailable); the check skips silently.
     slot_ttls: Dict[str, int] = field(default_factory=dict)
+    # #506: stored `max_parallel` clamped to the fleet ceiling. S-01/S-02/S-03
+    # keep using the raw `max_parallel` (clamping only lowers ZCARD vs stored,
+    # so the no-overbooking bound stays valid), but B-02 must compare slot
+    # count to the EFFECTIVE cap — under a lower ceiling an effective-full +
+    # queued agent would otherwise read as "free slots → drain stalled" and
+    # false-fire. None ⇒ fall back to `max_parallel` (test constructors that
+    # predate the ceiling).
+    effective_max_parallel: Optional[int] = None
 
 
 @dataclass
@@ -198,6 +277,19 @@ class Snapshot:
     # `sources_unavailable` and the R-01 check skips that agent rather
     # than firing.
     zombie_counts: Dict[str, int] = field(default_factory=dict)
+    # E-06 input: enabled, non-deleted schedules → {schedule_id, agent_name,
+    # next_run_at}. The check flags any whose next_run_at is more than the
+    # misfire grace behind the snapshot time (a stale projection the scheduler
+    # never advanced — the "Next: Nd ago" bug, #1472). Empty means the read was
+    # skipped (recorded in sources_unavailable).
+    enabled_schedules: List[Dict[str, Any]] = field(default_factory=list)
+    # E-03 / G-03 input (#1077): recent terminal execution rows
+    # ({id, agent_name, status, started_at, completed_at, duration_ms}),
+    # windowed on `started_at` (NOT `completed_at` — E-03 must see rows whose
+    # `completed_at` is NULL). Scoped to success/failed/cancelled (never
+    # `skipped`). Empty when the collection was skipped (older/minimal DDL
+    # missing `completed_at`/`duration_ms`, recorded in `sources_unavailable`).
+    terminal_rows: List[Dict[str, Any]] = field(default_factory=list)
     # Diagnostics — empty on a clean cycle.
     sources_unavailable: List[str] = field(default_factory=list)
 
@@ -238,6 +330,15 @@ def _collect_executions(agent_name: str) -> Dict[str, Any]:
     query so the canary cycle stays O(N agents) and never grows per-row.
     The column has been on `schedule_executions` since #106; rows predating
     that migration return NULL and are tolerated by the E-05 grace window.
+
+    Also captures `queued_at` + `backlog_metadata` for **queued** rows (E-04 /
+    G-04, #1077) in the same query, keyed by execution_id in `queued_meta`.
+    Both columns are PRAGMA-guarded (added by BACKLOG-001): when either is
+    absent (older/minimal DDL) `queued_meta` is left empty so E-04/G-04 skip
+    those eids (older-image fail-open) rather than firing on a column that never
+    existed. The metadata is read STRICTLY off queued rows — never terminal ones
+    — so #1449 (deferred; NULLs `backlog_metadata` on terminal rows) can't make
+    E-04 false-fire.
     """
     from db.connection import get_db_connection
 
@@ -249,9 +350,15 @@ def _collect_executions(agent_name: str) -> Dict[str, Any]:
         cursor.execute("PRAGMA table_info(schedule_executions)")
         cols = {c["name"] for c in cursor.fetchall()}
         has_session_col = "claude_session_id" in cols
+        # E-04/G-04 (#1077): both queued-metadata columns must exist to observe
+        # queued metadata at all. Guard on BOTH (they land together in
+        # BACKLOG-001) so a partial DDL degrades to older-image fail-open.
+        has_queued_meta = "queued_at" in cols and "backlog_metadata" in cols
         select_cols = "id, status, started_at"
         if has_session_col:
             select_cols += ", claude_session_id"
+        if has_queued_meta:
+            select_cols += ", queued_at, backlog_metadata"
         cursor.execute(
             f"SELECT {select_cols} FROM schedule_executions "
             "WHERE agent_name = ? AND status IN ('running', 'queued')",
@@ -262,6 +369,7 @@ def _collect_executions(agent_name: str) -> Dict[str, Any]:
             "queued": set(),
             "started_at": {},
             "claude_session_ids": {},
+            "queued_meta": {},
         }
         for row in cursor.fetchall():
             if row["status"] == "running":
@@ -273,6 +381,14 @@ def _collect_executions(agent_name: str) -> Dict[str, Any]:
                 )
             elif row["status"] == "queued":
                 out["queued"].add(row["id"])
+                if has_queued_meta:
+                    # A NULL value here IS a violation (real E-04 case); leaving
+                    # the eid out of the map only happens when the columns are
+                    # absent (older image → skipped above).
+                    out["queued_meta"][row["id"]] = {
+                        "queued_at": row["queued_at"],
+                        "backlog_metadata": row["backlog_metadata"],
+                    }
         return out
 
 
@@ -367,6 +483,49 @@ def _collect_queued_count_via_service(agent_name: str) -> Optional[int]:
         return None
 
 
+def _collect_queued_ids_via_engine(agent_name: str) -> Set[str]:
+    """B-01 Side B: queued execution ids via the SAME `get_engine()` seam as
+    `db.get_queued_count` (#1450), so both sides honor DATABASE_URL.
+
+    Independent code path from the production accessor — `SELECT id` here vs
+    `COUNT(*)` in `db/schedules.py`, and the literal ``'queued'`` here vs the
+    ``TaskExecutionStatus.QUEUED`` enum there — so a cache or status-filter
+    regression on the accessor still surfaces (non-tautology). Shares a
+    *database* with Side A, not a *code path*.
+
+    Raises on failure; the caller forces a B-01 skip rather than falling back
+    to the raw-sqlite id-set, which on Postgres would re-arm the very
+    backend-divergence gap this closes (comparing an engine count against a
+    stale/absent SQLite file).
+    """
+    from sqlalchemy import and_, select
+    from db.engine import get_engine
+    from db.tables import schedule_executions
+
+    stmt = select(schedule_executions.c.id).where(
+        and_(
+            schedule_executions.c.agent_name == agent_name,
+            schedule_executions.c.status == "queued",
+        )
+    )
+    with get_engine().connect() as conn:
+        return {row[0] for row in conn.execute(stmt)}
+
+
+def _clamp_to_ceiling(stored_max_parallel: int) -> int:
+    """Clamp a stored per-agent cap to the fleet ceiling for B-02 (#506).
+
+    Defensive: if the settings read fails (settings_service / database
+    unavailable under unit-test stubs), fall back to the stored value so the
+    snapshot never crashes — B-02 then behaves exactly as before the ceiling.
+    """
+    try:
+        from services.settings_service import clamp_to_ceiling
+        return clamp_to_ceiling(stored_max_parallel)
+    except Exception:  # pragma: no cover - defensive, exercised via stubbing
+        return stored_max_parallel
+
+
 def _collect_terminal_executions(window_minutes: int = 30) -> Dict[str, str]:
     """Recent terminal execution_ids → status (for E-02 reversal detection).
 
@@ -395,6 +554,113 @@ def _collect_terminal_executions(window_minutes: int = 30) -> Dict[str, str]:
             (*TERMINAL_EXECUTION_STATUSES, cutoff),
         )
         return {row["id"]: row["status"] for row in cursor.fetchall()}
+
+
+def _collect_terminal_rows(window_seconds: int) -> Dict[str, Any]:
+    """Recent terminal rows for E-03 (`completed_at` populated) + G-03
+    (`started_at <= completed_at`), windowed on `started_at`.
+
+    Window on `started_at`, NOT `completed_at`: E-03 must be able to see a
+    terminal row whose `completed_at` is NULL — the very bug it guards — and a
+    `completed_at` window would filter those out. Scoped to
+    success/failed/cancelled via the LOCAL `_E03_TERMINAL_STATUSES` list; the
+    module-level `_TERMINAL_SQL_LIST` also includes `skipped`, which
+    legitimately has no `completed_at`/`duration_ms` and would false-fire E-03.
+
+    Column-absent vs value-NULL: if `completed_at` or `duration_ms` is missing
+    from a minimal/older DDL, the whole collection is skipped (reported via the
+    returned `unavailable`) so E-03/G-03 skip the cycle — defaulting an *absent*
+    column to None would make E-03 fire on every row. A NULL *value* is a real
+    violation; an absent *column* is a source gap.
+
+    Bounded `ORDER BY started_at DESC LIMIT _TERMINAL_ROWS_CAP`: see the
+    constant's rationale (no index, 90-day retention, tripwire-not-audit).
+
+    Returns ``{"rows": List[Dict], "unavailable": Optional[str],
+    "sampled": bool}``.
+    """
+    from db.connection import get_db_connection
+
+    placeholders = ",".join("?" * len(_E03_TERMINAL_STATUSES))
+    # `iso_cutoff` is minute-granular (keyword-only `minutes`); round the
+    # second-granular window UP so it never shrinks below the requested span
+    # (a slightly larger window can never miss a just-completed terminal row).
+    cutoff_minutes = (int(window_seconds) + 59) // 60
+    cutoff = iso_cutoff(minutes=cutoff_minutes)
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("PRAGMA table_info(schedule_executions)")
+        cols = {c["name"] for c in cursor.fetchall()}
+        missing = [c for c in ("completed_at", "duration_ms") if c not in cols]
+        if missing:
+            return {
+                "rows": [],
+                "unavailable": (
+                    "schedule_executions missing column(s): "
+                    + ", ".join(missing)
+                ),
+                "sampled": False,
+            }
+        # Fetch one past the cap so we can flag when the window was truncated
+        # without a second COUNT query.
+        cursor.execute(
+            f"""
+            SELECT id, agent_name, status, started_at, completed_at, duration_ms
+            FROM schedule_executions
+            WHERE status IN ({placeholders})
+              AND started_at > ?
+            ORDER BY started_at DESC
+            LIMIT {_TERMINAL_ROWS_CAP + 1}
+            """,
+            (*_E03_TERMINAL_STATUSES, cutoff),
+        )
+        fetched = cursor.fetchall()
+        sampled = len(fetched) > _TERMINAL_ROWS_CAP
+        rows = [
+            {
+                "id": r["id"],
+                "agent_name": r["agent_name"],
+                "status": r["status"],
+                "started_at": r["started_at"],
+                "completed_at": r["completed_at"],
+                "duration_ms": r["duration_ms"],
+            }
+            for r in fetched[:_TERMINAL_ROWS_CAP]
+        ]
+        if sampled:
+            logger.warning(
+                "canary terminal-row collector hit the %d-row cap "
+                "(window=%ds); E-03/G-03 coverage is leading-edge only "
+                "this cycle",
+                _TERMINAL_ROWS_CAP,
+                window_seconds,
+            )
+        return {"rows": rows, "unavailable": None, "sampled": sampled}
+
+
+def _collect_enabled_schedules() -> List[Dict[str, Any]]:
+    """Enabled, non-deleted schedules → {schedule_id, agent_name, next_run_at}
+    for E-06 (stale next_run_at detection, #1472). Mirrors the scheduler's own
+    read predicate (`enabled = 1 AND deleted_at IS NULL`)."""
+    from db.connection import get_db_connection
+
+    with get_db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            SELECT id, agent_name, next_run_at
+            FROM agent_schedules
+            WHERE enabled = 1 AND deleted_at IS NULL
+            """
+        )
+        return [
+            {
+                "schedule_id": row["id"],
+                "agent_name": row["agent_name"],
+                "next_run_at": row["next_run_at"],
+            }
+            for row in cursor.fetchall()
+        ]
 
 
 def _collect_orphan_refs(known_agents: Set[str]) -> List[OrphanRef]:
@@ -595,17 +861,61 @@ def collect_snapshot() -> Snapshot:
                 "queued": set(),
                 "started_at": {},
                 "claude_session_ids": {},
+                "queued_meta": {},
             }
 
-        # B-01 inputs: production accessor `db.get_queued_count` for cross-
-        # check against the snapshot's own queued id-list count.
+        # B-01 inputs (#1450): both sides go through the `get_engine()` seam so
+        # they honor DATABASE_URL (backend-consistent on Postgres). Side A is
+        # the production accessor `db.get_queued_count`; Side B is an
+        # independent `SELECT id` over the same engine. On an engine-read
+        # failure, force a B-01 skip (`service_count=None`) — never fall back to
+        # the raw-sqlite `execs["queued"]` set for the comparison, which would
+        # re-arm the backend-divergence gap on Postgres.
+        try:
+            engine_qids: Optional[Set[str]] = _collect_queued_ids_via_engine(name)
+        except Exception as exc:
+            logger.exception(
+                "canary snapshot: engine queued-id read failed for %s", name
+            )
+            snap.sources_unavailable.append(f"engine.queued_ids[{name}]: {exc}")
+            engine_qids = None
+
         queued_via_service = _collect_queued_count_via_service(name)
 
+        # Temporal-race tolerance (#1450 gap a): the two reads happen at
+        # different instants; a concurrent enqueue/backlog-drain landing
+        # between them yields a transient mismatch. Confirm once — a real drift
+        # persists across the re-read, a race self-resolves. An unconfirmable
+        # confirm degrades to a skip (don't fire critical on a single
+        # unconfirmed mismatch); a confirm pair that STILL disagrees is stored
+        # verbatim so B-01 can still catch a persistent drift (a rare
+        # double-straddle is an accepted, self-healing residual).
+        if (
+            engine_qids is not None
+            and queued_via_service is not None
+            and queued_via_service != len(engine_qids)
+        ):
+            try:
+                confirm_ids = _collect_queued_ids_via_engine(name)
+                confirm_count = _collect_queued_count_via_service(name)
+            except Exception as exc:
+                logger.warning(
+                    "canary B-01 confirm re-read failed for %s: %s", name, exc
+                )
+                queued_via_service = None  # unconfirmable → B-01 skips this cycle
+            else:
+                if confirm_count is None:
+                    queued_via_service = None  # accessor gone → skip
+                else:
+                    engine_qids, queued_via_service = confirm_ids, confirm_count
+
+        stored_max_parallel = int(row["max_parallel_tasks"])
         snap.agents.append(
             AgentSnapshot(
                 name=name,
                 is_system=bool(row["is_system"]),
-                max_parallel=int(row["max_parallel_tasks"]),
+                max_parallel=stored_max_parallel,
+                effective_max_parallel=_clamp_to_ceiling(stored_max_parallel),
                 execution_timeout_seconds=int(row["execution_timeout_seconds"]),
                 slot_ids=redis_state["by_agent"].get(name, set()),
                 slot_scores=redis_state["scores"].get(name, {}),
@@ -614,7 +924,9 @@ def collect_snapshot() -> Snapshot:
                 running_started_at=execs.get("started_at", {}),
                 running_claude_session_ids=execs.get("claude_session_ids", {}),
                 queued_exec_ids=execs["queued"],
+                queued_meta=execs.get("queued_meta", {}),
                 queued_count_via_service=queued_via_service,
+                queued_ids_via_engine=engine_qids,
             )
         )
 
@@ -631,6 +943,32 @@ def collect_snapshot() -> Snapshot:
     except Exception as exc:
         logger.exception("canary snapshot: terminal executions read failed")
         snap.sources_unavailable.append(f"sqlite.terminal_executions: {exc}")
+
+    # SQLite: enabled schedules → next_run_at for the E-06 stale-projection check.
+    try:
+        snap.enabled_schedules = _collect_enabled_schedules()
+    except Exception as exc:
+        logger.exception("canary snapshot: enabled schedules read failed")
+        snap.sources_unavailable.append(f"sqlite.enabled_schedules: {exc}")
+
+    # SQLite: recent terminal rows for E-03 (completed_at populated) + G-03
+    # (started_at <= completed_at). Window off the MAX per-agent execution
+    # timeout so a just-completed max-timeout task (per-agent cap 60–7200s,
+    # #922) whose started_at is up to its timeout ago is still in-window;
+    # default 900s when no agents exist. Principled, not a hardcoded 120min.
+    max_timeout = max(
+        (int(r["execution_timeout_seconds"]) for r in agent_rows), default=900
+    )
+    try:
+        terminal = _collect_terminal_rows(max_timeout + TERMINAL_WINDOW_BUFFER_SECONDS)
+        snap.terminal_rows = terminal["rows"]
+        if terminal["unavailable"]:
+            snap.sources_unavailable.append(
+                f"sqlite.terminal_rows: {terminal['unavailable']}"
+            )
+    except Exception as exc:
+        logger.exception("canary snapshot: terminal-row read failed")
+        snap.sources_unavailable.append(f"sqlite.terminal_rows: {exc}")
 
     # Redis: drain-tick heartbeat for B-02. Reuses the slot_service Redis
     # client (same one used by `_collect_redis_slot_state` above). On
