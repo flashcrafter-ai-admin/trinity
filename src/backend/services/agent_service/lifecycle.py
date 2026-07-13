@@ -17,6 +17,7 @@ from database import db
 from services.docker_service import (
     docker_client,
     get_agent_container,
+    get_agent_ssh_port_binding,
 )
 from services.docker_utils import (
     container_stop, container_remove, container_start, container_reload,
@@ -637,7 +638,7 @@ async def recreate_container_with_updated_config(agent_name: str, old_container,
         image,
         detach=True,
         name=f"agent-{agent_name}",
-        ports={'22/tcp': ssh_port},
+        ports={'22/tcp': get_agent_ssh_port_binding(ssh_port)},
         volumes=volumes,
         environment=env_vars,
         labels=labels,

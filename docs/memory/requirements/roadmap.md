@@ -22,7 +22,7 @@
 ### 16.2 SSH Access
 - **Status**: ✅ Implemented (2026-01-02)
 - **Description**: Ephemeral SSH credentials via MCP tool (admin-only)
-- **Key Features**: ED25519 keys, configurable TTL, ops setting controlled, admin-only access
+- **Key Features**: ED25519 keys, configurable TTL, ops setting controlled, admin-only access; agent SSH ports bind to loopback by default and require an explicit valid `AGENT_SSH_BIND_HOST` IP for private-network access
 - **Flow**: `docs/memory/feature-flows/ssh-access.md`
 
 ### 16.3 Agent Info Display
