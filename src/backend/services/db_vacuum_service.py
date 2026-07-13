@@ -21,7 +21,6 @@ Configuration (env vars):
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
 import sqlite3
@@ -101,7 +100,9 @@ class DBVacuumService:
                 conn.close()
 
         try:
-            await asyncio.to_thread(_vacuum)
+            from services.deployment_lock_service import run_governed_executor
+
+            await run_governed_executor(None, _vacuum)
         except sqlite3.OperationalError as exc:
             logger.warning("VACUUM skipped: %s", exc)
             return {"status": "skipped", "reason": str(exc)}

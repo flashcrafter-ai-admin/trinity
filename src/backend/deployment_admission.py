@@ -117,8 +117,23 @@ class MutationAdmissionAuthority:
     def __init__(self, redis_provider: Callable):
         self._redis_provider = redis_provider
 
+    @staticmethod
+    def _call(operation, *args, **kwargs):
+        try:
+            return operation(*args, **kwargs)
+        except (
+            DeploymentLockUnavailable,
+            DeploymentLockConflict,
+            DeploymentLockRejected,
+        ):
+            raise
+        except Exception as exc:
+            raise DeploymentLockUnavailable(
+                "deployment lock authority command failed"
+            ) from exc
+
     def _redis(self):
-        client = self._redis_provider()
+        client = self._call(self._redis_provider)
         if client is None:
             raise DeploymentLockUnavailable("deployment lock authority is unavailable")
         return client
@@ -126,7 +141,7 @@ class MutationAdmissionAuthority:
     def begin(self, token: str | None) -> MutationReservation:
         client = self._redis()
         token_digest = hashlib.sha256((token or "").encode()).hexdigest()
-        current_raw = _decode(client.get(LOCK_KEY))
+        current_raw = _decode(self._call(client.get, LOCK_KEY))
         expected_lock = current_raw or ""
         if current_raw is not None:
             state = _parse_lock(current_raw)
@@ -157,7 +172,8 @@ redis.call('zadd', KEYS[3], ARGV[2], ARGV[3])
 redis.call('expire', KEYS[1], state['ttlSeconds'])
 return {1, KEYS[3]}
 """
-        result = client.eval(
+        result = self._call(
+            client.eval,
             script,
             3,
             LOCK_KEY,
@@ -186,7 +202,7 @@ return {1, KEYS[3]}
         child = MutationReservation(parent.key, secrets.token_urlsafe(32))
         now, expiry = _now_and_expiry()
         digest = parent.key.removeprefix(LEASE_RESERVATIONS_PREFIX)
-        current_raw = _decode(client.get(LOCK_KEY))
+        current_raw = _decode(self._call(client.get, LOCK_KEY))
         expected_lock = current_raw or ""
         if parent.key == ORDINARY_RESERVATIONS_KEY:
             if current_raw is not None and _parse_lock(current_raw)["phase"] != "draining":
@@ -224,7 +240,8 @@ end
 redis.call('zadd', KEYS[2], ARGV[5], ARGV[6])
 return 1
 """
-        admitted = client.eval(
+        admitted = self._call(
+            client.eval,
             script,
             2,
             LOCK_KEY,
@@ -245,7 +262,7 @@ return 1
         client = self._redis()
         now, expiry = _now_and_expiry()
         digest = reservation.key.removeprefix(LEASE_RESERVATIONS_PREFIX)
-        current_raw = _decode(client.get(LOCK_KEY))
+        current_raw = _decode(self._call(client.get, LOCK_KEY))
         expected_lock = current_raw or ""
         if reservation.key == ORDINARY_RESERVATIONS_KEY:
             if current_raw is not None and _parse_lock(current_raw)["phase"] != "draining":
@@ -278,7 +295,8 @@ end
 redis.call('zadd', KEYS[2], ARGV[5], ARGV[1])
 return 1
 """
-        refreshed = client.eval(
+        refreshed = self._call(
+            client.eval,
             script,
             2,
             LOCK_KEY,
@@ -294,7 +312,8 @@ return 1
 
     def end(self, reservation: MutationReservation) -> None:
         _validate_reservation(reservation)
-        self._redis().zrem(reservation.key, reservation.reservation_id)
+        client = self._redis()
+        self._call(client.zrem, reservation.key, reservation.reservation_id)
 
     def count(self, key: str) -> int:
         now, _ = _now_and_expiry()
@@ -303,7 +322,8 @@ return 1
 redis.call('zremrangebyscore', KEYS[1], '-inf', ARGV[1])
 return redis.call('zcard', KEYS[1])
 """
-        return int(self._redis().eval(script, 1, key, now))
+        client = self._redis()
+        return int(self._call(client.eval, script, 1, key, now))
 
     @contextmanager
     def context(self, reservation: MutationReservation):
@@ -396,11 +416,17 @@ return redis.call('zcard', KEYS[1])
                 coro.close()
             raise
 
-    def run_sync(self, function, *args, **kwargs):
-        reservation = self.begin(None)
+    def run_sync_reserved(
+        self,
+        reservation: MutationReservation,
+        function,
+        *args,
+        **kwargs,
+    ):
         stopped = threading.Event()
         heartbeat_thread = None
         try:
+            self.refresh(reservation)
             with self.context(reservation) as context:
                 def heartbeat() -> None:
                     while not stopped.wait(RESERVATION_HEARTBEAT_SECONDS):
@@ -426,6 +452,40 @@ return redis.call('zcard', KEYS[1])
                     timeout=max(1.0, RESERVATION_HEARTBEAT_SECONDS + 1.0)
                 )
             self.end(reservation)
+
+    def run_sync(self, function, *args, **kwargs):
+        reservation = self.begin(None)
+        return self.run_sync_reserved(reservation, function, *args, **kwargs)
+
+    async def run_in_executor(self, executor, function, *args, **kwargs):
+        """Keep a child reservation alive until a blocking effect actually exits."""
+        inherited = self.inherited()
+        reservation = self.adopt(inherited) if inherited else self.begin(None)
+        loop = asyncio.get_running_loop()
+
+        def invoke():
+            return self.run_sync_reserved(
+                reservation,
+                function,
+                *args,
+                **kwargs,
+            )
+
+        try:
+            future = loop.run_in_executor(executor, invoke)
+        except BaseException:
+            self.end(reservation)
+            raise
+
+        try:
+            return await asyncio.shield(future)
+        except asyncio.CancelledError:
+            try:
+                await asyncio.shield(future)
+            except BaseException:
+                pass
+            assert_current_authority()
+            raise
 
     async def run_when_admitted(
         self,

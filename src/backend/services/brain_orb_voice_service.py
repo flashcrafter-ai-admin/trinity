@@ -25,7 +25,6 @@ the tool surface at connect time.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -214,7 +213,7 @@ def _build_system_instruction(agent_prompt: Optional[str], can_write: bool) -> s
 
 
 def _mint_sync(voice_name: str, system_instruction: str, can_write: bool) -> dict:
-    """Blocking SDK mint — run under ``asyncio.to_thread`` from the async route."""
+    """Blocking SDK mint executed through the governed effect runner."""
     client = _get_v1alpha_client()
     # Owner sessions get the write tools folded into the read/visual/scope surface;
     # shared-user sessions get the read-only manifest unchanged (Phase 3 parity).
@@ -277,6 +276,9 @@ async def mint_voice_token(
     read-only Phase-3 manifest is minted verbatim. Raises ``ValueError`` when no
     Gemini key is configured; any SDK error propagates for the router to map to 502."""
     system_instruction = _build_system_instruction(agent_prompt, can_write)
-    return await asyncio.to_thread(
+    from services.deployment_lock_service import run_governed_executor
+
+    return await run_governed_executor(
+        None,
         _mint_sync, voice_name or DEFAULT_VOICE_NAME, system_instruction, can_write
     )

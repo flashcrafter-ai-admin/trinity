@@ -41,6 +41,16 @@ from fastapi import HTTPException
 # rationale as tests/unit/test_local_templates_listing.py.
 
 
+@pytest.fixture(autouse=True)
+def _governed_effect_port(monkeypatch):
+    from services import deployment_lock_service
+
+    async def run(_executor, function, *args, **kwargs):
+        return await asyncio.to_thread(function, *args, **kwargs)
+
+    monkeypatch.setattr(deployment_lock_service, "run_governed_executor", run)
+
+
 def _make_archive() -> str:
     """A minimal, valid Trinity archive: template.yaml + non-empty CLAUDE.md.
 

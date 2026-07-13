@@ -29,6 +29,16 @@ from dependencies import get_authorized_agent_by_name, get_current_user, get_own
 _AGENT = "cornelius"
 
 
+@pytest.fixture(autouse=True)
+def _governed_effect_port(monkeypatch):
+    from services import deployment_lock_service
+
+    async def run(_executor, function, *args, **kwargs):
+        return await asyncio.to_thread(function, *args, **kwargs)
+
+    monkeypatch.setattr(deployment_lock_service, "run_governed_executor", run)
+
+
 # --- fakes -----------------------------------------------------------------
 
 def _running():

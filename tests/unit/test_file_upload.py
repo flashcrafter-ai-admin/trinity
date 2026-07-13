@@ -7,6 +7,7 @@ and message router security validations.
 Related flow: docs/memory/feature-flows/channel-adapters.md
 """
 
+import asyncio
 import os
 import sys
 import tempfile
@@ -22,6 +23,21 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 # Mark all tests as unit tests (no backend required)
 pytestmark = pytest.mark.unit
+
+
+@pytest.fixture(autouse=True)
+def _docker_mutation_port(monkeypatch):
+    from services import docker_utils
+    from services import upload_service
+
+    async def run(_executor, function, *args, **kwargs):
+        return await asyncio.to_thread(function, *args, **kwargs)
+
+    async def exec_run(*_args, **_kwargs):
+        return MagicMock(exit_code=0, output=b"")
+
+    monkeypatch.setattr(docker_utils, "_governed_executor_runner", run)
+    monkeypatch.setattr(upload_service, "container_exec_run", exec_run)
 
 
 class TestTelegramFileExtraction:

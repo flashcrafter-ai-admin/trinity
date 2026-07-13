@@ -15,6 +15,7 @@ Covers the pure, Docker-free units of `routers/agent_data.py`:
 The full HTTP path (auth, streaming response, agent-server proxy) is exercised
 by the sibling-stack integration suite / verify-local.
 """
+import asyncio
 import importlib.util
 import io
 import tarfile
@@ -26,6 +27,16 @@ import pytest
 _BASE_IMAGE = (
     Path(__file__).resolve().parents[2] / "docker" / "base-image" / "agent_server"
 )
+
+
+@pytest.fixture(autouse=True)
+def _governed_effect_port(monkeypatch):
+    from services import deployment_lock_service
+
+    async def run(_executor, function, *args, **kwargs):
+        return await asyncio.to_thread(function, *args, **kwargs)
+
+    monkeypatch.setattr(deployment_lock_service, "run_governed_executor", run)
 
 
 def _load_snapshot_module():

@@ -22,6 +22,18 @@ logger = logging.getLogger(__name__)
 # Shared executor - limited to 4 workers to avoid overwhelming Docker daemon
 # This matches the pattern in telemetry.py
 _docker_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="docker-")
+_governed_executor_runner = None
+
+
+async def _run_docker_mutation(function):
+    # Lazy import avoids docker_utils -> deployment_lock_service import cycles.
+    runner = _governed_executor_runner
+    if runner is None:
+        from services.deployment_lock_service import run_governed_executor
+
+        runner = run_governed_executor
+
+    return await runner(_docker_executor, function)
 
 
 def _invalidate_agent_stats_for(container) -> None:
@@ -77,8 +89,7 @@ async def container_stop(container, timeout: int = 10) -> None:
         container: Docker container object
         timeout: Seconds to wait before killing (default 10)
     """
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(_docker_executor, lambda: container.stop(timeout=timeout))
+    await _run_docker_mutation(lambda: container.stop(timeout=timeout))
     _invalidate_agent_stats_for(container)  # #73
 
 
@@ -89,8 +100,7 @@ async def container_remove(container, force: bool = False) -> None:
         container: Docker container object
         force: Force removal even if running
     """
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(_docker_executor, lambda: container.remove(force=force))
+    await _run_docker_mutation(lambda: container.remove(force=force))
     _invalidate_agent_stats_for(container)  # #73
 
 
@@ -100,8 +110,7 @@ async def container_start(container) -> None:
     Args:
         container: Docker container object
     """
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(_docker_executor, container.start)
+    await _run_docker_mutation(container.start)
     _invalidate_agent_stats_for(container)  # #73
 
 
@@ -141,8 +150,7 @@ async def container_rename(container, new_name: str) -> None:
     # agent's stale stats). The container's label/name still reflect the old
     # value here.
     _invalidate_agent_stats_for(container)
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(_docker_executor, lambda: container.rename(new_name))
+    await _run_docker_mutation(lambda: container.rename(new_name))
 
 
 async def container_get(container_id: str) -> Any:
@@ -195,9 +203,7 @@ async def volume_create(name: str, labels: Optional[Dict[str, str]] = None) -> A
     Returns:
         Created volume object
     """
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        _docker_executor,
+    return await _run_docker_mutation(
         lambda: docker_client.volumes.create(name=name, labels=labels or {})
     )
 
@@ -211,8 +217,7 @@ async def volume_remove(volume, force: bool = False) -> None:
             in-use volume still raises ``APIError`` 409 — Docker never force-
             removes a volume referenced by a live container).
     """
-    loop = asyncio.get_event_loop()
-    await loop.run_in_executor(_docker_executor, lambda: volume.remove(force=force))
+    await _run_docker_mutation(lambda: volume.remove(force=force))
 
 
 # =============================================================================
@@ -351,12 +356,10 @@ async def containers_run(
     Returns:
         Container object (if detach=True) or logs
     """
-    loop = asyncio.get_event_loop()
-
     def _run():
         return docker_client.containers.run(image, command=command, **kwargs)
 
-    return await loop.run_in_executor(_docker_executor, _run)
+    return await _run_docker_mutation(_run)
 
 
 # =============================================================================
@@ -382,8 +385,6 @@ async def container_exec_run(
     Returns:
         ExecResult with exit_code and output
     """
-    loop = asyncio.get_event_loop()
-
     def _exec():
         kwargs = {}
         if user:
@@ -394,7 +395,7 @@ async def container_exec_run(
             kwargs['environment'] = environment
         return container.exec_run(cmd, **kwargs)
 
-    return await loop.run_in_executor(_docker_executor, _exec)
+    return await _run_docker_mutation(_exec)
 
 
 async def container_get_archive(container, path: str) -> tuple:
@@ -426,11 +427,7 @@ async def container_put_archive(container, path: str, data: bytes) -> bool:
     Returns:
         True on success, False on failure.
     """
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(
-        _docker_executor,
-        lambda: container.put_archive(path, data)
-    )
+    return await _run_docker_mutation(lambda: container.put_archive(path, data))
 
 
 async def api_exec_create(
@@ -460,8 +457,6 @@ async def api_exec_create(
     Returns:
         Exec instance dict with 'Id' key
     """
-    loop = asyncio.get_event_loop()
-
     def _create():
         return docker_client.api.exec_create(
             container_id,
@@ -475,7 +470,7 @@ async def api_exec_create(
             environment=environment
         )
 
-    return await loop.run_in_executor(_docker_executor, _create)
+    return await _run_docker_mutation(_create)
 
 
 async def api_exec_start(exec_id: str, socket: bool = False, tty: bool = True) -> Any:
@@ -489,12 +484,10 @@ async def api_exec_start(exec_id: str, socket: bool = False, tty: bool = True) -
     Returns:
         Socket object (if socket=True) or output
     """
-    loop = asyncio.get_event_loop()
-
     def _start():
         return docker_client.api.exec_start(exec_id, socket=socket, tty=tty)
 
-    return await loop.run_in_executor(_docker_executor, _start)
+    return await _run_docker_mutation(_start)
 
 
 # =============================================================================

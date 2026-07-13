@@ -10,6 +10,7 @@ the import proxy — the integration layer the pure-helper unit tests don't reac
 A full sibling-stack / verify-local run additionally exercises the real agent
 container restore path; this test covers everything up to that boundary.
 """
+import asyncio
 import base64
 import io
 import tarfile
@@ -24,6 +25,16 @@ import routers.agent_data as ad
 from dependencies import get_current_user, get_owned_agent_by_name
 
 _AGENT = "myagent"
+
+
+@pytest.fixture(autouse=True)
+def _governed_effect_port(monkeypatch):
+    from services import deployment_lock_service
+
+    async def run(_executor, function, *args, **kwargs):
+        return await asyncio.to_thread(function, *args, **kwargs)
+
+    monkeypatch.setattr(deployment_lock_service, "run_governed_executor", run)
 
 
 def _running():

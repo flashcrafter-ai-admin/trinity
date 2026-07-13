@@ -12,6 +12,7 @@ import pytest
 import asyncio
 from unittest.mock import Mock, MagicMock, patch
 import sys
+from functools import partial
 from pathlib import Path
 
 # Add backend path for imports (relative to this file)
@@ -28,8 +29,15 @@ def get_docker_utils():
 
     # Pre-populate sys.modules with mocks to avoid import chain
     # The chain is: docker_utils -> docker_service -> models -> utils.helpers
+    async def run_governed_executor(executor, function, *args, **kwargs):
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(executor, partial(function, *args, **kwargs))
+
     with patch.dict('sys.modules', {
-        'services.docker_service': Mock(docker_client=mock_docker_client)
+        'services.docker_service': Mock(docker_client=mock_docker_client),
+        'services.deployment_lock_service': Mock(
+            run_governed_executor=run_governed_executor
+        ),
     }):
         # Force reimport
         if 'services.docker_utils' in sys.modules:
@@ -47,6 +55,7 @@ def get_docker_utils():
         docker_utils.docker_client = mock_docker_client
 
         spec.loader.exec_module(docker_utils)
+        docker_utils._governed_executor_runner = run_governed_executor
 
         return docker_utils, mock_docker_client
 
@@ -67,6 +76,21 @@ class TestContainerOperations:
 
         # Verify stop was called with correct timeout
         mock_container.stop.assert_called_once_with(timeout=15)
+
+    @pytest.mark.asyncio
+    async def test_container_mutation_uses_governed_executor_port(self):
+        docker_utils, _ = get_docker_utils()
+        mock_container = Mock()
+        governed_calls = []
+
+        async def governed(executor, function, *args, **kwargs):
+            governed_calls.append(executor)
+            return function(*args, **kwargs)
+
+        docker_utils._governed_executor_runner = governed
+        await docker_utils.container_stop(mock_container)
+
+        assert governed_calls == [docker_utils._docker_executor]
 
     @pytest.mark.asyncio
     async def test_container_start_calls_docker_sdk(self):

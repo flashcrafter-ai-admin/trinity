@@ -8,7 +8,7 @@ import os
 import sqlite3
 import threading
 import time
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import redis
@@ -43,6 +43,53 @@ def _locked_state(phase: str) -> str:
         },
         sort_keys=True,
     )
+
+
+def test_scheduler_redis_client_uses_bounded_socket_timeouts(monkeypatch):
+    from scheduler import service as scheduler_service
+
+    monkeypatch.setattr(scheduler_service.config, "redis_socket_connect_timeout", 2.5)
+    monkeypatch.setattr(scheduler_service.config, "redis_socket_timeout", 4.5)
+    redis_client = MagicMock()
+
+    with patch("scheduler.service.redis.from_url", return_value=redis_client) as from_url:
+        service = SchedulerService(
+            database=MagicMock(),
+            lock_manager=MagicMock(),
+            redis_url="redis://test:test@redis:6379",
+        )
+
+        assert service.redis is redis_client
+
+    from_url.assert_called_once_with(
+        "redis://test:test@redis:6379",
+        decode_responses=True,
+        socket_connect_timeout=2.5,
+        socket_timeout=4.5,
+    )
+
+
+@pytest.mark.parametrize("redis_error", [redis.ConnectionError, redis.TimeoutError])
+def test_scheduler_admission_redis_failures_are_reported_as_unavailable(redis_error):
+    redis_client = MagicMock()
+    redis_client.get.side_effect = redis_error("redis unavailable")
+    database = MagicMock()
+
+    with patch("scheduler.service.redis.from_url", return_value=redis_client):
+        service = SchedulerService(
+            database=database,
+            lock_manager=MagicMock(),
+            redis_url="redis://test:test@redis:6379",
+        )
+        service._admission = admission.MutationAdmissionAuthority(
+            lambda: service._admission_redis
+        )
+
+        with pytest.raises(admission.DeploymentLockUnavailable) as exc_info:
+            service.initialize()
+
+    assert isinstance(exc_info.value.__cause__, redis_error)
+    database.ensure_process_schedules_table.assert_not_called()
 
 
 @pytest.mark.parametrize("phase", ["draining", "active", "releasing"])

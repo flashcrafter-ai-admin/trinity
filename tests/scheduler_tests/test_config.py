@@ -22,6 +22,8 @@ class TestSchedulerConfig:
 
             assert config.database_path == "/data/trinity.db"
             assert config.redis_url == _TEST_REDIS_URL
+            assert config.redis_socket_connect_timeout == 5.0
+            assert config.redis_socket_timeout == 5.0
             assert config.lock_timeout == 600
             assert config.lock_auto_renewal is True
             assert config.health_port == 8001
@@ -35,6 +37,8 @@ class TestSchedulerConfig:
         env = {
             "DATABASE_PATH": "/custom/path.db",
             "REDIS_URL": "redis://test:testpassword@custom:6380",
+            "REDIS_SOCKET_CONNECT_TIMEOUT": "2.5",
+            "REDIS_SOCKET_TIMEOUT": "4.5",
             "LOCK_TIMEOUT": "120",
             "LOCK_AUTO_RENEWAL": "false",
             "HEALTH_PORT": "9000",
@@ -45,6 +49,8 @@ class TestSchedulerConfig:
 
             assert config.database_path == "/custom/path.db"
             assert config.redis_url == "redis://test:testpassword@custom:6380"
+            assert config.redis_socket_connect_timeout == 2.5
+            assert config.redis_socket_timeout == 4.5
             assert config.lock_timeout == 120
             assert config.lock_auto_renewal is False
             assert config.health_port == 9000

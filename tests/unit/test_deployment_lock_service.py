@@ -53,6 +53,14 @@ class FakeRedis:
     def sismember(self, key, value):
         return value in self.sets.get(key, set())
 
+    def srem(self, key, value):
+        values = self.sets.get(key, set())
+        removed = int(value in values)
+        values.discard(value)
+        if not values:
+            self.sets.pop(key, None)
+        return removed
+
     def zadd(self, key, mapping):
         self.zsets.setdefault(key, {}).update({str(k): float(v) for k, v in mapping.items()})
         return len(mapping)
@@ -80,6 +88,17 @@ class FakeRedis:
         return self.zrem(key, *expired)
 
     def eval(self, script, key_count, *args):
+        if "trinity:candidate-operation:refresh" in script:
+            key, operation_id, _ttl = args
+            if self.values.get(key) != operation_id:
+                return 0
+            return 1
+        if "trinity:candidate-operation:release" in script:
+            key, operation_id = args
+            if self.values.get(key) != operation_id:
+                return 0
+            del self.values[key]
+            return 1
         if "trinity:reservation:begin" in script:
             lock_key, ordinary_key, lease_key, now, expiry, reservation_id, expected_lock = args
             self.zremrangebyscore(ordinary_key, "-inf", now)
@@ -369,6 +388,39 @@ async def test_acquisition_waits_for_detached_ordinary_child(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_executor_effect_keeps_independent_reservation_after_outer_cancel(
+    monkeypatch,
+):
+    redis = FakeRedis()
+    monkeypatch.setattr(locks, "get_breaker_redis", lambda: redis)
+    started = threading.Event()
+    finish = threading.Event()
+
+    def blocking_effect():
+        started.set()
+        assert finish.wait(timeout=3)
+        return "done"
+
+    parent = locks.begin_mutation(None)
+    with locks.mutation_admission_context(parent):
+        effect_task = asyncio.create_task(
+            locks._AUTHORITY.run_in_executor(None, blocking_effect)
+        )
+        assert await asyncio.to_thread(started.wait, 1)
+    locks.end_mutation(parent)
+    assert locks._AUTHORITY.count(locks.IN_FLIGHT_KEY) == 1
+
+    effect_task.cancel()
+    await asyncio.sleep(0.05)
+    assert effect_task.done() is False
+    assert locks._AUTHORITY.count(locks.IN_FLIGHT_KEY) == 1
+    finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await effect_task
+    assert locks._AUTHORITY.count(locks.IN_FLIGHT_KEY) == 0
+
+
+@pytest.mark.asyncio
 async def test_raw_task_cannot_reuse_parent_admission_context(monkeypatch):
     redis = FakeRedis()
     monkeypatch.setattr(locks, "get_breaker_redis", lambda: redis)
@@ -548,10 +600,177 @@ def test_all_agent_affecting_mutation_surfaces_require_admission(path):
     [
         "/api/public/slack/oauth/callback",
         "/api/files/file-1",
+        "/api/public/intro/invitation-token",
+        "/api/agents/agent-web/compatibility",
     ],
 )
 def test_write_bearing_get_surfaces_require_admission(path):
     assert locks.mutation_requires_admission("GET", path) is True
+
+
+def test_redis_command_failures_are_normalized(monkeypatch):
+    class BrokenRedis:
+        def get(self, _key):
+            raise ConnectionError("redis command failed")
+
+    monkeypatch.setattr(locks, "get_breaker_redis", lambda: BrokenRedis())
+
+    with pytest.raises(
+        locks.DeploymentLockUnavailable,
+        match="authority command failed",
+    ):
+        locks.active_lock()
+
+
+@pytest.mark.asyncio
+async def test_candidate_operation_serializes_rollback_and_prevents_resurrection(
+    monkeypatch,
+):
+    redis = FakeRedis()
+    monkeypatch.setattr(locks, "get_breaker_redis", lambda: redis)
+    _, token = locks.acquire_lock(
+        owner="creator",
+        fleet_lock_digest="a" * 64,
+        agent_names=["agent-web"],
+        ttl_seconds=900,
+    )
+    await locks.activate_lock_after_drain(token)
+    locks.enroll_candidate(token, "agent-web")
+    create_started = asyncio.Event()
+    allow_create = asyncio.Event()
+    rollback_entered = asyncio.Event()
+    agent_exists = False
+
+    async def create():
+        nonlocal agent_exists
+        async with locks.candidate_operation(token, "agent-web"):
+            locks.require_enrolled_candidate(token, "agent-web")
+            create_started.set()
+            await allow_create.wait()
+            agent_exists = True
+
+    async def rollback_candidate():
+        nonlocal agent_exists
+        async with locks.candidate_operation(token, "agent-web"):
+            rollback_entered.set()
+            assert agent_exists is True
+            agent_exists = False
+            locks.unenroll_candidate(token, "agent-web")
+
+    create_task = asyncio.create_task(create())
+    await create_started.wait()
+    rollback_task = asyncio.create_task(rollback_candidate())
+    await asyncio.sleep(0.05)
+    assert rollback_entered.is_set() is False
+    allow_create.set()
+    await create_task
+    await rollback_task
+
+    assert agent_exists is False
+    with pytest.raises(locks.DeploymentLockRejected, match="not enrolled"):
+        locks.require_enrolled_candidate(token, "agent-web")
+
+
+@pytest.mark.asyncio
+async def test_candidate_operation_fails_when_release_ownership_is_lost(monkeypatch):
+    redis = FakeRedis()
+    monkeypatch.setattr(locks, "get_breaker_redis", lambda: redis)
+    _, token = locks.acquire_lock(
+        owner="creator",
+        fleet_lock_digest="a" * 64,
+        agent_names=["agent-web"],
+        ttl_seconds=900,
+    )
+    await locks.activate_lock_after_drain(token)
+    locks.enroll_candidate(token, "agent-web")
+
+    with pytest.raises(
+        locks.DeploymentLockRejected,
+        match="serialization was lost",
+    ):
+        async with locks.candidate_operation(token, "agent-web"):
+            operation_key = next(
+                key
+                for key in redis.values
+                if key.startswith(locks.CANDIDATE_OPERATION_KEY_PREFIX)
+            )
+            redis.values[operation_key] = "different-owner"
+
+
+@pytest.mark.asyncio
+async def test_candidate_routes_serialize_create_then_rollback(monkeypatch):
+    from models import AgentConfig
+    from routers import agents as agents_router
+
+    redis = FakeRedis()
+    monkeypatch.setattr(locks, "get_breaker_redis", lambda: redis)
+    _, token = locks.acquire_lock(
+        owner="creator",
+        fleet_lock_digest="a" * 64,
+        agent_names=["agent-web"],
+        ttl_seconds=900,
+    )
+    await locks.activate_lock_after_drain(token)
+    locks.enroll_candidate(token, "agent-web")
+
+    request = MagicMock()
+    request.headers = {locks.LOCK_HEADER: token}
+    request.client.host = "127.0.0.1"
+    request.url.path = "/api/agents"
+    user = MagicMock(username="creator", role="creator")
+    create_started = asyncio.Event()
+    allow_create = asyncio.Event()
+    rollback_started = asyncio.Event()
+    agent_exists = False
+
+    def get_container(_agent_name):
+        return MagicMock() if agent_exists else None
+
+    async def create_agent(*_args, **_kwargs):
+        nonlocal agent_exists
+        create_started.set()
+        await allow_create.wait()
+        agent_exists = True
+        return {"name": "agent-web"}
+
+    async def rollback_agent(_agent_name):
+        nonlocal agent_exists
+        rollback_started.set()
+        assert agent_exists is True
+        agent_exists = False
+        return {"complete": True, "proof": {}, "agentName": "agent-web"}
+
+    monkeypatch.setattr(agents_router, "get_agent_container", get_container)
+    monkeypatch.setattr(agents_router.db, "is_agent_name_reserved", lambda _name: False)
+    monkeypatch.setattr(agents_router.db, "get_agent_owner", lambda _name: None)
+    monkeypatch.setattr(agents_router, "create_agent_internal", create_agent)
+    monkeypatch.setattr(agents_router, "rollback_candidate", rollback_agent)
+    monkeypatch.setattr(agents_router.platform_audit_service, "log", AsyncMock())
+
+    create_task = asyncio.create_task(
+        agents_router.create_agent_endpoint(
+            AgentConfig(name="agent-web"),
+            request,
+            user,
+        )
+    )
+    await create_started.wait()
+    rollback_task = asyncio.create_task(
+        agents_router.rollback_deployment_candidate_endpoint(
+            "agent-web",
+            request,
+            user,
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert rollback_started.is_set() is False
+    allow_create.set()
+    await create_task
+    await rollback_task
+
+    assert agent_exists is False
+    with pytest.raises(locks.DeploymentLockRejected, match="not enrolled"):
+        locks.require_enrolled_candidate(token, "agent-web")
 
 
 def test_read_only_get_surfaces_remain_available():
@@ -736,6 +955,11 @@ async def test_database_vacuum_runs_off_the_event_loop(monkeypatch, tmp_path):
         "connect_sqlite",
         lambda *_args, **_kwargs: FakeConnection(),
     )
+
+    async def run(_executor, function, *args, **kwargs):
+        return await asyncio.to_thread(function, *args, **kwargs)
+
+    monkeypatch.setattr(locks, "run_governed_executor", run)
 
     result = await vacuum_module.DBVacuumService().vacuum()
 

@@ -34,6 +34,12 @@ class SchedulerConfig:
 
     # Redis — must embed credentials; no fallback default (Issue #589)
     redis_url: str = field(default_factory=_require_redis_url)
+    redis_socket_connect_timeout: float = field(default_factory=lambda: float(os.getenv(
+        "REDIS_SOCKET_CONNECT_TIMEOUT", "5"
+    )))
+    redis_socket_timeout: float = field(default_factory=lambda: float(os.getenv(
+        "REDIS_SOCKET_TIMEOUT", "5"
+    )))
 
     # Lock settings
     lock_timeout: int = field(default_factory=lambda: int(os.getenv(

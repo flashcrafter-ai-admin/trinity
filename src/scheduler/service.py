@@ -58,6 +58,28 @@ def _describe_exception(e: BaseException) -> str:
 _POLL_DEADLINE_WHEN_NULL = 7200
 
 
+class _AdmissionRedisProxy:
+    """Translate Redis transport failures into the admission contract."""
+
+    def __init__(self, client: redis.Redis):
+        self._client = client
+
+    def __getattr__(self, name: str):
+        attribute = getattr(self._client, name)
+        if not callable(attribute):
+            return attribute
+
+        def call(*args, **kwargs):
+            try:
+                return attribute(*args, **kwargs)
+            except redis.RedisError as exc:
+                raise DeploymentLockUnavailable(
+                    "deployment lock authority is unavailable"
+                ) from exc
+
+        return call
+
+
 class SchedulerService:
     """
     Manages scheduled task execution for agents.
@@ -89,6 +111,7 @@ class SchedulerService:
 
         self.scheduler: Optional[AsyncIOScheduler] = None
         self._redis: Optional[redis.Redis] = None
+        self._admission_redis_client: Optional[_AdmissionRedisProxy] = None
         self._initialized = False
         self._start_time: Optional[datetime] = None
         self._instance_id: str = f"scheduler-{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
@@ -105,14 +128,25 @@ class SchedulerService:
 
         # Issue #132: Track active background polling tasks for graceful shutdown
         self._active_poll_tasks: set = set()
-        self._admission = MutationAdmissionAuthority(lambda: self.redis)
+        self._admission = MutationAdmissionAuthority(lambda: self._admission_redis)
 
     @property
     def redis(self) -> redis.Redis:
         """Get or create Redis connection for events."""
         if self._redis is None:
-            self._redis = redis.from_url(self.redis_url, decode_responses=True)
+            self._redis = redis.from_url(
+                self.redis_url,
+                decode_responses=True,
+                socket_connect_timeout=config.redis_socket_connect_timeout,
+                socket_timeout=config.redis_socket_timeout,
+            )
         return self._redis
+
+    @property
+    def _admission_redis(self) -> _AdmissionRedisProxy:
+        if self._admission_redis_client is None:
+            self._admission_redis_client = _AdmissionRedisProxy(self.redis)
+        return self._admission_redis_client
 
     def initialize(self):
         return self._admission.run_sync(self._initialize_admitted)
@@ -267,6 +301,7 @@ class SchedulerService:
         if self._redis:
             self._redis.close()
             self._redis = None
+            self._admission_redis_client = None
 
         self.lock_manager.close()
 

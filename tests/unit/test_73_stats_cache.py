@@ -27,6 +27,16 @@ from fastapi import HTTPException
 from services.agent_service import stats as stats_mod
 
 
+@pytest.fixture(autouse=True)
+def _docker_mutation_port(monkeypatch):
+    from services import docker_utils
+
+    async def run(_executor, function, *args, **kwargs):
+        return function(*args, **kwargs)
+
+    monkeypatch.setattr(docker_utils, "_governed_executor_runner", run)
+
+
 # --- fakes -----------------------------------------------------------------
 
 # A realistic-enough Docker stats payload so _compute_agent_stats produces a

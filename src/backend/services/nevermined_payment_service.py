@@ -2,7 +2,7 @@
 Nevermined x402 payment service (NVM-001).
 
 Handles verify/settle lifecycle via the payments-py SDK.
-All SDK calls are sync internally, so they are wrapped in asyncio.to_thread().
+SDK calls are synchronous; irreversible settlement uses the governed effect runner.
 """
 
 import asyncio
@@ -210,8 +210,11 @@ class NeverminedPaymentService:
         last_error = None
         for attempt in range(3):
             try:
+                from services.deployment_lock_service import run_governed_executor
+
                 result = await asyncio.wait_for(
-                    asyncio.to_thread(
+                    run_governed_executor(
+                        None,
                         payments.facilitator.settle_permissions,
                         payment_required,
                         access_token,

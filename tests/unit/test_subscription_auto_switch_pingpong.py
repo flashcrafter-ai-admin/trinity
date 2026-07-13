@@ -735,10 +735,12 @@ class TestKeyRolloverFanOut:
     @pytest.fixture
     def auto_switch(self, monkeypatch):
         import importlib
+        import services
 
         stub_db = _install_database_stub()
-        import services.subscription_auto_switch as mod
-        importlib.reload(mod)
+        sys.modules.pop("services.subscription_auto_switch", None)
+        services.__dict__.pop("subscription_auto_switch", None)
+        mod = importlib.import_module("services.subscription_auto_switch")
         mod._stub_db = stub_db  # type: ignore[attr-defined]
         return mod
 

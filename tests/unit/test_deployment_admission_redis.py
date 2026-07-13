@@ -11,6 +11,7 @@ import pytest
 import redis
 
 import deployment_admission as admission
+from services import deployment_lock_service as locks
 
 
 @pytest.fixture
@@ -146,6 +147,75 @@ async def test_heartbeat_loss_cancels_the_mutation_owner(authority, monkeypatch)
     with pytest.raises(admission.DeploymentLockRejected, match="was lost"):
         await asyncio.wait_for(task, timeout=1)
     assert gate.count(admission.ORDINARY_RESERVATIONS_KEY) == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_executor_waits_for_effect_before_ending_child(authority):
+    gate, _ = authority
+    started = threading.Event()
+    finish = threading.Event()
+
+    def effect():
+        started.set()
+        assert finish.wait(timeout=3)
+
+    parent = gate.begin(None)
+    with gate.context(parent):
+        task = asyncio.create_task(gate.run_in_executor(None, effect))
+        assert await asyncio.to_thread(started.wait, 1)
+    gate.end(parent)
+    assert gate.count(admission.ORDINARY_RESERVATIONS_KEY) == 1
+
+    task.cancel()
+    await asyncio.sleep(0.05)
+    assert task.done() is False
+    assert gate.count(admission.ORDINARY_RESERVATIONS_KEY) == 1
+    finish.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert gate.count(admission.ORDINARY_RESERVATIONS_KEY) == 0
+
+
+@pytest.mark.asyncio
+async def test_candidate_mutex_serializes_and_unenrolls_on_real_redis(
+    authority,
+    monkeypatch,
+):
+    _, client = authority
+    monkeypatch.setattr(locks, "get_breaker_redis", lambda: client)
+    _, token = locks.acquire_lock(
+        owner="creator",
+        fleet_lock_digest="a" * 64,
+        agent_names=["agent-web"],
+        ttl_seconds=900,
+    )
+    await locks.activate_lock_after_drain(token)
+    locks.enroll_candidate(token, "agent-web")
+    create_started = asyncio.Event()
+    allow_create = asyncio.Event()
+    rollback_started = asyncio.Event()
+
+    async def create():
+        async with locks.candidate_operation(token, "agent-web"):
+            create_started.set()
+            await allow_create.wait()
+
+    async def rollback():
+        async with locks.candidate_operation(token, "agent-web"):
+            rollback_started.set()
+            locks.unenroll_candidate(token, "agent-web")
+
+    create_task = asyncio.create_task(create())
+    await create_started.wait()
+    rollback_task = asyncio.create_task(rollback())
+    await asyncio.sleep(0.05)
+    assert rollback_started.is_set() is False
+    allow_create.set()
+    await create_task
+    await rollback_task
+
+    with pytest.raises(locks.DeploymentLockRejected, match="not enrolled"):
+        locks.require_enrolled_candidate(token, "agent-web")
 
 
 def test_expired_generation_cannot_damage_replacement(authority, monkeypatch):

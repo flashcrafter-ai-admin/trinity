@@ -22,7 +22,6 @@ operation lock (409 on contention). Three-layer split (Invariant #1):
 business logic stays thin here because the heavy lifting reuses
 ``docker_utils`` (export transport) and the agent-server restore primitive.
 """
-import asyncio
 import base64
 import io
 import json
@@ -259,7 +258,7 @@ async def export_agent_data(
             detail="Agent container is not running; start the agent before exporting its data.",
         )
 
-    loop = asyncio.get_event_loop()
+    from services.deployment_lock_service import run_governed_executor
 
     declared_paths: list[str] = []
     try:
@@ -282,7 +281,7 @@ async def export_agent_data(
                 stream = None
 
             if stream is not None:
-                await loop.run_in_executor(
+                await run_governed_executor(
                     None,
                     _drain_stream_to_file,
                     stream,
@@ -298,7 +297,7 @@ async def export_agent_data(
                 "data_paths": declared_paths,
                 "trinity_version": os.getenv("GIT_COMMIT_SHORT", "unknown"),
             }
-            await loop.run_in_executor(None, _append_manifest, tmp_path, manifest)
+            await run_governed_executor(None, _append_manifest, tmp_path, manifest)
         except _ExportTooLarge:
             _safe_unlink(tmp_path)
             raise HTTPException(

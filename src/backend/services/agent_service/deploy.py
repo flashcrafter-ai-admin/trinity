@@ -567,7 +567,14 @@ async def deploy_local_agent_logic(
         # The `.trinity-initialized` marker tells the agent's startup.sh
         # to skip its `/template` -> `/home/developer` copy (which won't
         # run anyway since no /template bind is set up — see crud.py).
-        _prepopulate_workspace_from_template(version_name, dest_path)
+        from services.deployment_lock_service import run_governed_executor
+
+        await run_governed_executor(
+            None,
+            _prepopulate_workspace_from_template,
+            version_name,
+            dest_path,
+        )
 
         agent_status = await create_agent_fn(
             agent_config,

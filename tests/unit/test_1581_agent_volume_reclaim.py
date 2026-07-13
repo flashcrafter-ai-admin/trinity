@@ -13,7 +13,9 @@ pin the fix:
 from __future__ import annotations
 
 import importlib.util
+import asyncio
 import sys
+from functools import partial
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
@@ -42,6 +44,15 @@ def _load_docker_utils():
         mod = importlib.util.module_from_spec(spec)
         mod.docker_client = mock_client
         spec.loader.exec_module(mod)
+
+        async def run_governed_executor(executor, function, *args, **kwargs):
+            loop = asyncio.get_running_loop()
+            return await loop.run_in_executor(
+                executor,
+                partial(function, *args, **kwargs),
+            )
+
+        mod._governed_executor_runner = run_governed_executor
     return mod, mock_client
 
 

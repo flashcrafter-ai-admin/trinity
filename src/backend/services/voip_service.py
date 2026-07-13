@@ -302,8 +302,10 @@ class VoipService:
 
     async def _dial(self, client, to_number: str, from_number: str, twiml: str):
         """Run the blocking Twilio SDK call off the event loop."""
-        import asyncio
-        return await asyncio.to_thread(
+        from services.deployment_lock_service import run_governed_executor
+
+        return await run_governed_executor(
+            None,
             client.calls.create, to=to_number, from_=from_number, twiml=twiml
         )
 

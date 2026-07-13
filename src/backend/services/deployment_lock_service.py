@@ -8,6 +8,7 @@ import json
 import secrets
 import asyncio
 import re
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable
 
@@ -28,17 +29,35 @@ from deployment_admission import (
 IN_FLIGHT_KEY = ORDINARY_RESERVATIONS_KEY
 LEASE_IN_FLIGHT_PREFIX = LEASE_RESERVATIONS_PREFIX
 ENROLLED_KEY_PREFIX = "trinity:agent-deployment-enrolled:v2:"
+CANDIDATE_OPERATION_KEY_PREFIX = "trinity:agent-deployment-candidate-operation:v2:"
 LOCK_HEADER = "X-Trinity-Deployment-Lock"
 MIN_TTL_SECONDS = 60
 MAX_TTL_SECONDS = 3600
 _MUTATING_GET_PATHS = (
     re.compile(r"^/api/public/slack/oauth/callback$"),
     re.compile(r"^/api/files/[^/]+$"),
+    re.compile(r"^/api/public/intro/[^/]+$"),
+    re.compile(r"^/api/agents/[^/]+/compatibility$"),
 )
 
 
+def _redis_call(operation, *args, **kwargs):
+    try:
+        return operation(*args, **kwargs)
+    except (
+        DeploymentLockUnavailable,
+        DeploymentLockConflict,
+        DeploymentLockRejected,
+    ):
+        raise
+    except Exception as exc:
+        raise DeploymentLockUnavailable(
+            "deployment lock authority command failed"
+        ) from exc
+
+
 def _redis():
-    client = get_breaker_redis()
+    client = _redis_call(get_breaker_redis)
     if client is None:
         raise DeploymentLockUnavailable("deployment lock authority is unavailable")
     return client
@@ -86,7 +105,8 @@ def _parse(raw: str | None) -> Dict[str, Any] | None:
 
 
 def active_lock() -> Dict[str, Any] | None:
-    return _parse(_decode(_redis().get(LOCK_KEY)))
+    client = _redis()
+    return _parse(_decode(_redis_call(client.get, LOCK_KEY)))
 
 
 def mutation_requires_admission(method: str, path: str) -> bool:
@@ -181,7 +201,8 @@ def acquire_lock(
         "phase": "draining",
     }
     raw = json.dumps(state, separators=(",", ":"), sort_keys=True)
-    if not _redis().set(LOCK_KEY, raw, nx=True, ex=ttl_seconds):
+    client = _redis()
+    if not _redis_call(client.set, LOCK_KEY, raw, nx=True, ex=ttl_seconds):
         raise DeploymentLockConflict("another deployment owns the Trinity-wide lock")
     return state, token
 
@@ -195,16 +216,137 @@ def enroll_candidate(token: str | None, agent_name: str) -> Dict[str, Any]:
     state = require_candidate(token, agent_name)
     client = _redis()
     key = _enrolled_key(state)
-    client.sadd(key, agent_name)
-    client.expire(key, int(state["ttlSeconds"]))
+    _redis_call(client.sadd, key, agent_name)
+    _redis_call(client.expire, key, int(state["ttlSeconds"]))
     return state
 
 
 def require_enrolled_candidate(token: str | None, agent_name: str) -> Dict[str, Any]:
     state = require_candidate(token, agent_name)
-    if not _redis().sismember(_enrolled_key(state), agent_name):
+    client = _redis()
+    if not _redis_call(client.sismember, _enrolled_key(state), agent_name):
         raise DeploymentLockRejected("agent was not enrolled by the active deployment lock")
     return state
+
+
+def unenroll_candidate(token: str | None, agent_name: str) -> Dict[str, Any]:
+    """Invalidate a completed rollback so a waiting create cannot resurrect it."""
+    state = require_candidate(token, agent_name)
+    client = _redis()
+    _redis_call(client.srem, _enrolled_key(state), agent_name)
+    return state
+
+
+def _candidate_operation_key(state: Dict[str, Any], agent_name: str) -> str:
+    agent_digest = hashlib.sha256(agent_name.encode()).hexdigest()
+    return (
+        f"{CANDIDATE_OPERATION_KEY_PREFIX}{state['tokenDigest']}:{agent_digest}"
+    )
+
+
+@asynccontextmanager
+async def candidate_operation(
+    token: str | None,
+    agent_name: str,
+    *,
+    require_enrolled: bool = True,
+    timeout_seconds: float = 30.0,
+):
+    """Serialize create, rollback, and enrollment for one lease-bound name."""
+    state = (
+        require_enrolled_candidate(token, agent_name)
+        if require_enrolled
+        else require_candidate(token, agent_name)
+    )
+    client = _redis()
+    key = _candidate_operation_key(state, agent_name)
+    operation_id = secrets.token_urlsafe(32)
+    ttl_seconds = max(30, min(int(state["ttlSeconds"]), 300))
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while not _redis_call(
+        client.set,
+        key,
+        operation_id,
+        nx=True,
+        ex=ttl_seconds,
+    ):
+        if require_enrolled:
+            require_enrolled_candidate(token, agent_name)
+        else:
+            require_candidate(token, agent_name)
+        if asyncio.get_running_loop().time() >= deadline:
+            raise DeploymentLockConflict(
+                "candidate operation did not serialize before timeout"
+            )
+        await asyncio.sleep(0.05)
+
+    owner_task = asyncio.current_task()
+    authority_error: BaseException | None = None
+
+    async def heartbeat() -> None:
+        nonlocal authority_error
+        script = """
+-- trinity:candidate-operation:refresh
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('expire', KEYS[1], ARGV[2])
+end
+return 0
+"""
+        try:
+            while True:
+                await asyncio.sleep(min(10.0, ttl_seconds / 3))
+                refreshed = _redis_call(
+                    client.eval,
+                    script,
+                    1,
+                    key,
+                    operation_id,
+                    ttl_seconds,
+                )
+                if int(refreshed) != 1:
+                    raise DeploymentLockRejected(
+                        "candidate operation serialization was lost"
+                    )
+        except asyncio.CancelledError:
+            raise
+        except BaseException as exc:
+            authority_error = exc
+            if owner_task is not None:
+                owner_task.cancel()
+
+    heartbeat_task = asyncio.create_task(
+        heartbeat(), name=f"candidate-operation-heartbeat:{agent_name}"
+    )
+    try:
+        try:
+            yield state
+        except asyncio.CancelledError:
+            if authority_error is not None:
+                raise authority_error
+            raise
+        if authority_error is not None:
+            raise authority_error
+    finally:
+        heartbeat_task.cancel()
+        await asyncio.gather(heartbeat_task, return_exceptions=True)
+        release_script = """
+-- trinity:candidate-operation:release
+if redis.call('get', KEYS[1]) == ARGV[1] then
+  return redis.call('del', KEYS[1])
+end
+return 0
+"""
+        released = _redis_call(
+            client.eval,
+            release_script,
+            1,
+            key,
+            operation_id,
+        )
+        if int(released) != 1:
+            raise DeploymentLockRejected(
+                "candidate operation serialization was lost"
+            )
 
 
 async def activate_lock_after_drain(token: str, timeout_seconds: float = 30.0) -> Dict[str, Any]:
@@ -220,7 +362,7 @@ async def activate_lock_after_drain(token: str, timeout_seconds: float = 30.0) -
     state = require_lock_token(token, allow_draining=True)
     active = {**state, "phase": "active"}
     client = _redis()
-    current = _decode(client.get(LOCK_KEY))
+    current = _decode(_redis_call(client.get, LOCK_KEY))
     updated = json.dumps(active, separators=(",", ":"), sort_keys=True)
     now = int(datetime.now(timezone.utc).timestamp() * 1000)
     script = """
@@ -232,7 +374,7 @@ if redis.call('get', KEYS[1]) == ARGV[1] and redis.call('zcard', KEYS[2]) == 0 t
 end
 return 0
 """
-    if int(client.eval(script, 2, LOCK_KEY, IN_FLIGHT_KEY, current, updated, state["ttlSeconds"], now)) != 1:
+    if int(_redis_call(client.eval, script, 2, LOCK_KEY, IN_FLIGHT_KEY, current, updated, state["ttlSeconds"], now)) != 1:
         raise DeploymentLockConflict("deployment lock could not activate after drain")
     return active
 
@@ -305,6 +447,15 @@ def governed_background_mutation(function):
     return _AUTHORITY.governed(function)
 
 
+async def run_governed_executor(executor, function, *args, **kwargs):
+    return await _AUTHORITY.run_in_executor(
+        executor,
+        function,
+        *args,
+        **kwargs,
+    )
+
+
 def require_lock_token(token: str | None, *, allow_draining: bool = False) -> Dict[str, Any]:
     state = active_lock()
     if state is None:
@@ -343,14 +494,14 @@ def _abandon_draining_lock(token: str) -> None:
     if state["phase"] != "draining":
         raise DeploymentLockRejected("only a draining deployment lock can be abandoned")
     client = _redis()
-    raw = _decode(client.get(LOCK_KEY))
+    raw = _decode(_redis_call(client.get, LOCK_KEY))
     if raw is None:
         raise DeploymentLockRejected("deployment lock expired before release")
     script = (
         "if redis.call('get', KEYS[1]) == ARGV[1] then "
         "redis.call('del', KEYS[2]); return redis.call('del', KEYS[1]) else return 0 end"
     )
-    if int(client.eval(script, 2, LOCK_KEY, _enrolled_key(state), raw)) != 1:
+    if int(_redis_call(client.eval, script, 2, LOCK_KEY, _enrolled_key(state), raw)) != 1:
         raise DeploymentLockRejected("deployment lock changed before release")
 
 
@@ -362,7 +513,7 @@ async def release_lock_after_drain(
     supplied = hashlib.sha256((token or "").encode()).hexdigest()
     reservation_key = f"{LEASE_IN_FLIGHT_PREFIX}{supplied}"
     client = _redis()
-    current = _decode(client.get(LOCK_KEY))
+    current = _decode(_redis_call(client.get, LOCK_KEY))
     if current is None:
         raise DeploymentLockRejected("deployment lock expired before release")
     if state["phase"] != "releasing":
@@ -372,7 +523,7 @@ async def release_lock_after_drain(
             "if redis.call('get', KEYS[1]) == ARGV[1] then "
             "redis.call('set', KEYS[1], ARGV[2], 'EX', ARGV[3]); return 1 else return 0 end"
         )
-        if int(client.eval(script, 1, LOCK_KEY, current, updated, state["ttlSeconds"])) != 1:
+        if int(_redis_call(client.eval, script, 1, LOCK_KEY, current, updated, state["ttlSeconds"])) != 1:
             raise DeploymentLockRejected("deployment lock changed before release")
         state = releasing
         current = updated
@@ -397,6 +548,6 @@ if redis.call('get', KEYS[1]) == ARGV[1] and redis.call('zcard', KEYS[3]) == 0 t
 end
 return 0
 """
-    if int(client.eval(script, 3, LOCK_KEY, _enrolled_key(state), reservation_key, current, now)) != 1:
+    if int(_redis_call(client.eval, script, 3, LOCK_KEY, _enrolled_key(state), reservation_key, current, now)) != 1:
         raise DeploymentLockRejected("deployment lock changed before drained release")
     return state
