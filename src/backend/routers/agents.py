@@ -50,9 +50,11 @@ from services.deployment_lock_service import (
     DeploymentLockConflict,
     DeploymentLockRejected,
     DeploymentLockUnavailable,
+    activate_lock_after_drain,
     acquire_lock,
+    enroll_candidate,
     release_lock,
-    require_candidate,
+    require_enrolled_candidate,
     require_lock_token,
 )
 from services.deployment_rollback_service import rollback_candidate
@@ -445,6 +447,7 @@ async def acquire_deployment_lock_endpoint(
             agent_names=body.agent_names,
             ttl_seconds=body.ttl_seconds,
         )
+        state = await activate_lock_after_drain(token)
     except DeploymentLockConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
     except DeploymentLockUnavailable as exc:
@@ -503,6 +506,19 @@ async def release_deployment_lock_endpoint(
 @router.post("")
 async def create_agent_endpoint(config: AgentConfig, request: Request, current_user: User = Depends(require_role("creator"))):
     """Create a new agent. Requires creator role or above."""
+    deployment_token = request.headers.get(LOCK_HEADER)
+    if deployment_token:
+        if db.is_agent_name_reserved(config.name) or get_agent_container(config.name) is not None:
+            raise HTTPException(
+                status_code=409,
+                detail="deployment candidate name is not provably absent",
+            )
+        try:
+            enroll_candidate(deployment_token, config.name)
+        except DeploymentLockRejected as exc:
+            raise HTTPException(status_code=423, detail=str(exc)) from exc
+        except DeploymentLockUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc)) from exc
     result = await create_agent_internal(config, current_user, request, skip_name_sanitization=False)
     # SEC-001: audit after successful creation. Failures here swallowed by the service.
     await platform_audit_service.log(
@@ -531,14 +547,16 @@ async def rollback_deployment_candidate_endpoint(
 ):
     """Irreversibly remove one candidate named by the active deployment lease."""
     try:
-        state = require_candidate(request.headers.get(LOCK_HEADER), agent_name)
+        state = require_enrolled_candidate(request.headers.get(LOCK_HEADER), agent_name)
     except DeploymentLockRejected as exc:
         raise HTTPException(status_code=423, detail=str(exc)) from exc
     except DeploymentLockUnavailable as exc:
         raise HTTPException(status_code=503, detail=str(exc)) from exc
     if state["owner"] != current_user.username and current_user.role != "admin":
         raise HTTPException(status_code=403, detail="deployment lock belongs to another creator")
-    if not db.can_user_delete_agent(current_user.username, agent_name):
+    if db.get_agent_owner(agent_name) is not None and not db.can_user_delete_agent(
+        current_user.username, agent_name
+    ):
         raise HTTPException(status_code=403, detail="You don't have permission to delete this agent")
     result = await rollback_candidate(agent_name)
     await platform_audit_service.log(

@@ -41,6 +41,19 @@ from .error_classifier import _is_rate_limit_message
 logger = logging.getLogger(__name__)
 
 
+def normalize_tool_result_status(value):
+    """Make successful Claude tool results explicit in returned raw transcripts."""
+    if isinstance(value, list):
+        for item in value:
+            normalize_tool_result_status(item)
+    elif isinstance(value, dict):
+        if value.get("type") == "tool_result" and "is_error" not in value:
+            value["is_error"] = False
+        for item in value.values():
+            normalize_tool_result_status(item)
+    return value
+
+
 def parse_stream_json_output(output: str) -> tuple[str, List[ExecutionLogEntry], ExecutionMetadata]:
     """
     Parse stream-json output from Claude Code.

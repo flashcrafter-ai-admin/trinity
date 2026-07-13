@@ -26,6 +26,7 @@ from database import db
 from models import ActivityState, TaskExecutionStatus
 from services.agent_auth import build_agent_auth_headers
 from services.capacity_manager import get_capacity_manager
+from services.deployment_lock_service import governed_background_mutation
 from services.slot_service import SLOT_TTL_BUFFER
 from utils.helpers import utc_now, utc_now_iso, parse_iso_timestamp
 from utils.credential_sanitizer import sanitize_text
@@ -294,6 +295,7 @@ class CleanupService:
             self._task = None
         logger.info("Cleanup service stopped")
 
+    @governed_background_mutation
     async def run_cleanup(self) -> CleanupReport:
         """Run a single cleanup cycle. Called by loop and on startup."""
         if self._lock.locked():

@@ -49,7 +49,7 @@ from .jsonl_recovery import (
     _recover_response_from_jsonl,
 )
 from .process_registry import get_process_registry
-from .stream_parser import process_stream_line
+from .stream_parser import normalize_tool_result_status, process_stream_line
 from .subprocess_lifecycle import (
     _capture_pgid,
     _drain_bounded,
@@ -607,7 +607,7 @@ def _run_headless_subprocess(ctx: HeadlessRunContext) -> None:
 
                     if isinstance(raw_msg, dict):
                         # SECURITY: Sanitize credentials from output before storing
-                        raw_msg = sanitize_dict(raw_msg)
+                        raw_msg = normalize_tool_result_status(sanitize_dict(raw_msg))
                         ctx.raw_messages.append(raw_msg)
                         # Publish to live streaming subscribers — isolate
                         # so subscriber-side breakage cannot back-pressure

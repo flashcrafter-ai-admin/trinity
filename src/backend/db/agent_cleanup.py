@@ -253,7 +253,7 @@ def _table_exists(conn, table: str) -> bool:
     return sa_inspect(conn).has_table(table)
 
 
-def cascade_delete(conn, agent_name: str) -> Dict[str, int]:
+def cascade_delete(conn, agent_name: str, *, include_keep: bool = False) -> Dict[str, int]:
     """
     Delete all CASCADE-policy rows referencing this agent.
 
@@ -312,7 +312,7 @@ def cascade_delete(conn, agent_name: str) -> Dict[str, int]:
 
     # Main CASCADE loop
     for ref in AGENT_REFS:
-        if ref.policy != Policy.CASCADE:
+        if ref.policy != Policy.CASCADE and not include_keep:
             continue
         if not _table_exists(conn, ref.table):
             continue
@@ -340,6 +340,116 @@ def cascade_delete(conn, agent_name: str) -> Dict[str, int]:
             deleted[table] = deleted.get(table, 0) + result.rowcount
 
     return deleted
+
+
+def purge_deployment_candidate_state(agent_name: str) -> Dict[str, object]:
+    """Idempotently remove and prove all state for a freshly deployed candidate.
+
+    Unlike normal retention-aware deletion, a failed deployment has no history
+    worth retaining. Both CASCADE and KEEP rows are therefore removed.
+    """
+    from sqlalchemy import delete as sa_delete, func, select as sa_select, text as sa_text
+    from .engine import get_engine
+
+    chained_ids: List[tuple] = []
+    public_session_ids: List[object] = []
+    with get_engine().begin() as conn:
+        for table, link_col, parent_table, parent_col in LINK_CHAINED_DELETES:
+            if not (_table_exists(conn, table) and _table_exists(conn, parent_table)):
+                continue
+            parent = _table(parent_table)
+            ids = [
+                row[0]
+                for row in conn.execute(
+                    sa_select(parent.c.id).where(parent.c[parent_col] == agent_name)
+                ).all()
+            ]
+            if ids:
+                chained_ids.append((table, link_col, ids))
+                if table == "public_chat_sessions" and _table_exists(conn, table):
+                    sessions = _table(table)
+                    public_session_ids.extend(
+                        row[0]
+                        for row in conn.execute(
+                            sa_select(sessions.c.id).where(sessions.c[link_col].in_(ids))
+                        ).all()
+                    )
+
+        deleted = cascade_delete(conn, agent_name, include_keep=True)
+        if _table_exists(conn, "agent_ownership"):
+            ownership = _table("agent_ownership")
+            result = conn.execute(
+                sa_delete(ownership).where(ownership.c.agent_name == agent_name)
+            )
+            deleted["agent_ownership"] = max(0, result.rowcount or 0)
+
+        remaining: Dict[str, int] = {}
+        remaining_keep = 0
+        remaining_mcp = 0
+        remaining_connector = 0
+        for ref in AGENT_REFS:
+            if not _table_exists(conn, ref.table):
+                continue
+            table = _table(ref.table)
+            count = int(
+                conn.execute(
+                    sa_select(func.count()).select_from(table).where(
+                        table.c[ref.column] == agent_name
+                    )
+                ).scalar_one()
+            )
+            key = f"{ref.table}:{ref.column}"
+            remaining[key] = count
+            if ref.policy == Policy.KEEP:
+                remaining_keep += count
+            if ref.table == "mcp_api_keys":
+                remaining_mcp += count
+            if ref.table == "enterprise_connectors":
+                remaining_connector += count
+        for table_name, column in EXTRA_AGENT_REFS:
+            if not _table_exists(conn, table_name):
+                continue
+            count = int(
+                conn.execute(
+                    sa_text(f"SELECT COUNT(*) FROM {table_name} WHERE {column} = :name"),
+                    {"name": agent_name},
+                ).scalar_one()
+            )
+            remaining[f"{table_name}:{column}"] = count
+        for table_name, column, ids in chained_ids:
+            table = _table(table_name)
+            remaining[f"{table_name}:{column}:chained"] = int(
+                conn.execute(
+                    sa_select(func.count()).select_from(table).where(table.c[column].in_(ids))
+                ).scalar_one()
+            )
+        if public_session_ids and _table_exists(conn, "public_chat_messages"):
+            messages = _table("public_chat_messages")
+            remaining["public_chat_messages:session_id:chained"] = int(
+                conn.execute(
+                    sa_select(func.count()).select_from(messages).where(
+                        messages.c.session_id.in_(public_session_ids)
+                    )
+                ).scalar_one()
+            )
+        if _table_exists(conn, "agent_ownership"):
+            ownership = _table("agent_ownership")
+            remaining["agent_ownership:agent_name"] = int(
+                conn.execute(
+                    sa_select(func.count()).select_from(ownership).where(
+                        ownership.c.agent_name == agent_name
+                    )
+                ).scalar_one()
+            )
+
+    return {
+        "deleted": deleted,
+        "remainingByReference": remaining,
+        "remainingRowCount": sum(remaining.values()),
+        "remainingKeepRowCount": remaining_keep,
+        "remainingMcpKeyCount": remaining_mcp,
+        "remainingConnectorConfigCount": remaining_connector,
+    }
 
 
 def cascade_rename(conn, old_name: str, new_name: str) -> Dict[str, int]:

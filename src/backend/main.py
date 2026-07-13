@@ -33,8 +33,9 @@ from services.deployment_lock_service import (
     LOCK_HEADER,
     DeploymentLockRejected,
     DeploymentLockUnavailable,
+    begin_mutation,
+    end_mutation,
     mutation_requires_admission,
-    require_mutation_admission,
 )
 from utils.helpers import utc_now_iso
 
@@ -856,15 +857,20 @@ import uuid as _uuid
 
 @app.middleware("http")
 async def enforce_deployment_lock(request: Request, call_next):
-    """Serialize all agent-affecting mutations while a fleet lease is active."""
+    """Serialize every mutating HTTP entry while a fleet lease is active."""
+    counted = False
     if mutation_requires_admission(request.method, request.url.path):
         try:
-            require_mutation_admission(request.headers.get(LOCK_HEADER))
+            counted = begin_mutation(request.headers.get(LOCK_HEADER))
         except DeploymentLockRejected as exc:
             return JSONResponse(status_code=423, content={"detail": str(exc)})
         except DeploymentLockUnavailable as exc:
             return JSONResponse(status_code=503, content={"detail": str(exc)})
-    return await call_next(request)
+    try:
+        return await call_next(request)
+    finally:
+        if counted:
+            end_mutation(True)
 
 
 @app.middleware("http")

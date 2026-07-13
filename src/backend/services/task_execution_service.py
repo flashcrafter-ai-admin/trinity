@@ -45,6 +45,7 @@ from services.capacity_manager import (
     get_capacity_manager,
 )
 from services.dispatch_breaker import DispatchBreaker
+from services.deployment_lock_service import governed_background_mutation
 from services.platform_audit_service import AuditEventType, platform_audit_service
 from services.settings_service import settings_service
 from utils.credential_sanitizer import sanitize_dict, sanitize_execution_log, sanitize_response, sanitize_text
@@ -865,6 +866,7 @@ class TaskExecutionService:
     credential sanitisation are applied consistently.
     """
 
+    @governed_background_mutation
     async def execute_task(
         self,
         agent_name: str,

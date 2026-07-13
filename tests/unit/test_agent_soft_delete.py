@@ -173,6 +173,33 @@ def test_purge_refuses_live_agent(tmp_agent_db, agent_ops):
     assert _count(tmp_agent_db, "agent_sharing", "agent_name=?", ("alive",)) == 1
 
 
+def test_deployment_candidate_purge_removes_keep_rows_and_inactive_keys(tmp_agent_db):
+    """A failed fresh deployment leaves no retained history or disabled secret."""
+    _seed_into(tmp_agent_db, "candidate")
+    _hrun(
+        "INSERT INTO mcp_api_keys (id, name, key_prefix, key_hash, created_at, user_id, "
+        "agent_name, scope, is_active) VALUES (:id, :n, 'pfx2', :kh, :ts, 1, :n, "
+        "'connector', 0)",
+        id="connector-candidate",
+        n="candidate",
+        kh="hash-connector-candidate",
+        ts=_TS,
+    )
+
+    from db.agent_cleanup import purge_deployment_candidate_state
+
+    proof = purge_deployment_candidate_state("candidate")
+    assert proof["remainingRowCount"] == 0
+    assert proof["remainingKeepRowCount"] == 0
+    assert proof["remainingMcpKeyCount"] == 0
+    assert _count(tmp_agent_db, "schedule_executions", "agent_name=?", ("candidate",)) == 0
+    assert _count(tmp_agent_db, "nevermined_payment_log", "agent_name=?", ("candidate",)) == 0
+    assert _count(tmp_agent_db, "mcp_api_keys", "agent_name=?", ("candidate",)) == 0
+
+    repeated = purge_deployment_candidate_state("candidate")
+    assert repeated["remainingRowCount"] == 0
+
+
 # -----------------------------------------------------------------------------
 # find_soft_deleted_agents_past_retention
 # -----------------------------------------------------------------------------

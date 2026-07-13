@@ -42,7 +42,7 @@ from .error_classifier import (
 from .headless_executor import _attempt_empty_result_recovery, execute_headless_task
 from .process_registry import get_process_registry
 from .runtime_adapter import AgentRuntime, RuntimeCapabilities
-from .stream_parser import process_stream_line
+from .stream_parser import normalize_tool_result_status, process_stream_line
 from .subprocess_lifecycle import (
     _capture_pgid,
     _drain_bounded,
@@ -355,7 +355,7 @@ async def execute_claude_code(prompt: str, stream: bool = False, model: Optional
 
                         if isinstance(raw_msg, dict):
                             # SECURITY: Sanitize credentials from output before storing
-                            raw_msg = sanitize_dict(raw_msg)
+                            raw_msg = normalize_tool_result_status(sanitize_dict(raw_msg))
                             raw_messages.append(raw_msg)
                             try:
                                 registry.publish_log_entry(execution_id, raw_msg)

@@ -23,6 +23,7 @@ from typing import Dict, Optional
 
 from database import db
 from services.agent_client import AgentClient
+from services.deployment_lock_service import governed_background_mutation
 from utils.helpers import utc_now_iso
 
 logger = logging.getLogger(__name__)
@@ -85,6 +86,7 @@ class SyncHealthService:
                 # Test-only: single cycle, then exit.
                 break
 
+    @governed_background_mutation
     async def _poll_cycle(self):
         """One pass over every git-enabled agent."""
         try:

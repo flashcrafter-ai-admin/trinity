@@ -15,6 +15,7 @@ class FakeRedis:
     def __init__(self):
         self.values = {}
         self.runtime_keys = []
+        self.sets = {}
 
     def get(self, key):
         return self.values.get(key)
@@ -25,7 +26,49 @@ class FakeRedis:
         self.values[key] = value
         return True
 
-    def eval(self, _script, _key_count, key, expected):
+    def delete(self, *keys):
+        for key in keys:
+            self.values.pop(key, None)
+            self.sets.pop(key, None)
+
+    def expire(self, _key, _seconds):
+        return True
+
+    def sadd(self, key, value):
+        self.sets.setdefault(key, set()).add(value)
+
+    def sismember(self, key, value):
+        return value in self.sets.get(key, set())
+
+    def eval(self, script, key_count, *args):
+        if key_count == 2 and "return {0, lock}" in script:
+            lock_key, counter_key = args
+            if lock_key in self.values:
+                return [0, self.values[lock_key]]
+            self.values[counter_key] = str(int(self.values.get(counter_key, "0")) + 1)
+            return [1, ""]
+        if key_count == 2 and "ARGV[3]" in script:
+            lock_key, counter_key, expected, updated, _ttl = args
+            if self.values.get(lock_key) != expected or int(self.values.get(counter_key, "0")) != 0:
+                return 0
+            self.values[lock_key] = updated
+            return 1
+        if key_count == 2 and "del', KEYS[2]" in script:
+            lock_key, enrolled_key, expected = args
+            if self.values.get(lock_key) != expected:
+                return 0
+            self.sets.pop(enrolled_key, None)
+            del self.values[lock_key]
+            return 1
+        if key_count == 1 and "decr" in script:
+            key = args[0]
+            value = int(self.values.get(key, "0"))
+            if value <= 1:
+                self.values.pop(key, None)
+                return 0
+            self.values[key] = str(value - 1)
+            return value - 1
+        key, expected = args
         if self.values.get(key) != expected:
             return 0
         del self.values[key]
@@ -37,7 +80,8 @@ class FakeRedis:
         return (key for key in self.runtime_keys if fnmatch.fnmatch(key, match))
 
 
-def test_deployment_lock_is_exclusive_scoped_and_atomically_released(monkeypatch):
+@pytest.mark.asyncio
+async def test_deployment_lock_is_exclusive_scoped_and_atomically_released(monkeypatch):
     redis = FakeRedis()
     monkeypatch.setattr(locks, "get_breaker_redis", lambda: redis)
     state, token = locks.acquire_lock(
@@ -47,8 +91,15 @@ def test_deployment_lock_is_exclusive_scoped_and_atomically_released(monkeypatch
         ttl_seconds=900,
     )
     assert state["agentNames"] == ["agent-seo", "agent-web"]
+    assert state["phase"] == "draining"
+    state = await locks.activate_lock_after_drain(token)
+    assert state["phase"] == "active"
     assert locks.require_mutation_admission(token)["fleetLockDigest"] == "a" * 64
     assert locks.require_candidate(token, "agent-web")["owner"] == "creator"
+    with pytest.raises(locks.DeploymentLockRejected, match="not enrolled"):
+        locks.require_enrolled_candidate(token, "agent-web")
+    locks.enroll_candidate(token, "agent-web")
+    assert locks.require_enrolled_candidate(token, "agent-web")["owner"] == "creator"
     with pytest.raises(locks.DeploymentLockRejected):
         locks.require_mutation_admission("wrong")
     with pytest.raises(locks.DeploymentLockRejected):
@@ -61,9 +112,51 @@ def test_deployment_lock_is_exclusive_scoped_and_atomically_released(monkeypatch
             ttl_seconds=900,
         )
     assert locks.release_lock(token)["fleetLockDigest"] == "a" * 64
+    assert redis.sets == {}
     assert locks.require_mutation_admission(None) is None
     with pytest.raises(locks.DeploymentLockRejected):
         locks.require_mutation_admission(token)
+
+
+@pytest.mark.asyncio
+async def test_lock_drains_preexisting_mutation_and_blocks_new_ones(monkeypatch):
+    redis = FakeRedis()
+    monkeypatch.setattr(locks, "get_breaker_redis", lambda: redis)
+    counted = locks.begin_mutation(None)
+    assert counted is True
+    _, token = locks.acquire_lock(
+        owner="creator",
+        fleet_lock_digest="a" * 64,
+        agent_names=["agent-web"],
+        ttl_seconds=900,
+    )
+    with pytest.raises(locks.DeploymentLockRejected, match="draining"):
+        locks.begin_mutation(None)
+    locks.end_mutation(counted)
+    state = await locks.activate_lock_after_drain(token)
+    assert state["phase"] == "active"
+    with pytest.raises(locks.DeploymentLockRejected, match="token"):
+        locks.begin_mutation(None)
+    assert locks.begin_mutation(token) is False
+
+
+@pytest.mark.asyncio
+async def test_background_mutation_is_counted_and_authority_absence_cannot_hide_a_lease(monkeypatch):
+    redis = FakeRedis()
+    monkeypatch.setattr(locks, "get_breaker_redis", lambda: redis)
+    authority_available = True
+
+    @locks.governed_background_mutation
+    async def job():
+        if authority_available:
+            assert redis.values[locks.IN_FLIGHT_KEY] == "1"
+        return "done"
+
+    assert await job() == "done"
+    assert locks.IN_FLIGHT_KEY not in redis.values
+    authority_available = False
+    monkeypatch.setattr(locks, "get_breaker_redis", lambda: None)
+    assert await job() == "done"
 
 
 def test_deployment_lock_fails_closed_without_authority(monkeypatch):
@@ -83,6 +176,9 @@ def test_deployment_lock_fails_closed_without_authority(monkeypatch):
         "/api/subscriptions/agents/agent-web",
         "/api/admin/soft-deleted/agents/agent-web/recover",
         "/api/monitoring/cleanup-trigger",
+        "/api/mcp",
+        "/internal/execute-task",
+        "/webhooks/provider",
     ],
 )
 def test_all_agent_affecting_mutation_surfaces_require_admission(path):
@@ -116,6 +212,13 @@ async def test_candidate_rollback_requires_complete_absence_proof(
     database.is_agent_name_reserved.return_value = False
     database.get_connector_key_prefix.return_value = None
     database.get_agent_mcp_api_key.return_value = None
+    database_proof = {
+        "remainingRowCount": 0,
+        "remainingKeepRowCount": 0,
+        "remainingMcpKeyCount": 0,
+        "remainingConnectorConfigCount": 0,
+        "remainingByReference": {"agent_ownership:agent_name": 0},
+    }
     monkeypatch.setattr(rollback, "db", database)
     monkeypatch.setattr(
         rollback, "get_agent_container", lambda _name: live_containers.pop(0)
@@ -135,7 +238,9 @@ async def test_candidate_rollback_requires_complete_absence_proof(
     capacity.cancel_all_overflow = AsyncMock()
     with patch(
         "services.capacity_manager.get_capacity_manager", return_value=capacity
-    ), patch("services.agent_runtime_state.clear_agent_runtime_state", AsyncMock()):
+    ), patch("services.agent_runtime_state.clear_agent_runtime_state", AsyncMock()), patch(
+        "db.agent_cleanup.purge_deployment_candidate_state", return_value=database_proof
+    ):
         result = await rollback.rollback_candidate(agent_name)
     assert result["complete"] is True
     assert all(result["proof"].values())
@@ -153,6 +258,13 @@ async def test_candidate_rollback_reports_residual_volume(monkeypatch):
     database.is_agent_name_reserved.return_value = False
     database.get_connector_key_prefix.return_value = None
     database.get_agent_mcp_api_key.return_value = None
+    database_proof = {
+        "remainingRowCount": 0,
+        "remainingKeepRowCount": 0,
+        "remainingMcpKeyCount": 0,
+        "remainingConnectorConfigCount": 0,
+        "remainingByReference": {"agent_ownership:agent_name": 0},
+    }
     monkeypatch.setattr(rollback, "db", database)
     monkeypatch.setattr(rollback, "get_agent_container", lambda _name: None)
     monkeypatch.setattr(rollback, "remove_agent_volumes", AsyncMock(return_value=0))
@@ -162,7 +274,9 @@ async def test_candidate_rollback_reports_residual_volume(monkeypatch):
     capacity.cancel_all_overflow = AsyncMock()
     with patch(
         "services.capacity_manager.get_capacity_manager", return_value=capacity
-    ), patch("services.agent_runtime_state.clear_agent_runtime_state", AsyncMock()):
+    ), patch("services.agent_runtime_state.clear_agent_runtime_state", AsyncMock()), patch(
+        "db.agent_cleanup.purge_deployment_candidate_state", return_value=database_proof
+    ):
         result = await rollback.rollback_candidate(agent_name)
     assert result["complete"] is False
     assert result["proof"]["volumesAbsent"] is False

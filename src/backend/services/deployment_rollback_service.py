@@ -26,6 +26,7 @@ _RUNTIME_KEY_PREFIXES = (
     "agent:slots:",
     "agent:slot:",
     "agent:queue:",
+    "agent:data_op:",
 )
 
 
@@ -50,6 +51,15 @@ def _remaining_runtime_keys(agent_name: str) -> List[str]:
         for key in client.scan_iter(match=f"{prefix}*{agent_name}*"):
             found.add(key.decode() if isinstance(key, bytes) else str(key))
     return sorted(found)
+
+
+def _clear_deployment_runtime_keys(agent_name: str) -> None:
+    client = get_breaker_redis()
+    if client is None:
+        raise RuntimeError("runtime-state authority is unavailable")
+    keys = _remaining_runtime_keys(agent_name)
+    if keys:
+        client.delete(*keys)
 
 
 def _credential_artifacts(agent_name: str) -> List[Path]:
@@ -86,14 +96,23 @@ async def rollback_candidate(agent_name: str) -> Dict[str, Any]:
         from services.agent_runtime_state import clear_agent_runtime_state
 
         await clear_agent_runtime_state(agent_name)
+        _clear_deployment_runtime_keys(agent_name)
     except Exception as exc:  # noqa: BLE001
         errors.append(f"runtime clear: {exc}")
 
-    owner = db.get_agent_owner(agent_name)
-    if owner is not None and not db.delete_agent_ownership(agent_name):
-        errors.append("ownership soft delete failed")
-    if not db.purge_agent_ownership(agent_name):
-        errors.append("ownership hard purge failed")
+    try:
+        from db.agent_cleanup import purge_deployment_candidate_state
+
+        database_proof = purge_deployment_candidate_state(agent_name)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"database purge: {exc}")
+        database_proof = {
+            "remainingRowCount": -1,
+            "remainingKeepRowCount": -1,
+            "remainingMcpKeyCount": -1,
+            "remainingConnectorConfigCount": -1,
+            "remainingByReference": {"proof": -1},
+        }
 
     try:
         await remove_agent_volumes(agent_name)
@@ -121,13 +140,18 @@ async def rollback_candidate(agent_name: str) -> Dict[str, Any]:
         remaining_runtime_keys = ["proof-unavailable"]
     proof = {
         "containerAbsent": get_agent_container(agent_name) is None,
-        "ownershipAbsent": not db.is_agent_name_reserved(agent_name),
-        "connectorKeyAbsent": db.get_connector_key_prefix(agent_name) is None,
-        "agentMcpKeyAbsent": db.get_agent_mcp_api_key(agent_name) is None,
+        "agentRowsAbsent": database_proof["remainingRowCount"] == 0,
+        "ownershipAbsent": database_proof["remainingByReference"].get(
+            "agent_ownership:agent_name", -1
+        ) == 0,
+        "allMcpKeysAbsent": database_proof["remainingMcpKeyCount"] == 0,
+        "connectorConfigAbsent": database_proof["remainingConnectorConfigCount"] == 0,
+        "retainedHistoryAbsent": database_proof["remainingKeepRowCount"] == 0,
         "credentialArtifactsAbsent": not any(
             path.exists() for path in _credential_artifacts(agent_name)
         ),
         "runtimeStateAbsent": len(remaining_runtime_keys) == 0,
+        "dataOperationStateAbsent": len(remaining_runtime_keys) == 0,
         "volumesAbsent": len(remaining_volumes) == 0,
     }
     complete = all(proof.values()) and not errors
@@ -137,5 +161,6 @@ async def rollback_candidate(agent_name: str) -> Dict[str, Any]:
         "proof": proof,
         "remainingVolumes": remaining_volumes,
         "remainingRuntimeKeyCount": len(remaining_runtime_keys),
+        "remainingDatabaseRows": database_proof["remainingByReference"],
         "errors": errors,
     }

@@ -25,6 +25,7 @@ import httpx
 from database import db
 from redis_breaker_util import get_breaker_redis
 from services.agent_auth import agent_httpx_client
+from services.deployment_lock_service import governed_background_mutation
 from services.model_context import DEFAULT_CONTEXT_WINDOW
 from db_models import (
     AgentHealthStatus,
@@ -1033,6 +1034,7 @@ class MonitoringService:
             # which would otherwise spin the loop into a tight flood.
             await asyncio.sleep(max(1, self.config.docker_check_interval))
 
+    @governed_background_mutation
     async def _run_check_cycle(self):
         """Run one cycle of health checks for every Trinity agent.
 
