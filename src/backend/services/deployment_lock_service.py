@@ -7,6 +7,7 @@ import hmac
 import json
 import secrets
 import asyncio
+import re
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable
 
@@ -20,6 +21,8 @@ from deployment_admission import (
     DeploymentLockRejected,
     MutationAdmissionAuthority,
     MutationReservation,
+    assert_current_authority,
+    current_authority_error,
 )
 
 IN_FLIGHT_KEY = ORDINARY_RESERVATIONS_KEY
@@ -28,6 +31,10 @@ ENROLLED_KEY_PREFIX = "trinity:agent-deployment-enrolled:v2:"
 LOCK_HEADER = "X-Trinity-Deployment-Lock"
 MIN_TTL_SECONDS = 60
 MAX_TTL_SECONDS = 3600
+_MUTATING_GET_PATHS = (
+    re.compile(r"^/api/public/slack/oauth/callback$"),
+    re.compile(r"^/api/files/[^/]+$"),
+)
 
 
 def _redis():
@@ -83,11 +90,14 @@ def active_lock() -> Dict[str, Any] | None:
 
 
 def mutation_requires_admission(method: str, path: str) -> bool:
-    if method.upper() not in {"POST", "PUT", "PATCH", "DELETE"}:
+    normalized_method = method.upper()
+    if normalized_method == "GET":
+        return any(pattern.fullmatch(path) for pattern in _MUTATING_GET_PATHS)
+    if normalized_method not in {"POST", "PUT", "PATCH", "DELETE"}:
         return False
-    if method.upper() == "POST" and path == "/api/agents/deployment-lock":
+    if normalized_method == "POST" and path == "/api/agents/deployment-lock":
         return False
-    if method.upper() == "DELETE" and path == "/api/agents/deployment-lock":
+    if normalized_method == "DELETE" and path == "/api/agents/deployment-lock":
         return False
     return True
 
@@ -264,6 +274,31 @@ def reserve_governed_call(function, *args, **kwargs):
 
 def spawn_governed_mutation(coro, *, name: str | None = None) -> asyncio.Task:
     return _AUTHORITY.spawn(coro, name=name)
+
+
+def spawn_mutation_when_admitted(
+    function,
+    *args,
+    retry_seconds: float = 1.0,
+    name: str | None = None,
+    **kwargs,
+) -> asyncio.Task:
+    """Retry admission without holding a reservation, then run exactly once."""
+    return _AUTHORITY.spawn_when_admitted(
+        function,
+        *args,
+        retry_seconds=retry_seconds,
+        name=name,
+        **kwargs,
+    )
+
+
+def mutation_authority_error() -> BaseException | None:
+    return current_authority_error()
+
+
+def require_current_mutation_authority() -> None:
+    assert_current_authority()
 
 
 def governed_background_mutation(function):

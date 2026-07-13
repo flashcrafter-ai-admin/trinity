@@ -26,7 +26,11 @@ from database import db
 from models import ActivityState, TaskExecutionStatus
 from services.agent_auth import build_agent_auth_headers
 from services.capacity_manager import get_capacity_manager
-from services.deployment_lock_service import governed_background_mutation
+from services.deployment_lock_service import (
+    DeploymentLockRejected,
+    DeploymentLockUnavailable,
+    governed_background_mutation,
+)
 from services.slot_service import SLOT_TTL_BUFFER
 from utils.helpers import utc_now, utc_now_iso, parse_iso_timestamp
 from utils.credential_sanitizer import sanitize_text
@@ -1515,20 +1519,33 @@ class CleanupService:
 
     async def _cleanup_loop(self):
         """Main cleanup loop."""
-        await self._run_startup_cleanup_governed()
+        startup_complete = False
+        try:
+            while self._running:
+                if not startup_complete:
+                    try:
+                        await self._run_startup_cleanup_governed()
+                        startup_complete = True
+                    except (DeploymentLockRejected, DeploymentLockUnavailable) as exc:
+                        logger.info("[Cleanup] Startup paused by deployment admission: %s", exc)
+                        await asyncio.sleep(min(1.0, self.poll_interval))
+                        continue
 
-        while self._running:
-            try:
-                await asyncio.sleep(self.poll_interval)
-            except asyncio.CancelledError:
-                break
+                try:
+                    await asyncio.sleep(self.poll_interval)
+                except asyncio.CancelledError:
+                    break
 
-            try:
-                await self.run_cleanup_governed()
-            except asyncio.CancelledError:
-                break
-            except Exception as e:
-                logger.error(f"[Cleanup] Cycle error: {e}")
+                try:
+                    await self.run_cleanup_governed()
+                except asyncio.CancelledError:
+                    break
+                except (DeploymentLockRejected, DeploymentLockUnavailable) as exc:
+                    logger.info("[Cleanup] Cycle paused by deployment admission: %s", exc)
+                except Exception as e:
+                    logger.error(f"[Cleanup] Cycle error: {e}")
+        finally:
+            self._running = False
 
     @governed_background_mutation
     async def _run_startup_cleanup_governed(self) -> None:

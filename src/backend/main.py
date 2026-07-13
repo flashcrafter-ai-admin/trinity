@@ -34,6 +34,7 @@ from services.deployment_lock_service import (
     DeploymentAdmissionMiddleware,
     governed_background_mutation,
     spawn_governed_mutation,
+    spawn_mutation_when_admitted,
 )
 from utils.helpers import utc_now_iso
 
@@ -329,6 +330,15 @@ def setup_opentelemetry(app: FastAPI) -> bool:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan handler."""
+    admission_retry_tasks: list[asyncio.Task] = []
+
+    def retry_mutation(function, *args, name: str, **kwargs) -> asyncio.Task:
+        task = spawn_mutation_when_admitted(
+            function, *args, retry_seconds=1.0, name=name, **kwargs
+        )
+        admission_retry_tasks.append(task)
+        return task
+
     # Set up structured JSON logging (captured by Vector)
     setup_logging()
 
@@ -358,7 +368,9 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error(f"Event bus startup failed (broadcasts will degrade): {e}")
 
-    await platform_audit_service.log(
+    retry_mutation(
+        platform_audit_service.log,
+        name="startup-audit-when-admitted",
         event_type=AuditEventType.SYSTEM,
         event_action="startup",
         source="system",
@@ -396,14 +408,22 @@ async def lifespan(app: FastAPI):
             logger.error(f"Error checking agents: {e}")
 
         # Auto-deploy system agent (Phase 11.1)
-        try:
-            result = await system_agent_service.ensure_deployed_governed()
-            logger.info(f"System agent: {result['action']} - {result['message']}")
-            if result.get('status') == 'error':
-                logger.warning(f"  Warning: System agent deployment issue - {result.get('message')}")
-        except Exception as e:
-            logger.error(f"Error deploying system agent: {e}")
-            # Don't fail startup - system agent is important but not critical for platform operation
+        async def _ensure_system_agent_when_admitted():
+            try:
+                result = await system_agent_service.ensure_deployed_governed()
+                logger.info(f"System agent: {result['action']} - {result['message']}")
+                if result.get('status') == 'error':
+                    logger.warning(
+                        "  Warning: System agent deployment issue - %s",
+                        result.get('message'),
+                    )
+            except Exception as e:
+                logger.error(f"Error deploying system agent: {e}")
+
+        retry_mutation(
+            _ensure_system_agent_when_admitted,
+            name="system-agent-startup-when-admitted",
+        )
 
         # Seed the default Cornelius agent on a fresh install (ent#107). This is the
         # UPGRADE / safety-net path: a fresh install's FIRST seed happens from the
@@ -416,7 +436,10 @@ async def lifespan(app: FastAPI):
         # workers, so scheduling it in every worker is safe.
         try:
             if _db.get_setting_value('setup_completed', 'false') == 'true':
-                spawn_governed_mutation(cornelius_agent_service.ensure_seeded_governed())
+                retry_mutation(
+                    cornelius_agent_service.ensure_seeded_governed,
+                    name="cornelius-seed-when-admitted",
+                )
         except Exception as e:
             logger.error(f"Error scheduling Cornelius seed: {e}")
     else:
@@ -579,22 +602,23 @@ async def lifespan(app: FastAPI):
         mark_startup_recovery_complete,
         recover_orphaned_executions_governed,
     )
-    try:
+    async def _recover_tasks_when_admitted():
         task_recovery = await recover_orphaned_executions_governed()
         if task_recovery["recovered"] > 0:
             logger.info(
-                f"Task execution recovery: "
-                f"recovered={task_recovery['recovered']}, "
-                f"still_running={task_recovery['still_running']}, "
-                f"skipped_grace={task_recovery.get('skipped_grace', 0)}"
+                "Task execution recovery: recovered=%s, still_running=%s, skipped_grace=%s",
+                task_recovery["recovered"],
+                task_recovery["still_running"],
+                task_recovery.get("skipped_grace", 0),
             )
         else:
             logger.info("Task execution recovery: no orphaned executions found")
-    except Exception as e:
-        logger.error(f"Error recovering task executions: {e}")
-        # Don't fail startup - recovery is important but not critical
-    finally:
         mark_startup_recovery_complete()
+
+    retry_mutation(
+        _recover_tasks_when_admitted,
+        name="orphan-recovery-when-admitted",
+    )
 
     # Start Slack channel transport (Socket Mode or webhook)
     try:
@@ -658,16 +682,26 @@ async def lifespan(app: FastAPI):
         from services.settings_service import settings_service
         public_url = settings_service.get_setting("public_chat_url", "")
         if public_url:
-            bindings = _db.get_all_telegram_bindings()
-            for binding in bindings:
-                try:
-                    await register_webhook(binding["agent_name"], public_url)
-                except Exception as we:
-                    logger.warning(f"Telegram webhook reconciliation failed for {binding['agent_name']}: {we}")
-            if bindings:
-                logger.info(f"Telegram transport ready ({len(bindings)} bot(s) registered)")
-            else:
-                logger.info("Telegram transport ready (no bots configured)")
+            async def _reconcile_telegram_webhooks():
+                bindings = _db.get_all_telegram_bindings()
+                for binding in bindings:
+                    try:
+                        await register_webhook(binding["agent_name"], public_url)
+                    except Exception as we:
+                        logger.warning(
+                            "Telegram webhook reconciliation failed for %s: %s",
+                            binding["agent_name"],
+                            we,
+                        )
+                logger.info(
+                    "Telegram transport ready (%s)",
+                    f"{len(bindings)} bot(s) registered" if bindings else "no bots configured",
+                )
+
+            retry_mutation(
+                _reconcile_telegram_webhooks,
+                name="telegram-reconcile-when-admitted",
+            )
         else:
             logger.info("Telegram transport ready (no public URL — webhooks not registered)")
     except Exception as e:
@@ -694,9 +728,21 @@ async def lifespan(app: FastAPI):
         from services.settings_service import settings_service as _settings_svc
         public_url = _settings_svc.get_setting("public_chat_url", "")
         if public_url:
-            backfill_whatsapp_webhook_urls(public_url)
-            bindings = _db.get_all_whatsapp_bindings()
-            logger.info(f"WhatsApp transport ready ({len(bindings)} binding(s); webhook URLs refreshed)")
+            def _backfill_whatsapp_webhooks():
+                backfill_whatsapp_webhook_urls(public_url)
+                bindings = _db.get_all_whatsapp_bindings()
+                logger.info(
+                    "WhatsApp transport ready (%d binding(s); webhook URLs refreshed)",
+                    len(bindings),
+                )
+
+            async def _backfill_whatsapp_webhooks_async():
+                _backfill_whatsapp_webhooks()
+
+            retry_mutation(
+                _backfill_whatsapp_webhooks_async,
+                name="whatsapp-backfill-when-admitted",
+            )
         else:
             logger.info("WhatsApp transport ready (no public URL — webhook URLs not computed)")
     except Exception as e:
@@ -704,6 +750,12 @@ async def lifespan(app: FastAPI):
         # Don't fail startup — WhatsApp is optional
 
     yield
+
+    for task in admission_retry_tasks:
+        if not task.done():
+            task.cancel()
+    if admission_retry_tasks:
+        await asyncio.gather(*admission_retry_tasks, return_exceptions=True)
 
     # NOTE: Embedded scheduler shutdown removed - scheduler runs in dedicated container
     # See: src/scheduler/, docs/memory/feature-flows/scheduler-service.md
@@ -812,7 +864,7 @@ async def lifespan(app: FastAPI):
         logger.error(f"Error closing agent HTTP client pool: {e}")
 
     try:
-        await platform_audit_service.log(
+        await governed_background_mutation(platform_audit_service.log)(
             event_type=AuditEventType.SYSTEM,
             event_action="shutdown",
             source="system",

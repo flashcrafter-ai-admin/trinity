@@ -34,7 +34,10 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from database import db
-from services.deployment_lock_service import spawn_governed_mutation
+from services.deployment_lock_service import (
+    mutation_authority_error,
+    spawn_governed_mutation,
+)
 from services.task_execution_service import (
     TaskExecutionResult,
     get_task_execution_service,
@@ -433,25 +436,28 @@ class LoopService:
                     try:
                         await asyncio.sleep(sleep_for)
                     except asyncio.CancelledError:
+                        if mutation_authority_error() is not None:
+                            raise
                         terminal_status = "stopped"
                         stop_reason = "user_stopped"
                         break
         finally:
-            db.finalize_loop(
-                loop_id,
-                status=terminal_status,
-                stop_reason=stop_reason,
-                error=terminal_error,
-            )
-            await _broadcast({
-                "type": "loop_completed",
-                "loop_id": loop_id,
-                "agent_name": loop["agent_name"],
-                "status": terminal_status,
-                "stop_reason": stop_reason,
-                "runs_completed": runs_completed,
-                "timestamp": datetime.utcnow().isoformat() + "Z",
-            })
+            if mutation_authority_error() is None:
+                db.finalize_loop(
+                    loop_id,
+                    status=terminal_status,
+                    stop_reason=stop_reason,
+                    error=terminal_error,
+                )
+                await _broadcast({
+                    "type": "loop_completed",
+                    "loop_id": loop_id,
+                    "agent_name": loop["agent_name"],
+                    "status": terminal_status,
+                    "stop_reason": stop_reason,
+                    "runs_completed": runs_completed,
+                    "timestamp": datetime.utcnow().isoformat() + "Z",
+                })
             async with self._lock:
                 self._handles.pop(loop_id, None)
 

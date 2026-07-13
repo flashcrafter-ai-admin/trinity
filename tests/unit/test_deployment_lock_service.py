@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import docker
@@ -80,28 +81,30 @@ class FakeRedis:
 
     def eval(self, script, key_count, *args):
         if "trinity:reservation:begin" in script:
-            lock_key, ordinary_key, lease_key, token, digest, now, expiry, reservation_id = args
+            lock_key, ordinary_key, lease_key, now, expiry, reservation_id, expected_lock = args
             self.zremrangebyscore(ordinary_key, "-inf", now)
             raw = self.values.get(lock_key)
             if raw is None:
-                if token:
+                if expected_lock:
                     return [3, ""]
                 self.zadd(ordinary_key, {reservation_id: expiry})
                 return [1, ordinary_key]
+            if raw != expected_lock:
+                return [3, raw]
             state = json.loads(raw)
             if state["phase"] != "active":
                 return [2, raw]
-            if state["tokenDigest"] != digest:
-                return [3, raw]
             self.zremrangebyscore(lease_key, "-inf", now)
             self.zadd(lease_key, {reservation_id: expiry})
             return [1, lease_key]
         if "trinity:reservation:adopt" in script:
-            lock_key, key, parent_id, ordinary_key, digest, now, expiry, child_id = args
+            lock_key, key, parent_id, ordinary_key, expected_lock, now, expiry, child_id = args
             self.zremrangebyscore(key, "-inf", now)
             if self.zscore(key, parent_id) is None:
                 return 0
             raw = self.values.get(lock_key)
+            if (raw or "") != expected_lock:
+                return 0
             if key == ordinary_key:
                 if raw is not None and json.loads(raw)["phase"] != "draining":
                     return 0
@@ -109,16 +112,18 @@ class FakeRedis:
                 if raw is None:
                     return 0
                 state = json.loads(raw)
-                if state["tokenDigest"] != digest or state["phase"] not in {"active", "releasing"}:
+                if state["phase"] not in {"active", "releasing"}:
                     return 0
             self.zadd(key, {child_id: expiry})
             return 1
         if "trinity:reservation:refresh" in script:
-            lock_key, key, reservation_id, ordinary_key, digest, now, expiry = args
+            lock_key, key, reservation_id, ordinary_key, expected_lock, now, expiry = args
             self.zremrangebyscore(key, "-inf", now)
             if self.zscore(key, reservation_id) is None:
                 return 0
             raw = self.values.get(lock_key)
+            if (raw or "") != expected_lock:
+                return 0
             if key == ordinary_key:
                 if raw is not None and json.loads(raw)["phase"] != "draining":
                     return 0
@@ -126,7 +131,7 @@ class FakeRedis:
                 if raw is None:
                     return 0
                 state = json.loads(raw)
-                if state["tokenDigest"] != digest or state["phase"] not in {"active", "releasing"}:
+                if state["phase"] not in {"active", "releasing"}:
                     return 0
             self.zadd(key, {reservation_id: expiry})
             return 1
@@ -538,6 +543,22 @@ def test_all_agent_affecting_mutation_surfaces_require_admission(path):
     assert locks.mutation_requires_admission("GET", path) is False
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/public/slack/oauth/callback",
+        "/api/files/file-1",
+    ],
+)
+def test_write_bearing_get_surfaces_require_admission(path):
+    assert locks.mutation_requires_admission("GET", path) is True
+
+
+def test_read_only_get_surfaces_remain_available():
+    assert locks.mutation_requires_admission("GET", "/api/agents") is False
+    assert locks.mutation_requires_admission("GET", "/api/agents/agent-web/whatsapp") is False
+
+
 def test_lock_lifecycle_endpoints_are_the_only_special_admission_paths():
     assert (
         locks.mutation_requires_admission("POST", "/api/agents/deployment-lock")
@@ -601,6 +622,174 @@ async def test_mutating_websockets_are_rejected_by_an_active_release_lock(
 def test_read_only_websockets_do_not_require_mutation_admission():
     assert locks.websocket_requires_admission("/ws") is False
     assert locks.websocket_requires_admission("/ws/events") is False
+
+
+def test_sqlalchemy_rejects_work_after_reservation_authority_loss(monkeypatch, tmp_path):
+    from sqlalchemy import text
+    from db.engine import _build_engine
+
+    redis = FakeRedis()
+    monkeypatch.setattr(locks, "get_breaker_redis", lambda: redis)
+    engine = _build_engine(f"sqlite:///{tmp_path / 'guarded.db'}")
+    reservation = locks.begin_mutation(None)
+    try:
+        with locks.mutation_admission_context(reservation) as context:
+            context.authority_error = locks.DeploymentLockRejected("reservation lost")
+            with pytest.raises(locks.DeploymentLockRejected, match="reservation lost"):
+                with engine.begin() as connection:
+                    connection.execute(text("CREATE TABLE blocked (id INTEGER)"))
+    finally:
+        locks.end_mutation(reservation)
+        engine.dispose()
+
+
+def test_sqlalchemy_rejects_commit_when_authority_is_lost_after_write(
+    monkeypatch, tmp_path
+):
+    from sqlalchemy import text
+    from db.engine import _build_engine
+
+    redis = FakeRedis()
+    monkeypatch.setattr(locks, "get_breaker_redis", lambda: redis)
+    engine = _build_engine(f"sqlite:///{tmp_path / 'commit-guarded.db'}")
+    with engine.begin() as connection:
+        connection.execute(text("CREATE TABLE guarded (id INTEGER)"))
+
+    reservation = locks.begin_mutation(None)
+    try:
+        with locks.mutation_admission_context(reservation) as context:
+            with engine.connect() as connection:
+                transaction = connection.begin()
+                connection.execute(text("INSERT INTO guarded (id) VALUES (1)"))
+                context.authority_error = locks.DeploymentLockRejected(
+                    "reservation lost before commit"
+                )
+                with pytest.raises(
+                    locks.DeploymentLockRejected,
+                    match="reservation lost before commit",
+                ):
+                    transaction.commit()
+                transaction.rollback()
+    finally:
+        locks.end_mutation(reservation)
+
+    with engine.connect() as connection:
+        assert connection.execute(text("SELECT COUNT(*) FROM guarded")).scalar_one() == 0
+    engine.dispose()
+
+
+def test_raw_sqlite_rejects_commit_when_authority_is_lost_after_write(
+    monkeypatch, tmp_path
+):
+    from db.connection import connect_sqlite
+
+    redis = FakeRedis()
+    monkeypatch.setattr(locks, "get_breaker_redis", lambda: redis)
+    database_path = tmp_path / "raw-commit-guarded.db"
+    with connect_sqlite(str(database_path)) as connection:
+        connection.execute("CREATE TABLE guarded (id INTEGER)")
+
+    reservation = locks.begin_mutation(None)
+    try:
+        with locks.mutation_admission_context(reservation) as context:
+            connection = connect_sqlite(str(database_path))
+            try:
+                connection.execute("INSERT INTO guarded (id) VALUES (1)")
+                context.authority_error = locks.DeploymentLockRejected(
+                    "reservation lost before raw commit"
+                )
+                with pytest.raises(
+                    locks.DeploymentLockRejected,
+                    match="reservation lost before raw commit",
+                ):
+                    connection.commit()
+                connection.rollback()
+            finally:
+                connection.close()
+    finally:
+        locks.end_mutation(reservation)
+
+    with connect_sqlite(str(database_path)) as connection:
+        assert connection.execute("SELECT COUNT(*) FROM guarded").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_database_vacuum_runs_off_the_event_loop(monkeypatch, tmp_path):
+    from services import db_vacuum_service as vacuum_module
+
+    event_loop_thread = threading.get_ident()
+    execution_threads = []
+    database_path = tmp_path / "vacuum.db"
+    database_path.touch()
+
+    class FakeConnection:
+        def execute(self, statement):
+            assert statement == "VACUUM"
+            execution_threads.append(threading.get_ident())
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(vacuum_module, "DB_PATH", str(database_path))
+    monkeypatch.setattr(
+        vacuum_module,
+        "connect_sqlite",
+        lambda *_args, **_kwargs: FakeConnection(),
+    )
+
+    result = await vacuum_module.DBVacuumService().vacuum()
+
+    assert result["status"] == "ok"
+    assert execution_threads and execution_threads[0] != event_loop_thread
+
+
+@pytest.mark.asyncio
+async def test_cleanup_retries_startup_after_admission_release(monkeypatch):
+    service = cleanup_module.CleanupService(poll_interval=0)
+    startup = AsyncMock(
+        side_effect=[locks.DeploymentLockRejected("release active"), None]
+    )
+
+    async def one_cycle():
+        service._running = False
+        return cleanup_module.CleanupReport()
+
+    monkeypatch.setattr(service, "_run_startup_cleanup_governed", startup)
+    monkeypatch.setattr(service, "run_cleanup_governed", one_cycle)
+    service._running = True
+    await service._cleanup_loop()
+
+    assert startup.await_count == 2
+    assert service._running is False
+
+
+@pytest.mark.asyncio
+async def test_retryable_startup_retries_initial_refresh_race(monkeypatch):
+    redis = FakeRedis()
+    authority = locks.MutationAdmissionAuthority(lambda: redis)
+    real_refresh = authority.refresh
+    refresh_attempts = 0
+    operation_calls = 0
+
+    def refresh(reservation):
+        nonlocal refresh_attempts
+        refresh_attempts += 1
+        if refresh_attempts == 1:
+            raise locks.DeploymentLockRejected("reservation lost before start")
+        real_refresh(reservation)
+
+    async def operation():
+        nonlocal operation_calls
+        operation_calls += 1
+        return "ok"
+
+    monkeypatch.setattr(authority, "refresh", refresh)
+
+    result = await authority.run_when_admitted(operation, retry_seconds=0)
+
+    assert result == "ok"
+    assert operation_calls == 1
+    assert authority.count(locks.IN_FLIGHT_KEY) == 0
 
 
 def test_pure_asgi_gate_adopts_real_base_http_route_and_background_tasks(monkeypatch):

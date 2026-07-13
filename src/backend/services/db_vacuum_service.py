@@ -21,6 +21,7 @@ Configuration (env vars):
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import sqlite3
@@ -29,7 +30,7 @@ from typing import Any, Dict
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
-from db.connection import DB_PATH
+from db.connection import DB_PATH, connect_sqlite
 from services.deployment_lock_service import governed_background_mutation
 
 logger = logging.getLogger(__name__)
@@ -87,14 +88,23 @@ class DBVacuumService:
         outcome rather than retry — the next nightly run will catch up.
         """
         size_before = self._db_size_bytes()
-        conn = sqlite3.connect(DB_PATH, timeout=300.0, isolation_level=None)
+
+        def _vacuum() -> None:
+            conn = connect_sqlite(
+                DB_PATH,
+                timeout=300.0,
+                isolation_level=None,
+            )
+            try:
+                conn.execute("VACUUM")
+            finally:
+                conn.close()
+
         try:
-            conn.execute("VACUUM")
+            await asyncio.to_thread(_vacuum)
         except sqlite3.OperationalError as exc:
             logger.warning("VACUUM skipped: %s", exc)
             return {"status": "skipped", "reason": str(exc)}
-        finally:
-            conn.close()
         size_after = self._db_size_bytes()
         reclaimed = size_before - size_after
         logger.info(

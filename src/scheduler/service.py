@@ -21,7 +21,11 @@ import pytz
 import redis
 
 import httpx
-from deployment_admission import MutationAdmissionAuthority
+from deployment_admission import (
+    DeploymentLockRejected,
+    DeploymentLockUnavailable,
+    MutationAdmissionAuthority,
+)
 
 from .config import config
 from .models import Schedule, ScheduleExecution, ExecutionStatus, SchedulerStatus, ProcessSchedule
@@ -298,7 +302,10 @@ class SchedulerService:
                 # Check if it's time to sync schedules
                 now = datetime.utcnow()
                 if (now - last_sync).total_seconds() >= sync_interval:
-                    await self._sync_schedules()
+                    try:
+                        await self._sync_schedules()
+                    except (DeploymentLockRejected, DeploymentLockUnavailable) as exc:
+                        logger.info("Schedule sync paused by deployment admission: %s", exc)
                     last_sync = now
 
                 await asyncio.sleep(heartbeat_interval)

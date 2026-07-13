@@ -31,7 +31,10 @@ from services.activity_service import activity_service
 from services.task_execution_service import get_task_execution_service
 from services.platform_audit_service import platform_audit_service, AuditEventType
 from services import idempotency_service
-from services.deployment_lock_service import spawn_governed_mutation
+from services.deployment_lock_service import (
+    mutation_authority_error,
+    spawn_governed_mutation,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -383,6 +386,8 @@ async def _execute_task_internal_background(task_service, request: InternalTaskE
             f"status={result.status}, execution_id={result.execution_id}"
         )
     except asyncio.CancelledError:
+        if mutation_authority_error() is not None:
+            raise
         # Python 3.11+: CancelledError is BaseException, bypasses except Exception.
         # On backend shutdown, in-flight background tasks are cancelled; close the
         # record synchronously so cleanup_service doesn't inflate duration (#767).

@@ -47,6 +47,7 @@ from services.capacity_manager import (
 from services.dispatch_breaker import DispatchBreaker
 from services.deployment_lock_service import (
     governed_background_mutation,
+    mutation_authority_error,
     spawn_governed_mutation,
 )
 from services.platform_audit_service import AuditEventType, platform_audit_service
@@ -1688,6 +1689,8 @@ class TaskExecutionService:
             )
 
         except asyncio.CancelledError:
+            if mutation_authority_error() is not None:
+                raise
             # Python 3.11+: CancelledError is BaseException, bypasses except Exception.
             # On backend shutdown, background tasks are cancelled; close the record
             # immediately so cleanup_service doesn't inflate duration (#767).
@@ -1713,7 +1716,11 @@ class TaskExecutionService:
             # #1083: on an async 202 handoff the slot lease belongs to the result
             # callback (or the lease reaper) — do NOT release it here, or the turn
             # would run with no capacity reserved and overbook the agent.
-            if slot_acquired and not async_handoff:
+            if (
+                slot_acquired
+                and not async_handoff
+                and mutation_authority_error() is None
+            ):
                 await capacity.release(
                     agent_name,
                     execution_id or f"temp-{datetime.utcnow().timestamp()}",

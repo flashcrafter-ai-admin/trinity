@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import os
+import threading
+import time
 
 import pytest
 import redis
@@ -41,6 +43,67 @@ def test_synchronous_reservation_does_not_require_an_event_loop(authority):
 
     assert gate.run_sync(lambda: "ok") == "ok"
     assert gate.count(admission.ORDINARY_RESERVATIONS_KEY) == 0
+
+
+def test_synchronous_reservation_renews_until_callback_finishes(authority, monkeypatch):
+    gate, _ = authority
+    monkeypatch.setattr(admission, "RESERVATION_TTL_SECONDS", 1)
+    monkeypatch.setattr(admission, "RESERVATION_HEARTBEAT_SECONDS", 0.05)
+    started = threading.Event()
+    finish = threading.Event()
+    results = []
+
+    def operation():
+        started.set()
+        assert finish.wait(timeout=3)
+        return "ok"
+
+    worker = threading.Thread(target=lambda: results.append(gate.run_sync(operation)))
+    worker.start()
+    assert started.wait(timeout=1)
+    time.sleep(1.2)
+    assert gate.count(admission.ORDINARY_RESERVATIONS_KEY) == 1
+    finish.set()
+    worker.join(timeout=2)
+
+    assert results == ["ok"]
+    assert gate.count(admission.ORDINARY_RESERVATIONS_KEY) == 0
+
+
+def test_synchronous_heartbeat_loss_reaches_callback(authority, monkeypatch):
+    gate, client = authority
+    monkeypatch.setattr(admission, "RESERVATION_HEARTBEAT_SECONDS", 0.05)
+    started = threading.Event()
+    finish = threading.Event()
+    errors = []
+
+    def operation():
+        started.set()
+        assert finish.wait(timeout=3)
+        admission.assert_current_authority()
+
+    def run():
+        try:
+            gate.run_sync(operation)
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=run)
+    worker.start()
+    assert started.wait(timeout=1)
+    reservation_id = client.zrange(admission.ORDINARY_RESERVATIONS_KEY, 0, 0)[0]
+    client.zrem(admission.ORDINARY_RESERVATIONS_KEY, reservation_id)
+
+    deadline = time.time() + 1
+    while gate.count(admission.ORDINARY_RESERVATIONS_KEY) != 0 and time.time() < deadline:
+        time.sleep(0.01)
+    time.sleep(0.1)
+    finish.set()
+    worker.join(timeout=2)
+
+    assert len(errors) == 1
+    assert isinstance(errors[0], admission.DeploymentLockRejected)
+    assert "was lost" in str(errors[0])
 
 
 @pytest.mark.asyncio

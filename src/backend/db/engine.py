@@ -19,7 +19,7 @@ import os
 import threading
 from typing import Dict
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.engine import Engine, make_url
 from sqlalchemy.pool import NullPool
 
@@ -58,22 +58,39 @@ def _build_engine(url: str) -> Engine:
         # cross-thread sqlite handle). check_same_thread is disabled because
         # the pool may check a connection in on a different thread than it was
         # checked out on under a threaded uvicorn worker.
-        return create_engine(
+        engine = create_engine(
             url,
             poolclass=NullPool,
             connect_args={"timeout": 30.0, "check_same_thread": False},
             future=True,
             hide_parameters=True,
         )
-    # Server-based backends (PostgreSQL): real connection pooling.
-    return create_engine(
-        url,
-        pool_size=int(os.getenv("DB_POOL_SIZE", "10")),
-        max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "20")),
-        pool_pre_ping=True,
-        future=True,
-        hide_parameters=True,
-    )
+    else:
+        # Server-based backends (PostgreSQL): real connection pooling.
+        engine = create_engine(
+            url,
+            pool_size=int(os.getenv("DB_POOL_SIZE", "10")),
+            max_overflow=int(os.getenv("DB_MAX_OVERFLOW", "20")),
+            pool_pre_ping=True,
+            future=True,
+            hide_parameters=True,
+        )
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def _reject_sql_after_authority_loss(
+        _connection, _cursor, _statement, _parameters, _context, _executemany
+    ) -> None:
+        from deployment_admission import assert_current_authority
+
+        assert_current_authority()
+
+    @event.listens_for(engine, "commit")
+    def _reject_commit_after_authority_loss(_connection) -> None:
+        from deployment_admission import assert_current_authority
+
+        assert_current_authority()
+
+    return engine
 
 
 def get_engine() -> Engine:

@@ -32,7 +32,7 @@
 ### 1.4.1 Governed Fleet Deployment
 - **Status**: Implemented
 - **Description**: Creator-operated fleet releases use one Trinity-wide, expiring deployment lease so agent mutations cannot race a checked inventory transition.
-- **Key Features**: Redis-backed atomic lease acquisition; exact fleet-lock digest and candidate-name binding; unique, renewable, generation-safe mutation reservations; pure-ASGI admission across mutating HTTP and voice/VoIP/terminal WebSockets; the same authority for scheduler, startup, and detached background writes; fail-closed cancellation when reservation authority is lost; and constant-time lease-token verification.
+- **Key Features**: Redis-backed atomic lease acquisition; exact fleet-lock digest and candidate-name binding; unique, renewable, generation-safe async and synchronous mutation reservations; pure-ASGI admission across mutating methods, write-bearing OAuth/download GETs, and voice/VoIP/terminal WebSockets; retryable admission for startup reconciliation and scheduler/cleanup loops; persistence-boundary fencing after reservation loss for SQLite, PostgreSQL, and the standalone scheduler; the same authority for detached background writes; and constant-time lease-token verification before atomic whole-lock snapshot comparison.
 - **Rollback**: A lease owner can hard-purge only a candidate named in the active lease. Success requires machine-checkable absence of its container, ownership and child rows, connector/MCP keys, credential artifacts, runtime state, and persistent volumes; ordinary deletion remains recoverable soft-delete.
 
 ### 1.5 Agent Logs Viewing

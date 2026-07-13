@@ -21,6 +21,18 @@ from .utils import utc_now_iso, to_utc_iso, parse_scheduler_ts
 logger = logging.getLogger(__name__)
 
 
+def _assert_admission_authority() -> None:
+    from deployment_admission import assert_current_authority
+
+    assert_current_authority()
+
+
+class _AdmissionGuardedSqliteConnection(sqlite3.Connection):
+    def commit(self) -> None:
+        _assert_admission_authority()
+        super().commit()
+
+
 def _scheduler_pg_url() -> Optional[str]:
     """Return the PostgreSQL ``DATABASE_URL`` if configured, else None (#300).
 
@@ -90,6 +102,7 @@ class _PgConn:
         return _PgCursor(self._conn.cursor())
 
     def commit(self):
+        _assert_admission_authority()
         self._conn.commit()
 
     def rollback(self):
@@ -129,7 +142,10 @@ class SchedulerDatabase:
             from psycopg2.extras import RealDictCursor
             conn = _PgConn(psycopg2.connect(pg_url, cursor_factory=RealDictCursor))
         else:
-            conn = sqlite3.connect(self.database_path)
+            conn = sqlite3.connect(
+                self.database_path,
+                factory=_AdmissionGuardedSqliteConnection,
+            )
             conn.row_factory = sqlite3.Row
         try:
             yield conn

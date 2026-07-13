@@ -9,6 +9,40 @@ import sqlite3
 from contextlib import contextmanager
 
 
+class _AdmissionGuardedConnection(sqlite3.Connection):
+    """Reject commits after a governed operation loses Redis authority."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.set_progress_handler(self._admission_progress, 1000)
+
+    @staticmethod
+    def _admission_progress() -> int:
+        from deployment_admission import current_authority_error
+
+        return 1 if current_authority_error() is not None else 0
+
+    def execute(self, *args, **kwargs):
+        from deployment_admission import assert_current_authority
+
+        assert_current_authority()
+        return super().execute(*args, **kwargs)
+
+    def commit(self) -> None:
+        from deployment_admission import assert_current_authority
+
+        assert_current_authority()
+        super().commit()
+
+
+def connect_sqlite(path: str | None = None, **kwargs) -> _AdmissionGuardedConnection:
+    return sqlite3.connect(
+        path or DB_PATH,
+        factory=_AdmissionGuardedConnection,
+        **kwargs,
+    )
+
+
 def _resolve_sqlite_path() -> str:
     """Resolve the on-disk SQLite path, honoring a SQLite ``DATABASE_URL`` (#300).
 
@@ -39,7 +73,7 @@ DB_PATH = _resolve_sqlite_path()
 @contextmanager
 def get_db_connection():
     """Context manager for database connections with proper transaction handling."""
-    conn = sqlite3.connect(DB_PATH, timeout=30.0)
+    conn = connect_sqlite(timeout=30.0)
     conn.row_factory = sqlite3.Row
     try:
         yield conn

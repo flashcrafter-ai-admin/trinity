@@ -146,9 +146,8 @@ async def get_whatsapp_binding(
             "public_chat_url is not set in Settings. Configure it, then paste the "
             "generated webhook URL into the Twilio Console."
         )
-    elif not binding.get("webhook_url") or binding.get("webhook_url") != webhook_url:
-        # Backfill DB to match
-        db.update_whatsapp_webhook_url(agent_name, webhook_url)
+    # This GET is a projection only. Persistent backfill runs through the
+    # governed startup reconciliation path.
 
     return WhatsAppBindingResponse(
         agent_name=agent_name,

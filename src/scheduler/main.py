@@ -20,6 +20,7 @@ from typing import Optional
 from urllib.parse import urlparse, urlunparse
 
 from aiohttp import web
+from deployment_admission import DeploymentLockRejected, DeploymentLockUnavailable
 
 from .config import config
 from .service import SchedulerService
@@ -81,7 +82,13 @@ class SchedulerApp:
         await self._start_health_server()
 
         # Initialize and run scheduler
-        self.scheduler_service.initialize()
+        while not self._shutdown_event.is_set():
+            try:
+                self.scheduler_service.initialize()
+                break
+            except (DeploymentLockRejected, DeploymentLockUnavailable) as exc:
+                logger.info("Scheduler initialization paused by deployment admission: %s", exc)
+                await asyncio.sleep(1.0)
 
         # Fire any schedules missed while container was down (Issue #145)
         await self.scheduler_service.fire_missed_schedules()
@@ -197,9 +204,14 @@ class SchedulerApp:
         )
 
         # Execute in background (fire-and-forget)
-        self.scheduler_service._admission.spawn(
-            self._execute_manual_trigger(schedule_id, triggered_by=triggered_by)
-        )
+        try:
+            self.scheduler_service._admission.spawn(
+                self._execute_manual_trigger(schedule_id, triggered_by=triggered_by)
+            )
+        except DeploymentLockRejected as exc:
+            return web.json_response({"error": str(exc)}, status=423)
+        except DeploymentLockUnavailable as exc:
+            return web.json_response({"error": str(exc)}, status=503)
 
         # Return immediately; execution creates its own record asynchronously
         return web.json_response({
@@ -256,7 +268,10 @@ class SchedulerApp:
                     # Check if it's time to sync schedules
                     now = datetime.utcnow()
                     if (now - last_sync).total_seconds() >= sync_interval:
-                        await self.scheduler_service._sync_schedules()
+                        try:
+                            await self.scheduler_service._sync_schedules()
+                        except (DeploymentLockRejected, DeploymentLockUnavailable) as exc:
+                            logger.info("Schedule sync paused by deployment admission: %s", exc)
                         last_sync = now
 
                 await asyncio.sleep(heartbeat_interval)
