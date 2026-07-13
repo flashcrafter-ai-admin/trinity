@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import docker
@@ -30,6 +32,8 @@ class FakeRedis:
         for key in keys:
             self.values.pop(key, None)
             self.sets.pop(key, None)
+            if key in self.runtime_keys:
+                self.runtime_keys.remove(key)
 
     def expire(self, _key, _seconds):
         return True
@@ -41,17 +45,40 @@ class FakeRedis:
         return value in self.sets.get(key, set())
 
     def eval(self, script, key_count, *args):
-        if key_count == 2 and "return {0, lock}" in script:
-            lock_key, counter_key = args
-            if lock_key in self.values:
-                return [0, self.values[lock_key]]
-            self.values[counter_key] = str(int(self.values.get(counter_key, "0")) + 1)
-            return [1, ""]
+        if key_count == 3 and "cjson.decode" in script:
+            lock_key, counter_key, lease_counter, token, digest = args
+            raw = self.values.get(lock_key)
+            if raw is None:
+                if token:
+                    return [3, ""]
+                self.values[counter_key] = str(int(self.values.get(counter_key, "0")) + 1)
+                return [1, counter_key]
+            state = json.loads(raw)
+            if state["phase"] != "active":
+                return [2, raw]
+            if state["tokenDigest"] != digest:
+                return [3, raw]
+            self.values[lease_counter] = str(int(self.values.get(lease_counter, "0")) + 1)
+            return [1, lease_counter]
         if key_count == 2 and "ARGV[3]" in script:
             lock_key, counter_key, expected, updated, _ttl = args
             if self.values.get(lock_key) != expected or int(self.values.get(counter_key, "0")) != 0:
                 return 0
             self.values[lock_key] = updated
+            return 1
+        if key_count == 1 and "ARGV[2]" in script:
+            lock_key, expected, updated, _ttl = args
+            if self.values.get(lock_key) != expected:
+                return 0
+            self.values[lock_key] = updated
+            return 1
+        if key_count == 3 and "KEYS[3]" in script:
+            lock_key, enrolled_key, counter_key, expected = args
+            if self.values.get(lock_key) != expected or int(self.values.get(counter_key, "0")) != 0:
+                return 0
+            self.sets.pop(enrolled_key, None)
+            self.values.pop(counter_key, None)
+            del self.values[lock_key]
             return 1
         if key_count == 2 and "del', KEYS[2]" in script:
             lock_key, enrolled_key, expected = args
@@ -111,7 +138,7 @@ async def test_deployment_lock_is_exclusive_scoped_and_atomically_released(monke
             agent_names=["agent-other"],
             ttl_seconds=900,
         )
-    assert locks.release_lock(token)["fleetLockDigest"] == "a" * 64
+    assert (await locks.release_lock_after_drain(token))["fleetLockDigest"] == "a" * 64
     assert redis.sets == {}
     assert locks.require_mutation_admission(None) is None
     with pytest.raises(locks.DeploymentLockRejected):
@@ -123,40 +150,62 @@ async def test_lock_drains_preexisting_mutation_and_blocks_new_ones(monkeypatch)
     redis = FakeRedis()
     monkeypatch.setattr(locks, "get_breaker_redis", lambda: redis)
     counted = locks.begin_mutation(None)
-    assert counted is True
+    assert counted == locks.IN_FLIGHT_KEY
     _, token = locks.acquire_lock(
         owner="creator",
         fleet_lock_digest="a" * 64,
         agent_names=["agent-web"],
         ttl_seconds=900,
     )
-    with pytest.raises(locks.DeploymentLockRejected, match="draining"):
+    with pytest.raises(locks.DeploymentLockRejected, match="not accepting"):
         locks.begin_mutation(None)
     locks.end_mutation(counted)
     state = await locks.activate_lock_after_drain(token)
     assert state["phase"] == "active"
     with pytest.raises(locks.DeploymentLockRejected, match="token"):
         locks.begin_mutation(None)
-    assert locks.begin_mutation(token) is False
+    lease_counter = locks.begin_mutation(token)
+    assert lease_counter.startswith(locks.LEASE_IN_FLIGHT_PREFIX)
+    locks.end_mutation(lease_counter)
+
+
+@pytest.mark.asyncio
+async def test_release_blocks_new_writes_and_drains_authorized_mutation(monkeypatch):
+    redis = FakeRedis()
+    monkeypatch.setattr(locks, "get_breaker_redis", lambda: redis)
+    _, token = locks.acquire_lock(
+        owner="creator",
+        fleet_lock_digest="a" * 64,
+        agent_names=["agent-web"],
+        ttl_seconds=900,
+    )
+    await locks.activate_lock_after_drain(token)
+    lease_counter = locks.begin_mutation(token)
+    release = asyncio.create_task(locks.release_lock_after_drain(token, timeout_seconds=1))
+    await asyncio.sleep(0.06)
+    assert release.done() is False
+    assert locks.active_lock()["phase"] == "releasing"
+    with pytest.raises(locks.DeploymentLockRejected, match="not accepting"):
+        locks.begin_mutation(token)
+    locks.end_mutation(lease_counter)
+    assert (await release)["phase"] == "releasing"
+    assert locks.active_lock() is None
 
 
 @pytest.mark.asyncio
 async def test_background_mutation_is_counted_and_authority_absence_cannot_hide_a_lease(monkeypatch):
     redis = FakeRedis()
     monkeypatch.setattr(locks, "get_breaker_redis", lambda: redis)
-    authority_available = True
-
     @locks.governed_background_mutation
     async def job():
-        if authority_available:
-            assert redis.values[locks.IN_FLIGHT_KEY] == "1"
+        assert redis.values[locks.IN_FLIGHT_KEY] == "1"
         return "done"
 
     assert await job() == "done"
     assert locks.IN_FLIGHT_KEY not in redis.values
-    authority_available = False
     monkeypatch.setattr(locks, "get_breaker_redis", lambda: None)
-    assert await job() == "done"
+    with pytest.raises(locks.DeploymentLockUnavailable):
+        await job()
 
 
 def test_deployment_lock_fails_closed_without_authority(monkeypatch):
@@ -186,14 +235,14 @@ def test_all_agent_affecting_mutation_surfaces_require_admission(path):
     assert locks.mutation_requires_admission("GET", path) is False
 
 
-def test_lock_acquisition_is_the_only_unlocked_agent_mutation():
+def test_lock_lifecycle_endpoints_are_the_only_special_admission_paths():
     assert (
         locks.mutation_requires_admission("POST", "/api/agents/deployment-lock")
         is False
     )
     assert (
         locks.mutation_requires_admission("DELETE", "/api/agents/deployment-lock")
-        is True
+        is False
     )
 
 
@@ -281,3 +330,24 @@ async def test_candidate_rollback_reports_residual_volume(monkeypatch):
     assert result["complete"] is False
     assert result["proof"]["volumesAbsent"] is False
     assert len(result["remainingVolumes"]) == 3
+
+
+def test_runtime_cleanup_is_exact_for_colliding_agent_names(monkeypatch):
+    redis = FakeRedis()
+    redis.runtime_keys = [
+        "agent:circuit:agent-web",
+        "agent:circuit:agent-web:probe-lock",
+        "agent:slot:agent-web:execution-1",
+        "agent:queue:agent-web",
+        "agent:circuit:agent-web-2",
+        "agent:slot:agent-web-2:execution-1",
+        "agent:queue:agent-web-2",
+    ]
+    monkeypatch.setattr(rollback, "get_breaker_redis", lambda: redis)
+    rollback._clear_deployment_runtime_keys("agent-web")
+    assert rollback._remaining_runtime_keys("agent-web") == []
+    assert sorted(redis.runtime_keys) == [
+        "agent:circuit:agent-web-2",
+        "agent:queue:agent-web-2",
+        "agent:slot:agent-web-2:execution-1",
+    ]

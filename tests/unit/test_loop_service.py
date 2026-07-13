@@ -198,6 +198,9 @@ class _FakeTaskService:
         self._idx += 1
         return result
 
+    async def execute_task_governed(self, **kwargs):
+        return await self.execute_task(**kwargs)
+
 
 # ---------------------------------------------------------------------------
 # Fixtures

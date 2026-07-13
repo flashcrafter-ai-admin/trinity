@@ -124,7 +124,7 @@ class FanOutService:
                     # execution_timeout_seconds (TIMEOUT-001). The optional
                     # overall `timeout_seconds` parameter governs the outer
                     # fan-out deadline, not the individual task ceiling.
-                    result = await task_service.execute_task(
+                    result = await task_service.execute_task_governed(
                         agent_name=agent_name,
                         message=task.message,
                         triggered_by="fan_out",

@@ -71,7 +71,7 @@ class SyncHealthService:
     async def _poll_loop(self):
         while self._running:
             try:
-                await self._poll_cycle()
+                await self._poll_cycle_governed()
             except asyncio.CancelledError:
                 break
             except Exception:
@@ -86,7 +86,6 @@ class SyncHealthService:
                 # Test-only: single cycle, then exit.
                 break
 
-    @governed_background_mutation
     async def _poll_cycle(self):
         """One pass over every git-enabled agent."""
         try:
@@ -100,6 +99,10 @@ class SyncHealthService:
 
         tasks = [self._sync_agent(cfg) for cfg in configs]
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    @governed_background_mutation
+    async def _poll_cycle_governed(self):
+        return await self._poll_cycle()
 
     async def _sync_agent(self, config) -> None:
         """Pull one agent's git status, upsert DB, maybe alert."""

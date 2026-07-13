@@ -113,7 +113,7 @@ def test_email_registered_and_intake_scheduled(patched):
     funcs = _task_funcs(bg)
     assert setup.submit_operator_intake in funcs  # intake scheduled (consent)
     # ent#107: Cornelius seed is always scheduled after setup completes.
-    assert setup.cornelius_agent_service.ensure_seeded in funcs
+    assert setup.cornelius_agent_service.ensure_seeded_governed in funcs
 
 
 def test_email_only_completes_setup_cleanly(patched):
@@ -128,7 +128,7 @@ def test_email_only_completes_setup_cleanly(patched):
     assert patched.settings["setup_completed"] == "true"
     funcs = _task_funcs(bg)
     assert setup.submit_operator_intake not in funcs  # no consent → no intake
-    assert setup.cornelius_agent_service.ensure_seeded in funcs  # ent#107
+    assert setup.cornelius_agent_service.ensure_seeded_governed in funcs  # ent#107
 
 
 def test_email_without_consent_registers_but_no_intake(patched):
@@ -140,7 +140,7 @@ def test_email_without_consent_registers_but_no_intake(patched):
     assert patched.users["admin"]["email"] == "me@acme.com"
     funcs = _task_funcs(bg)
     assert setup.submit_operator_intake not in funcs  # no consent → no intake
-    assert setup.cornelius_agent_service.ensure_seeded in funcs  # ent#107
+    assert setup.cornelius_agent_service.ensure_seeded_governed in funcs  # ent#107
 
 
 def test_invalid_email_rejected_before_any_write(patched):

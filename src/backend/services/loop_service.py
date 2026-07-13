@@ -269,7 +269,7 @@ class LoopService:
                 run_start = datetime.utcnow()
 
                 try:
-                    result: TaskExecutionResult = await task_service.execute_task(
+                    result: TaskExecutionResult = await task_service.execute_task_governed(
                         agent_name=loop["agent_name"],
                         message=rendered,
                         triggered_by="loop",

@@ -137,7 +137,7 @@ async def set_admin_password(
     # so it runs AFTER the response is sent: a container create must never delay or
     # break setup. The service is idempotent, first-run-only, and fresh-install-
     # scoped, so this can never double-provision or surprise an established fleet.
-    background_tasks.add_task(cornelius_agent_service.ensure_seeded)
+    background_tasks.add_task(cornelius_agent_service.ensure_seeded_governed)
 
     # Operator intake (trinity-enterprise#38): only on affirmative consent.
     # Scheduled as a background task so it runs AFTER the response is sent — it

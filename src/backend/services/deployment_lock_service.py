@@ -15,6 +15,7 @@ from redis_breaker_util import get_breaker_redis
 
 LOCK_KEY = "trinity:agent-deployment-lock:v1"
 IN_FLIGHT_KEY = "trinity:agent-deployment-mutations:v1"
+LEASE_IN_FLIGHT_PREFIX = "trinity:agent-deployment-lease-mutations:v1:"
 ENROLLED_KEY_PREFIX = "trinity:agent-deployment-enrolled:v1:"
 LOCK_HEADER = "X-Trinity-Deployment-Lock"
 MIN_TTL_SECONDS = 60
@@ -67,7 +68,7 @@ def _parse(raw: str | None) -> Dict[str, Any] | None:
         not isinstance(state, dict)
         or set(state) != required
         or state.get("schemaVersion") != "trinity-agent-deployment-lock/1"
-        or state.get("phase") not in {"draining", "active"}
+        or state.get("phase") not in {"draining", "active", "releasing"}
         or not isinstance(state.get("agentNames"), list)
     ):
         raise DeploymentLockUnavailable(
@@ -84,6 +85,8 @@ def mutation_requires_admission(method: str, path: str) -> bool:
     if method.upper() not in {"POST", "PUT", "PATCH", "DELETE"}:
         return False
     if method.upper() == "POST" and path == "/api/agents/deployment-lock":
+        return False
+    if method.upper() == "DELETE" and path == "/api/agents/deployment-lock":
         return False
     return True
 
@@ -151,7 +154,7 @@ async def activate_lock_after_drain(token: str, timeout_seconds: float = 30.0) -
     while _counter_value() != 0:
         if asyncio.get_running_loop().time() >= deadline:
             try:
-                release_lock(token)
+                _abandon_draining_lock(token)
             finally:
                 raise DeploymentLockConflict("preexisting mutations did not drain before timeout")
         await asyncio.sleep(0.05)
@@ -170,53 +173,50 @@ async def activate_lock_after_drain(token: str, timeout_seconds: float = 30.0) -
     return active
 
 
-def begin_mutation(token: str | None) -> bool:
-    """Atomically admit a mutation, returning True when it owns an in-flight slot."""
+def begin_mutation(token: str | None) -> str:
+    """Atomically admit and count either an ordinary or lease-authorized mutation."""
     client = _redis()
+    supplied = hashlib.sha256((token or "").encode()).hexdigest()
+    lease_counter = f"{LEASE_IN_FLIGHT_PREFIX}{supplied}"
     script = (
         "local lock = redis.call('get', KEYS[1]); "
-        "if lock then return {0, lock} end; "
-        "redis.call('incr', KEYS[2]); redis.call('expire', KEYS[2], 3600); return {1, ''}"
+        "if not lock then "
+        "if ARGV[1] ~= '' then return {3, ''} end; "
+        "redis.call('incr', KEYS[2]); redis.call('expire', KEYS[2], 3600); return {1, KEYS[2]} end; "
+        "local state = cjson.decode(lock); "
+        "if state['phase'] ~= 'active' then return {2, lock} end; "
+        "if state['tokenDigest'] ~= ARGV[2] then return {3, lock} end; "
+        "redis.call('incr', KEYS[3]); redis.call('expire', KEYS[3], state['ttlSeconds']); "
+        "return {1, KEYS[3]}"
     )
-    result = client.eval(script, 2, LOCK_KEY, IN_FLIGHT_KEY)
+    result = client.eval(script, 3, LOCK_KEY, IN_FLIGHT_KEY, lease_counter, token or "", supplied)
     if not isinstance(result, (list, tuple)) or len(result) != 2:
         raise DeploymentLockUnavailable("deployment mutation admission returned invalid state")
-    counted = int(result[0]) == 1
-    if counted:
-        if token:
-            end_mutation(True)
-            raise DeploymentLockRejected("deployment lock is absent or expired")
-        return True
-    state = _parse(_decode(result[1]))
-    if state is None or state["phase"] != "active":
-        raise DeploymentLockRejected("deployment lock is still draining")
-    supplied = hashlib.sha256((token or "").encode()).hexdigest()
-    if not hmac.compare_digest(supplied, str(state["tokenDigest"])):
-        raise DeploymentLockRejected("active deployment lock token is required")
-    return False
+    code = int(result[0])
+    if code == 1:
+        counter_key = _decode(result[1])
+        if not counter_key:
+            raise DeploymentLockUnavailable("deployment mutation admission omitted its counter")
+        return counter_key
+    if code == 2:
+        raise DeploymentLockRejected("deployment lock is not accepting mutations")
+    raise DeploymentLockRejected("active deployment lock token is required")
 
 
-def end_mutation(counted: bool) -> None:
-    if not counted:
-        return
+def end_mutation(counter_key: str) -> None:
     script = (
         "local n = tonumber(redis.call('get', KEYS[1]) or '0'); "
         "if n <= 1 then redis.call('del', KEYS[1]); return 0 end; "
         "return redis.call('decr', KEYS[1])"
     )
-    _redis().eval(script, 1, IN_FLIGHT_KEY)
+    _redis().eval(script, 1, counter_key)
 
 
 def governed_background_mutation(function):
     """Count non-HTTP mutation jobs so lease acquisition drains them too."""
     @wraps(function)
     async def wrapped(*args, **kwargs):
-        try:
-            counted = begin_mutation(None)
-        except DeploymentLockUnavailable:
-            # No lease can be acquired without this same authority, so there is
-            # no deployment to race. Preserve ordinary background operation.
-            return await function(*args, **kwargs)
+        counted = begin_mutation(None)
         try:
             return await function(*args, **kwargs)
         finally:
@@ -258,8 +258,10 @@ def require_candidate(token: str | None, agent_name: str) -> Dict[str, Any]:
     return state
 
 
-def release_lock(token: str | None) -> Dict[str, Any]:
+def _abandon_draining_lock(token: str) -> None:
     state = require_lock_token(token, allow_draining=True)
+    if state["phase"] != "draining":
+        raise DeploymentLockRejected("only a draining deployment lock can be abandoned")
     client = _redis()
     raw = _decode(client.get(LOCK_KEY))
     if raw is None:
@@ -270,4 +272,52 @@ def release_lock(token: str | None) -> Dict[str, Any]:
     )
     if int(client.eval(script, 2, LOCK_KEY, _enrolled_key(state), raw)) != 1:
         raise DeploymentLockRejected("deployment lock changed before release")
+
+
+async def release_lock_after_drain(
+    token: str | None, timeout_seconds: float = 30.0
+) -> Dict[str, Any]:
+    """Stop new lease writes, drain admitted ones, then atomically remove the lease."""
+    state = require_lock_token(token, allow_draining=True)
+    supplied = hashlib.sha256((token or "").encode()).hexdigest()
+    counter_key = f"{LEASE_IN_FLIGHT_PREFIX}{supplied}"
+    client = _redis()
+    current = _decode(client.get(LOCK_KEY))
+    if current is None:
+        raise DeploymentLockRejected("deployment lock expired before release")
+    if state["phase"] != "releasing":
+        releasing = {**state, "phase": "releasing"}
+        updated = json.dumps(releasing, separators=(",", ":"), sort_keys=True)
+        script = (
+            "if redis.call('get', KEYS[1]) == ARGV[1] then "
+            "redis.call('set', KEYS[1], ARGV[2], 'EX', ARGV[3]); return 1 else return 0 end"
+        )
+        if int(client.eval(script, 1, LOCK_KEY, current, updated, state["ttlSeconds"])) != 1:
+            raise DeploymentLockRejected("deployment lock changed before release")
+        state = releasing
+        current = updated
+
+    deadline = asyncio.get_running_loop().time() + timeout_seconds
+    while True:
+        raw_count = _decode(client.get(counter_key))
+        try:
+            count = max(0, int(raw_count or "0"))
+        except ValueError as exc:
+            raise DeploymentLockUnavailable(
+                "deployment lease mutation counter contains invalid state"
+            ) from exc
+        if count == 0:
+            break
+        if asyncio.get_running_loop().time() >= deadline:
+            raise DeploymentLockConflict("lease-authorized mutations did not drain before timeout")
+        await asyncio.sleep(0.05)
+
+    script = (
+        "if redis.call('get', KEYS[1]) == ARGV[1] and "
+        "tonumber(redis.call('get', KEYS[3]) or '0') == 0 then "
+        "redis.call('del', KEYS[2]); redis.call('del', KEYS[3]); "
+        "return redis.call('del', KEYS[1]) else return 0 end"
+    )
+    if int(client.eval(script, 3, LOCK_KEY, _enrolled_key(state), counter_key, current)) != 1:
+        raise DeploymentLockRejected("deployment lock changed before drained release")
     return state

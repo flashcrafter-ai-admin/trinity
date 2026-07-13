@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from services.deployment_lock_service import governed_background_mutation
 import re
 import shlex
 from dataclasses import dataclass, field
@@ -126,7 +127,7 @@ class SessionCleanupService:
         await asyncio.sleep(60)
         while self._running:
             try:
-                await self.run_cycle()
+                await self._run_cycle_governed()
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -146,6 +147,10 @@ class SessionCleanupService:
 
         async with self._lock:
             return await self._run_cycle_inner()
+
+    @governed_background_mutation
+    async def _run_cycle_governed(self) -> SessionCleanupReport:
+        return await self.run_cycle()
 
     async def _run_cycle_inner(self) -> SessionCleanupReport:
         report = SessionCleanupReport(started_at=datetime.now(timezone.utc).isoformat())

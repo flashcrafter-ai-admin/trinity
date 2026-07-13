@@ -22,6 +22,7 @@ from services.docker_service import (
 )
 from services.docker_utils import container_reload, container_start, containers_run
 from services.agent_runtime_state import clear_agent_breakers
+from services.deployment_lock_service import governed_background_mutation
 from services.settings_service import get_anthropic_api_key
 from services.agent_service.lifecycle import FULL_CAPABILITIES, AGENT_TMPFS_MOUNT, AGENT_DEFAULT_TMPDIR
 from services.agent_service.capabilities import normalize_cpu, normalize_memory
@@ -120,6 +121,11 @@ class SystemAgentService:
             result["message"] = f"Failed to create system agent: {e}"
             logger.error(f"Failed to create system agent: {e}")
             return result
+
+    @governed_background_mutation
+    async def ensure_deployed_governed(self) -> dict:
+        """Background-only admission wrapper for startup reconciliation."""
+        return await self.ensure_deployed()
 
     async def _create_system_agent(self) -> dict:
         """

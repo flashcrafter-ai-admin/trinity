@@ -866,7 +866,6 @@ class TaskExecutionService:
     credential sanitisation are applied consistently.
     """
 
-    @governed_background_mutation
     async def execute_task(
         self,
         agent_name: str,
@@ -1960,6 +1959,11 @@ class TaskExecutionService:
             context_used=salvage_context,
             context_max=salvage_context_max,
         )
+
+    @governed_background_mutation
+    async def execute_task_governed(self, *args, **kwargs) -> TaskExecutionResult:
+        """Admission wrapper for autonomous executions outside HTTP middleware."""
+        return await self.execute_task(*args, **kwargs)
 
 
 # ---------------------------------------------------------------------------

@@ -20,6 +20,7 @@ import logging
 from typing import Optional
 
 from database import db
+from services.deployment_lock_service import governed_background_mutation
 from services.agent_client import AgentClient
 
 logger = logging.getLogger(__name__)
@@ -77,7 +78,7 @@ class OperatorQueueSyncService:
         """Main polling loop."""
         while self._running:
             try:
-                await self._poll_cycle()
+                await self._poll_cycle_governed()
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -110,6 +111,10 @@ class OperatorQueueSyncService:
         # Sync each agent concurrently (with a reasonable limit)
         tasks = [self._sync_agent(name) for name in running_agents]
         await asyncio.gather(*tasks, return_exceptions=True)
+
+    @governed_background_mutation
+    async def _poll_cycle_governed(self):
+        return await self._poll_cycle()
 
     async def _sync_agent(self, agent_name: str):
         """Sync a single agent's operator queue file."""

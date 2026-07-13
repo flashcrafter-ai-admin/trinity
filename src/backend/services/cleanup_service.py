@@ -295,7 +295,6 @@ class CleanupService:
             self._task = None
         logger.info("Cleanup service stopped")
 
-    @governed_background_mutation
     async def run_cleanup(self) -> CleanupReport:
         """Run a single cleanup cycle. Called by loop and on startup."""
         if self._lock.locked():
@@ -303,6 +302,10 @@ class CleanupService:
             return self.last_report or CleanupReport()
         async with self._lock:
             return await self._run_cleanup_inner()
+
+    @governed_background_mutation
+    async def run_cleanup_governed(self) -> CleanupReport:
+        return await self.run_cleanup()
 
     async def _run_cleanup_inner(self) -> CleanupReport:
         """Inner cleanup logic, called under lock.
@@ -1526,7 +1529,7 @@ class CleanupService:
 
         # Run initial cleanup on startup
         try:
-            startup_report = await self.run_cleanup()
+            startup_report = await self.run_cleanup_governed()
             if startup_report.total > 0:
                 logger.info(f"[Cleanup] Startup sweep: {startup_report.to_dict()}")
             else:
@@ -1541,7 +1544,7 @@ class CleanupService:
                 break
 
             try:
-                await self.run_cleanup()
+                await self.run_cleanup_governed()
             except asyncio.CancelledError:
                 break
             except Exception as e:

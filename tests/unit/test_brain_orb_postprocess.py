@@ -89,7 +89,9 @@ def test_dispatch_creates_execution_and_backgrounds_run():
         fake_db = types.SimpleNamespace(
             create_task_execution=lambda **kw: types.SimpleNamespace(id="exec-7", kwargs=kw)
         )
-        fake_svc = types.SimpleNamespace(execute_task=execute)
+        fake_svc = types.SimpleNamespace(
+            execute_task=execute, execute_task_governed=execute
+        )
         with patch.object(pp, "read_postprocess_config", _enabled_cfg()), \
              patch("database.db", fake_db), \
              patch("services.task_execution_service.get_task_execution_service",
@@ -141,7 +143,9 @@ def test_dispatch_execute_task_error_contained():
         fake_db = types.SimpleNamespace(
             create_task_execution=lambda **kw: types.SimpleNamespace(id="exec-8")
         )
-        fake_svc = types.SimpleNamespace(execute_task=execute)
+        fake_svc = types.SimpleNamespace(
+            execute_task=execute, execute_task_governed=execute
+        )
         with patch.object(pp, "read_postprocess_config", _enabled_cfg()), \
              patch("database.db", fake_db), \
              patch("services.task_execution_service.get_task_execution_service",

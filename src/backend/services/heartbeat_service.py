@@ -362,6 +362,15 @@ def process_watch_tick() -> List[Tuple[str, str]]:
     return transitions
 
 
+from services.deployment_lock_service import governed_background_mutation
+
+
+@governed_background_mutation
+async def _run_heartbeat_watch_tick() -> None:
+    for name, kind in process_watch_tick():
+        await _emit_heartbeat_alert(name, kind)
+
+
 async def run_heartbeat_watch_loop(interval_seconds: int = HEARTBEAT_WATCH_INTERVAL_SECONDS) -> None:
     """Background loop: actively alert on agents that stop heartbeating.
 
@@ -372,8 +381,7 @@ async def run_heartbeat_watch_loop(interval_seconds: int = HEARTBEAT_WATCH_INTER
     await asyncio.sleep(interval_seconds)
     while True:
         try:
-            for name, kind in process_watch_tick():
-                await _emit_heartbeat_alert(name, kind)
+            await _run_heartbeat_watch_tick()
         except Exception:  # noqa: BLE001 — loop must never die
             logger.exception("heartbeat watch tick raised unexpectedly")
         await asyncio.sleep(interval_seconds)

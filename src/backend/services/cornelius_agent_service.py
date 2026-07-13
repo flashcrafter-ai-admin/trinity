@@ -39,6 +39,7 @@ from database import db
 from models import AgentConfig, User
 from services.docker_service import docker_client
 from redis_breaker_util import get_breaker_redis
+from services.deployment_lock_service import governed_background_mutation
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +142,11 @@ class CorneliusAgentService:
             return result
         finally:
             self._release_lock()
+
+    @governed_background_mutation
+    async def ensure_seeded_governed(self) -> dict:
+        """Background-only admission wrapper for setup and startup seeding."""
+        return await self.ensure_seeded()
 
     async def _provision(self, admin_user: User) -> None:
         """Create the Cornelius agent from the bundled local template.

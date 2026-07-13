@@ -140,7 +140,7 @@ async def dispatch_postprocess(
 
         async def _run() -> None:
             try:
-                await svc.execute_task(
+                await svc.execute_task_governed(
                     agent_name=agent_name,
                     message=message,
                     triggered_by="voice",

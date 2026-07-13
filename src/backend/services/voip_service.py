@@ -370,7 +370,7 @@ class VoipService:
         try:
             from services.task_execution_service import get_task_execution_service
             svc = get_task_execution_service()
-            await svc.execute_task(
+            await svc.execute_task_governed(
                 agent_name=agent_name,
                 message=message,
                 triggered_by="voip",

@@ -53,7 +53,7 @@ from services.deployment_lock_service import (
     activate_lock_after_drain,
     acquire_lock,
     enroll_candidate,
-    release_lock,
+    release_lock_after_drain,
     require_enrolled_candidate,
     require_lock_token,
 )
@@ -479,7 +479,7 @@ async def release_deployment_lock_endpoint(
 ):
     """Release the active deployment lease using its unlogged bearer token."""
     try:
-        state = require_lock_token(request.headers.get(LOCK_HEADER))
+        state = require_lock_token(request.headers.get(LOCK_HEADER), allow_draining=True)
     except DeploymentLockRejected as exc:
         raise HTTPException(status_code=423, detail=str(exc)) from exc
     except DeploymentLockUnavailable as exc:
@@ -487,9 +487,11 @@ async def release_deployment_lock_endpoint(
     if state["owner"] != current_user.username and current_user.role != "admin":
         raise HTTPException(status_code=403, detail="deployment lock belongs to another creator")
     try:
-        release_lock(request.headers.get(LOCK_HEADER))
-    except DeploymentLockRejected as exc:
+        await release_lock_after_drain(request.headers.get(LOCK_HEADER))
+    except (DeploymentLockRejected, DeploymentLockConflict) as exc:
         raise HTTPException(status_code=423, detail=str(exc)) from exc
+    except DeploymentLockUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     await platform_audit_service.log(
         event_type=AuditEventType.AGENT_LIFECYCLE,
         event_action="deployment_lock_release",
@@ -503,6 +505,33 @@ async def release_deployment_lock_endpoint(
     return {"released": True, "fleetLockDigest": state["fleetLockDigest"]}
 
 
+@router.post("/deployment-candidates/{agent_name}/enroll")
+async def enroll_deployment_candidate_endpoint(
+    agent_name: str,
+    request: Request,
+    current_user: User = Depends(require_role("creator")),
+):
+    """Prove an agent name absent and bind it to the active deployment lease."""
+    token = request.headers.get(LOCK_HEADER)
+    try:
+        state = require_lock_token(token)
+    except DeploymentLockRejected as exc:
+        raise HTTPException(status_code=423, detail=str(exc)) from exc
+    except DeploymentLockUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if state["owner"] != current_user.username and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="deployment lock belongs to another creator")
+    if db.is_agent_name_reserved(agent_name) or get_agent_container(agent_name) is not None:
+        raise HTTPException(status_code=409, detail="deployment candidate name is not provably absent")
+    try:
+        enroll_candidate(token, agent_name)
+    except DeploymentLockRejected as exc:
+        raise HTTPException(status_code=423, detail=str(exc)) from exc
+    except DeploymentLockUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    return {"enrolled": True, "agentName": agent_name}
+
+
 @router.post("")
 async def create_agent_endpoint(config: AgentConfig, request: Request, current_user: User = Depends(require_role("creator"))):
     """Create a new agent. Requires creator role or above."""
@@ -514,7 +543,7 @@ async def create_agent_endpoint(config: AgentConfig, request: Request, current_u
                 detail="deployment candidate name is not provably absent",
             )
         try:
-            enroll_candidate(deployment_token, config.name)
+            require_enrolled_candidate(deployment_token, config.name)
         except DeploymentLockRejected as exc:
             raise HTTPException(status_code=423, detail=str(exc)) from exc
         except DeploymentLockUnavailable as exc:

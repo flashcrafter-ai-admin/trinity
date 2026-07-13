@@ -1024,7 +1024,7 @@ class MonitoringService:
                 self._is_leader = leader
 
                 if leader:
-                    await self._run_check_cycle()
+                    await self._run_check_cycle_governed()
             except Exception as e:
                 print(f"Monitoring check cycle failed: {e}")
 
@@ -1034,7 +1034,6 @@ class MonitoringService:
             # which would otherwise spin the loop into a tight flood.
             await asyncio.sleep(max(1, self.config.docker_check_interval))
 
-    @governed_background_mutation
     async def _run_check_cycle(self):
         """Run one cycle of health checks for every Trinity agent.
 
@@ -1107,6 +1106,10 @@ class MonitoringService:
         import random
         if random.random() < 0.03:  # ~1 in 33 cycles (every ~15 min at 30s interval)
             db.cleanup_old_health_records(days=7)
+
+    @governed_background_mutation
+    async def _run_check_cycle_governed(self):
+        return await self._run_check_cycle()
 
 
 # Global service instance

@@ -19,17 +19,6 @@ from services.docker_utils import (
 )
 
 _VOLUME_SUFFIXES = ("workspace", "public", "shared")
-_RUNTIME_KEY_PREFIXES = (
-    "agent:heartbeat:",
-    "agent:circuit:",
-    "agent:dispatch:",
-    "agent:slots:",
-    "agent:slot:",
-    "agent:queue:",
-    "agent:data_op:",
-)
-
-
 async def _remaining_volumes(agent_name: str) -> List[str]:
     remaining: List[str] = []
     for suffix in _VOLUME_SUFFIXES:
@@ -42,22 +31,42 @@ async def _remaining_volumes(agent_name: str) -> List[str]:
     return remaining
 
 
+def _runtime_keys(agent_name: str, client) -> List[str]:
+    exact = {
+        f"agent:heartbeat:{agent_name}",
+        f"agent:heartbeat:seen:{agent_name}",
+        f"agent:heartbeat:misses:{agent_name}",
+        f"agent:circuit:{agent_name}",
+        f"agent:circuit:{agent_name}:probe-lock",
+        f"agent:dispatch:{agent_name}",
+        f"agent:dispatch:{agent_name}:probe-lock",
+        f"agent:slots:{agent_name}",
+        f"agent:queue:{agent_name}",
+        f"agent:data_op:{agent_name}",
+    }
+    metadata_prefix = f"agent:slot:{agent_name}:"
+    found = {
+        key.decode() if isinstance(key, bytes) else str(key)
+        for key in client.scan_iter(match=f"{metadata_prefix}*")
+    }
+    for exact_key in exact:
+        for key in client.scan_iter(match=exact_key):
+            found.add(key.decode() if isinstance(key, bytes) else str(key))
+    return sorted(found)
+
+
 def _remaining_runtime_keys(agent_name: str) -> List[str]:
     client = get_breaker_redis()
     if client is None:
         raise RuntimeError("runtime-state authority is unavailable")
-    found = set()
-    for prefix in _RUNTIME_KEY_PREFIXES:
-        for key in client.scan_iter(match=f"{prefix}*{agent_name}*"):
-            found.add(key.decode() if isinstance(key, bytes) else str(key))
-    return sorted(found)
+    return _runtime_keys(agent_name, client)
 
 
 def _clear_deployment_runtime_keys(agent_name: str) -> None:
     client = get_breaker_redis()
     if client is None:
         raise RuntimeError("runtime-state authority is unavailable")
-    keys = _remaining_runtime_keys(agent_name)
+    keys = _runtime_keys(agent_name, client)
     if keys:
         client.delete(*keys)
 
@@ -161,6 +170,7 @@ async def rollback_candidate(agent_name: str) -> Dict[str, Any]:
         "proof": proof,
         "remainingVolumes": remaining_volumes,
         "remainingRuntimeKeyCount": len(remaining_runtime_keys),
+        "remainingRuntimeKeys": remaining_runtime_keys,
         "remainingDatabaseRows": database_proof["remainingByReference"],
         "errors": errors,
     }

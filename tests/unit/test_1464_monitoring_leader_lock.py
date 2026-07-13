@@ -164,7 +164,7 @@ async def test_run_loop_runs_cycle_only_when_leader(monkeypatch):
         monkeypatch.setattr(svc, "_try_acquire_leadership", lambda: leader)
 
         cycle = AsyncMock()
-        monkeypatch.setattr(svc, "_run_check_cycle", cycle)
+        monkeypatch.setattr(svc, "_run_check_cycle_governed", cycle)
 
         # Stop the loop after its first sleep so it runs exactly one iteration.
         async def _sleep_once(_):

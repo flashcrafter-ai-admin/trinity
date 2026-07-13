@@ -35,6 +35,7 @@ from services.deployment_lock_service import (
     DeploymentLockUnavailable,
     begin_mutation,
     end_mutation,
+    governed_background_mutation,
     mutation_requires_admission,
 )
 from utils.helpers import utc_now_iso
@@ -399,7 +400,7 @@ async def lifespan(app: FastAPI):
 
         # Auto-deploy system agent (Phase 11.1)
         try:
-            result = await system_agent_service.ensure_deployed()
+            result = await system_agent_service.ensure_deployed_governed()
             logger.info(f"System agent: {result['action']} - {result['message']}")
             if result.get('status') == 'error':
                 logger.warning(f"  Warning: System agent deployment issue - {result.get('message')}")
@@ -418,7 +419,7 @@ async def lifespan(app: FastAPI):
         # workers, so scheduling it in every worker is safe.
         try:
             if _db.get_setting_value('setup_completed', 'false') == 'true':
-                asyncio.create_task(cornelius_agent_service.ensure_seeded())
+                asyncio.create_task(cornelius_agent_service.ensure_seeded_governed())
         except Exception as e:
             logger.error(f"Error scheduling Cornelius seed: {e}")
     else:
@@ -512,6 +513,10 @@ async def lifespan(app: FastAPI):
         from services.capacity_manager import get_capacity_manager
         capacity = get_capacity_manager()
 
+        @governed_background_mutation
+        async def _capacity_maintenance_cycle():
+            await capacity.run_maintenance(max_age_hours=24)
+
         async def _capacity_maintenance_loop():
             # First tick after a short delay so startup stays snappy. #1085: a
             # small startup jitter so replicas don't realign their maintenance
@@ -519,7 +524,7 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(15 + random.uniform(0, 2))
             while True:
                 try:
-                    await capacity.run_maintenance(max_age_hours=24)
+                    await _capacity_maintenance_cycle()
                 except Exception as exc:
                     logger.warning(f"[Capacity] maintenance tick failed: {exc}")
                 # #1085: jitter the loop period so concurrent replicas' drain
@@ -858,7 +863,7 @@ import uuid as _uuid
 @app.middleware("http")
 async def enforce_deployment_lock(request: Request, call_next):
     """Serialize every mutating HTTP entry while a fleet lease is active."""
-    counted = False
+    counted = None
     if mutation_requires_admission(request.method, request.url.path):
         try:
             counted = begin_mutation(request.headers.get(LOCK_HEADER))
@@ -870,7 +875,7 @@ async def enforce_deployment_lock(request: Request, call_next):
         return await call_next(request)
     finally:
         if counted:
-            end_mutation(True)
+            end_mutation(counted)
 
 
 @app.middleware("http")
