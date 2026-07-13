@@ -197,7 +197,7 @@ class SchedulerApp:
         )
 
         # Execute in background (fire-and-forget)
-        asyncio.create_task(
+        self.scheduler_service._admission.spawn(
             self._execute_manual_trigger(schedule_id, triggered_by=triggered_by)
         )
 

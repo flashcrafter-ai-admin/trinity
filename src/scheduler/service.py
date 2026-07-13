@@ -21,6 +21,7 @@ import pytz
 import redis
 
 import httpx
+from deployment_admission import MutationAdmissionAuthority
 
 from .config import config
 from .models import Schedule, ScheduleExecution, ExecutionStatus, SchedulerStatus, ProcessSchedule
@@ -100,6 +101,7 @@ class SchedulerService:
 
         # Issue #132: Track active background polling tasks for graceful shutdown
         self._active_poll_tasks: set = set()
+        self._admission = MutationAdmissionAuthority(lambda: self.redis)
 
     @property
     def redis(self) -> redis.Redis:
@@ -109,6 +111,9 @@ class SchedulerService:
         return self._redis
 
     def initialize(self):
+        return self._admission.run_sync(self._initialize_admitted)
+
+    def _initialize_admitted(self):
         """Initialize the scheduler and load all enabled schedules."""
         if self._initialized:
             logger.warning("Scheduler already initialized")
@@ -497,6 +502,12 @@ class SchedulerService:
     # =========================================================================
 
     async def _sync_schedules(self):
+        reservation = self._admission.begin(None)
+        return await self._admission.run_reserved(
+            reservation, self._sync_schedules_admitted()
+        )
+
+    async def _sync_schedules_admitted(self):
         """
         Sync in-memory APScheduler jobs with database schedules.
 
@@ -676,6 +687,11 @@ class SchedulerService:
             logger.warning(f"Unknown job_id format for skipped job: {job_id}")
 
     def _record_skipped_agent_schedule(self, schedule_id: str):
+        return self._admission.run_sync(
+            self._record_skipped_agent_schedule_admitted, schedule_id
+        )
+
+    def _record_skipped_agent_schedule_admitted(self, schedule_id: str):
         """
         Record a skipped agent schedule execution in the database.
 
@@ -716,6 +732,11 @@ class SchedulerService:
             logger.error(f"Error recording skipped execution for schedule {schedule_id}: {e}")
 
     def _record_skipped_process_schedule(self, schedule_id: str):
+        return self._admission.run_sync(
+            self._record_skipped_process_schedule_admitted, schedule_id
+        )
+
+    def _record_skipped_process_schedule_admitted(self, schedule_id: str):
         """
         Record a skipped process schedule execution in the database.
 
@@ -761,6 +782,12 @@ class SchedulerService:
     # =========================================================================
 
     async def _execute_schedule(self, schedule_id: str):
+        reservation = self._admission.begin(None)
+        return await self._admission.run_reserved(
+            reservation, self._execute_schedule_admitted(schedule_id)
+        )
+
+    async def _execute_schedule_admitted(self, schedule_id: str):
         """
         Execute a scheduled task.
 
@@ -1186,7 +1213,7 @@ class SchedulerService:
                 f"Backend accepted async execution for {agent_name}, "
                 f"execution_id={execution_id}, spawning background poll task"
             )
-            task = asyncio.create_task(
+            task = self._admission.spawn(
                 self._poll_and_finalize(
                     execution_id=execution_id,
                     timeout_seconds=timeout_seconds,
@@ -1474,6 +1501,34 @@ class SchedulerService:
         )
 
     async def _execute_retry(
+        self,
+        original_execution_id: str,
+        failed_execution_id: str,
+        schedule_id: str,
+        agent_name: str,
+        message: str,
+        timeout_seconds: Optional[int],
+        model: str,
+        allowed_tools: list,
+        next_attempt_number: int
+    ):
+        reservation = self._admission.begin(None)
+        return await self._admission.run_reserved(
+            reservation,
+            self._execute_retry_admitted(
+                original_execution_id,
+                failed_execution_id,
+                schedule_id,
+                agent_name,
+                message,
+                timeout_seconds,
+                model,
+                allowed_tools,
+                next_attempt_number,
+            ),
+        )
+
+    async def _execute_retry_admitted(
         self,
         original_execution_id: str,
         failed_execution_id: str,
@@ -1816,6 +1871,12 @@ class SchedulerService:
             logger.warning(f"Failed to remove process schedule job {job_id}: {e}")
 
     async def _execute_process_schedule(self, schedule_id: str):
+        reservation = self._admission.begin(None)
+        return await self._admission.run_reserved(
+            reservation, self._execute_process_schedule_admitted(schedule_id)
+        )
+
+    async def _execute_process_schedule_admitted(self, schedule_id: str):
         """
         Execute a scheduled process.
 

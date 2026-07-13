@@ -17,6 +17,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy scheduler source code
 COPY src/scheduler /app/scheduler
+COPY src/backend/deployment_admission.py /app/deployment_admission.py
 
 # Set Python path
 ENV PYTHONPATH=/app

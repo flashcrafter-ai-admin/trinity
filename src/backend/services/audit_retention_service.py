@@ -35,6 +35,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from database import db
 from services.platform_audit_service import platform_audit_service
+from services.deployment_lock_service import governed_background_mutation
 
 logger = logging.getLogger(__name__)
 
@@ -61,7 +62,7 @@ class AuditRetentionService:
             return
 
         self.scheduler.add_job(
-            self.prune,
+            self.prune_governed,
             CronTrigger(hour=AUDIT_RETENTION_HOUR, minute=15),
             id="audit_log_retention",
             name="Daily audit_log retention prune",
@@ -102,6 +103,10 @@ class AuditRetentionService:
             retention_days,
         )
         return {"removed": removed, "retention_days": retention_days}
+
+    @governed_background_mutation
+    async def prune_governed(self) -> Dict[str, Any]:
+        return await self.prune()
 
 
 audit_retention_service = AuditRetentionService()

@@ -202,6 +202,7 @@ def _run_email_request(email, *, whitelisted, recent_requests, monkeypatch):
         lambda e, expiry_minutes=10: {"code": "123456", "expires_in_seconds": 600},
     )
     monkeypatch.setattr(email_service_mod, "EmailService", _FakeEmailService)
+    monkeypatch.setattr(auth_mod, "spawn_governed_mutation", asyncio.create_task)
 
     async def _go():
         resp = await auth_mod.request_email_login_code(_FakeRequest({"email": email}))

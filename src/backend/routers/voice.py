@@ -320,7 +320,7 @@ async def voice_websocket(
             })
         except Exception:
             pass
-        asyncio.create_task(platform_audit_service.log(
+        spawn_governed_mutation(platform_audit_service.log(
             event_type=AuditEventType.EXECUTION,
             event_action="voice_tool_call",
             source="api",

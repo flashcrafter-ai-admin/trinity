@@ -7,36 +7,27 @@ import hmac
 import json
 import secrets
 import asyncio
-from contextlib import contextmanager
-from contextvars import ContextVar
-from functools import wraps
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable
 
 from redis_breaker_util import get_breaker_redis
+from deployment_admission import (
+    LOCK_KEY,
+    ORDINARY_RESERVATIONS_KEY,
+    LEASE_RESERVATIONS_PREFIX,
+    DeploymentLockUnavailable,
+    DeploymentLockConflict,
+    DeploymentLockRejected,
+    MutationAdmissionAuthority,
+    MutationReservation,
+)
 
-LOCK_KEY = "trinity:agent-deployment-lock:v1"
-IN_FLIGHT_KEY = "trinity:agent-deployment-mutations:v1"
-LEASE_IN_FLIGHT_PREFIX = "trinity:agent-deployment-lease-mutations:v1:"
-ENROLLED_KEY_PREFIX = "trinity:agent-deployment-enrolled:v1:"
+IN_FLIGHT_KEY = ORDINARY_RESERVATIONS_KEY
+LEASE_IN_FLIGHT_PREFIX = LEASE_RESERVATIONS_PREFIX
+ENROLLED_KEY_PREFIX = "trinity:agent-deployment-enrolled:v2:"
 LOCK_HEADER = "X-Trinity-Deployment-Lock"
 MIN_TTL_SECONDS = 60
 MAX_TTL_SECONDS = 3600
-_CURRENT_MUTATION_COUNTER: ContextVar[tuple[str, asyncio.Task | None] | None] = ContextVar(
-    "trinity_deployment_mutation_counter", default=None
-)
-
-
-class DeploymentLockUnavailable(RuntimeError):
-    pass
-
-
-class DeploymentLockConflict(RuntimeError):
-    pass
-
-
-class DeploymentLockRejected(RuntimeError):
-    pass
 
 
 def _redis():
@@ -44,6 +35,9 @@ def _redis():
     if client is None:
         raise DeploymentLockUnavailable("deployment lock authority is unavailable")
     return client
+
+
+_AUTHORITY = MutationAdmissionAuthority(_redis)
 
 
 def _decode(value: Any) -> str | None:
@@ -98,6 +92,62 @@ def mutation_requires_admission(method: str, path: str) -> bool:
     return True
 
 
+def websocket_requires_admission(path: str) -> bool:
+    return (
+        path.startswith("/ws/voice/")
+        or path.startswith("/api/voip/voice/")
+        or (path.startswith("/api/agents/") and path.endswith("/terminal"))
+        or path == "/api/system-agent/terminal"
+    )
+
+
+class DeploymentAdmissionMiddleware:
+    """Pure-ASGI admission gate that owns the complete downstream lifetime."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        scope_type = scope.get("type")
+        path = scope.get("path", "")
+        required = (
+            scope_type == "http"
+            and mutation_requires_admission(scope.get("method", ""), path)
+        ) or (scope_type == "websocket" and websocket_requires_admission(path))
+        if not required:
+            await self.app(scope, receive, send)
+            return
+
+        headers = {
+            key.decode("latin-1").lower(): value.decode("latin-1")
+            for key, value in scope.get("headers", [])
+        }
+        try:
+            reservation = begin_mutation(headers.get(LOCK_HEADER.lower()))
+        except DeploymentLockRejected as exc:
+            if scope_type == "websocket":
+                await send({"type": "websocket.close", "code": 1013, "reason": str(exc)})
+            else:
+                from starlette.responses import JSONResponse
+
+                await JSONResponse(status_code=423, content={"detail": str(exc)})(
+                    scope, receive, send
+                )
+            return
+        except DeploymentLockUnavailable as exc:
+            if scope_type == "websocket":
+                await send({"type": "websocket.close", "code": 1011, "reason": str(exc)})
+            else:
+                from starlette.responses import JSONResponse
+
+                await JSONResponse(status_code=503, content={"detail": str(exc)})(
+                    scope, receive, send
+                )
+            return
+
+        await _AUTHORITY.run_reserved(reservation, self.app(scope, receive, send))
+
+
 def acquire_lock(
     *, owner: str, fleet_lock_digest: str, agent_names: Iterable[str], ttl_seconds: int
 ) -> tuple[Dict[str, Any], str]:
@@ -147,18 +197,10 @@ def require_enrolled_candidate(token: str | None, agent_name: str) -> Dict[str, 
     return state
 
 
-def _counter_value() -> int:
-    raw = _decode(_redis().get(IN_FLIGHT_KEY))
-    try:
-        return max(0, int(raw or "0"))
-    except ValueError as exc:
-        raise DeploymentLockUnavailable("deployment mutation counter contains invalid state") from exc
-
-
 async def activate_lock_after_drain(token: str, timeout_seconds: float = 30.0) -> Dict[str, Any]:
     """Wait for pre-lease mutations to finish, then atomically activate the lease."""
     deadline = asyncio.get_running_loop().time() + timeout_seconds
-    while _counter_value() != 0:
+    while _AUTHORITY.count(IN_FLIGHT_KEY) != 0:
         if asyncio.get_running_loop().time() >= deadline:
             try:
                 _abandon_draining_lock(token)
@@ -170,116 +212,43 @@ async def activate_lock_after_drain(token: str, timeout_seconds: float = 30.0) -
     client = _redis()
     current = _decode(client.get(LOCK_KEY))
     updated = json.dumps(active, separators=(",", ":"), sort_keys=True)
-    script = (
-        "if redis.call('get', KEYS[1]) == ARGV[1] and "
-        "tonumber(redis.call('get', KEYS[2]) or '0') == 0 then "
-        "redis.call('set', KEYS[1], ARGV[2], 'EX', ARGV[3]); return 1 else return 0 end"
-    )
-    if int(client.eval(script, 2, LOCK_KEY, IN_FLIGHT_KEY, current, updated, state["ttlSeconds"])) != 1:
+    now = int(datetime.now(timezone.utc).timestamp() * 1000)
+    script = """
+-- trinity:reservation:activate
+redis.call('zremrangebyscore', KEYS[2], '-inf', ARGV[4])
+if redis.call('get', KEYS[1]) == ARGV[1] and redis.call('zcard', KEYS[2]) == 0 then
+  redis.call('set', KEYS[1], ARGV[2], 'EX', ARGV[3])
+  return 1
+end
+return 0
+"""
+    if int(client.eval(script, 2, LOCK_KEY, IN_FLIGHT_KEY, current, updated, state["ttlSeconds"], now)) != 1:
         raise DeploymentLockConflict("deployment lock could not activate after drain")
     return active
 
 
-def begin_mutation(token: str | None) -> str:
-    """Atomically admit and count either an ordinary or lease-authorized mutation."""
-    client = _redis()
-    supplied = hashlib.sha256((token or "").encode()).hexdigest()
-    lease_counter = f"{LEASE_IN_FLIGHT_PREFIX}{supplied}"
-    script = (
-        "local lock = redis.call('get', KEYS[1]); "
-        "if not lock then "
-        "if ARGV[1] ~= '' then return {3, ''} end; "
-        "redis.call('incr', KEYS[2]); redis.call('expire', KEYS[2], 3600); return {1, KEYS[2]} end; "
-        "local state = cjson.decode(lock); "
-        "if state['phase'] ~= 'active' then return {2, lock} end; "
-        "if state['tokenDigest'] ~= ARGV[2] then return {3, lock} end; "
-        "redis.call('incr', KEYS[3]); redis.call('expire', KEYS[3], state['ttlSeconds']); "
-        "return {1, KEYS[3]}"
-    )
-    result = client.eval(script, 3, LOCK_KEY, IN_FLIGHT_KEY, lease_counter, token or "", supplied)
-    if not isinstance(result, (list, tuple)) or len(result) != 2:
-        raise DeploymentLockUnavailable("deployment mutation admission returned invalid state")
-    code = int(result[0])
-    if code == 1:
-        counter_key = _decode(result[1])
-        if not counter_key:
-            raise DeploymentLockUnavailable("deployment mutation admission omitted its counter")
-        return counter_key
-    if code == 2:
-        raise DeploymentLockRejected("deployment lock is not accepting mutations")
-    raise DeploymentLockRejected("active deployment lock token is required")
+def begin_mutation(token: str | None) -> MutationReservation:
+    return _AUTHORITY.begin(token)
 
 
-def end_mutation(counter_key: str) -> None:
-    script = (
-        "local n = tonumber(redis.call('get', KEYS[1]) or '0'); "
-        "if n <= 1 then redis.call('del', KEYS[1]); return 0 end; "
-        "return redis.call('decr', KEYS[1])"
-    )
-    _redis().eval(script, 1, counter_key)
+def end_mutation(reservation: MutationReservation) -> None:
+    _AUTHORITY.end(reservation)
 
 
-def adopt_mutation(counter_key: str) -> str:
-    """Synchronously extend an already-admitted mutation for a detached child."""
-    if counter_key != IN_FLIGHT_KEY and not counter_key.startswith(LEASE_IN_FLIGHT_PREFIX):
-        raise DeploymentLockUnavailable("invalid inherited deployment mutation counter")
-    client = _redis()
-    script = (
-        "local count = tonumber(redis.call('get', KEYS[2]) or '0'); "
-        "if count <= 0 then return 0 end; "
-        "local lock = redis.call('get', KEYS[1]); "
-        "if KEYS[2] == ARGV[1] then "
-        "if lock then local state = cjson.decode(lock); "
-        "if state['phase'] ~= 'draining' then return 0 end end; "
-        "else if not lock then return 0 end; local state = cjson.decode(lock); "
-        "if state['tokenDigest'] ~= ARGV[2] or "
-        "(state['phase'] ~= 'active' and state['phase'] ~= 'releasing') then return 0 end end; "
-        "redis.call('incr', KEYS[2]); redis.call('expire', KEYS[2], 3600); return 1"
-    )
-    digest = (
-        counter_key.removeprefix(LEASE_IN_FLIGHT_PREFIX)
-        if counter_key.startswith(LEASE_IN_FLIGHT_PREFIX)
-        else ""
-    )
-    if int(client.eval(script, 2, LOCK_KEY, counter_key, IN_FLIGHT_KEY, digest)) != 1:
-        raise DeploymentLockRejected("inherited deployment mutation is no longer admitted")
-    return counter_key
+def adopt_mutation(reservation: MutationReservation) -> MutationReservation:
+    return _AUTHORITY.adopt(reservation)
 
 
-@contextmanager
-def mutation_admission_context(counter_key: str):
-    """Expose one admitted counter to awaited work and synchronously spawned children."""
-    token = _CURRENT_MUTATION_COUNTER.set((counter_key, asyncio.current_task()))
-    try:
-        yield
-    finally:
-        _CURRENT_MUTATION_COUNTER.reset(token)
+def mutation_admission_context(reservation: MutationReservation):
+    return _AUTHORITY.context(reservation)
 
 
-def _inherited_mutation_counter() -> str | None:
-    admission = _CURRENT_MUTATION_COUNTER.get()
-    if admission is None:
-        return None
-    counter_key, owner_task = admission
-    return counter_key if owner_task is asyncio.current_task() else None
+def _inherited_mutation_counter() -> MutationReservation | None:
+    return _AUTHORITY.inherited()
 
 
 def _reserve_governed_mutation(coro):
-    inherited = _inherited_mutation_counter()
-    try:
-        counter_key = adopt_mutation(inherited) if inherited else begin_mutation(None)
-    except Exception:
-        coro.close()
-        raise
-
-    async def run():
-        try:
-            with mutation_admission_context(counter_key):
-                return await coro
-        finally:
-            end_mutation(counter_key)
-
-    return counter_key, run
+    return _AUTHORITY.reserve(coro)
 
 
 def reserve_governed_mutation(coro):
@@ -294,33 +263,11 @@ def reserve_governed_call(function, *args, **kwargs):
 
 
 def spawn_governed_mutation(coro, *, name: str | None = None) -> asyncio.Task:
-    """Reserve before detaching and hold admission through the entire child chain."""
-    counter_key, run = _reserve_governed_mutation(coro)
-    task_coro = run()
-
-    try:
-        return asyncio.create_task(task_coro, name=name)
-    except Exception:
-        task_coro.close()
-        end_mutation(counter_key)
-        coro.close()
-        raise
+    return _AUTHORITY.spawn(coro, name=name)
 
 
 def governed_background_mutation(function):
-    """Count non-HTTP mutation jobs so lease acquisition drains them too."""
-    @wraps(function)
-    async def wrapped(*args, **kwargs):
-        if _inherited_mutation_counter():
-            return await function(*args, **kwargs)
-        counted = begin_mutation(None)
-        try:
-            with mutation_admission_context(counted):
-                return await function(*args, **kwargs)
-        finally:
-            end_mutation(counted)
-
-    return wrapped
+    return _AUTHORITY.governed(function)
 
 
 def require_lock_token(token: str | None, *, allow_draining: bool = False) -> Dict[str, Any]:
@@ -378,7 +325,7 @@ async def release_lock_after_drain(
     """Stop new lease writes, drain admitted ones, then atomically remove the lease."""
     state = require_lock_token(token, allow_draining=True)
     supplied = hashlib.sha256((token or "").encode()).hexdigest()
-    counter_key = f"{LEASE_IN_FLIGHT_PREFIX}{supplied}"
+    reservation_key = f"{LEASE_IN_FLIGHT_PREFIX}{supplied}"
     client = _redis()
     current = _decode(client.get(LOCK_KEY))
     if current is None:
@@ -397,25 +344,24 @@ async def release_lock_after_drain(
 
     deadline = asyncio.get_running_loop().time() + timeout_seconds
     while True:
-        raw_count = _decode(client.get(counter_key))
-        try:
-            count = max(0, int(raw_count or "0"))
-        except ValueError as exc:
-            raise DeploymentLockUnavailable(
-                "deployment lease mutation counter contains invalid state"
-            ) from exc
+        count = _AUTHORITY.count(reservation_key)
         if count == 0:
             break
         if asyncio.get_running_loop().time() >= deadline:
             raise DeploymentLockConflict("lease-authorized mutations did not drain before timeout")
         await asyncio.sleep(0.05)
 
-    script = (
-        "if redis.call('get', KEYS[1]) == ARGV[1] and "
-        "tonumber(redis.call('get', KEYS[3]) or '0') == 0 then "
-        "redis.call('del', KEYS[2]); redis.call('del', KEYS[3]); "
-        "return redis.call('del', KEYS[1]) else return 0 end"
-    )
-    if int(client.eval(script, 3, LOCK_KEY, _enrolled_key(state), counter_key, current)) != 1:
+    now = int(datetime.now(timezone.utc).timestamp() * 1000)
+    script = """
+-- trinity:reservation:release
+redis.call('zremrangebyscore', KEYS[3], '-inf', ARGV[2])
+if redis.call('get', KEYS[1]) == ARGV[1] and redis.call('zcard', KEYS[3]) == 0 then
+  redis.call('del', KEYS[2])
+  redis.call('del', KEYS[3])
+  return redis.call('del', KEYS[1])
+end
+return 0
+"""
+    if int(client.eval(script, 3, LOCK_KEY, _enrolled_key(state), reservation_key, current, now)) != 1:
         raise DeploymentLockRejected("deployment lock changed before drained release")
     return state

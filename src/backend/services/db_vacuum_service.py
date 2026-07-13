@@ -30,6 +30,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
 from db.connection import DB_PATH
+from services.deployment_lock_service import governed_background_mutation
 
 logger = logging.getLogger(__name__)
 
@@ -58,7 +59,7 @@ class DBVacuumService:
             return
 
         self.scheduler.add_job(
-            self.vacuum,
+            self.vacuum_governed,
             CronTrigger(hour=DB_VACUUM_HOUR, minute=DB_VACUUM_MINUTE),
             id="db_vacuum",
             name="Daily SQLite VACUUM",
@@ -108,6 +109,10 @@ class DBVacuumService:
             "size_after": size_after,
             "reclaimed_bytes": reclaimed,
         }
+
+    @governed_background_mutation
+    async def vacuum_governed(self) -> Dict[str, Any]:
+        return await self.vacuum()
 
     @staticmethod
     def _db_size_bytes() -> int:

@@ -15,6 +15,7 @@ _src_path = str(_project_root / 'src')
 if _src_path not in sys.path:
     sys.path.insert(0, _src_path)
 
+import asyncio
 import os
 import sqlite3
 import tempfile
@@ -23,6 +24,25 @@ from typing import Generator
 from unittest.mock import MagicMock, AsyncMock
 
 import pytest
+
+
+class _UnitAdmissionAuthority:
+    """Hermetic scheduler admission seam; real Redis semantics have dedicated tests."""
+
+    def __init__(self, _redis_factory):
+        pass
+
+    def begin(self, _lease_id=None):
+        return object()
+
+    async def run_reserved(self, _reservation, awaitable):
+        return await awaitable
+
+    def run_sync(self, callback, *args, **kwargs):
+        return callback(*args, **kwargs)
+
+    def spawn(self, awaitable):
+        return asyncio.create_task(awaitable)
 
 
 def pytest_configure(config):
@@ -64,6 +84,14 @@ def resource_tracker():
 def cleanup_after_test():
     """Override - scheduler tests don't need cleanup."""
     yield
+
+
+@pytest.fixture(autouse=True)
+def unit_admission_authority(monkeypatch):
+    """Keep scheduler unit tests off Redis without adding a production fail-open path."""
+    monkeypatch.setattr(
+        "scheduler.service.MutationAdmissionAuthority", _UnitAdmissionAuthority
+    )
 
 
 # ============================================================================

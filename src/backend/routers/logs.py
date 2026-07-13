@@ -102,7 +102,7 @@ async def update_retention_config(
 
         from apscheduler.triggers.cron import CronTrigger
         log_archive_service.scheduler.add_job(
-            log_archive_service.archive_old_logs,
+            log_archive_service.archive_old_logs_governed,
             CronTrigger(hour=config.cleanup_hour, minute=0),
             id="log_archival",
             name="Nightly Log Archival",

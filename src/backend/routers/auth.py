@@ -12,6 +12,7 @@ import redis
 
 from models import Token
 from services.platform_audit_service import platform_audit_service, AuditEventType
+from services.deployment_lock_service import spawn_governed_mutation
 from config import (
     SECRET_KEY,
     ALGORITHM,
@@ -498,7 +499,7 @@ async def request_email_login_code(request: Request):
         except Exception:
             logger.exception("Failed to send email login code")
 
-    task = asyncio.create_task(_dispatch_code(email, code_data["code"]))
+    task = spawn_governed_mutation(_dispatch_code(email, code_data["code"]))
     _email_dispatch_tasks.add(task)
     task.add_done_callback(_email_dispatch_tasks.discard)
 

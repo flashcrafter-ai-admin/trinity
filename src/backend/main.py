@@ -31,13 +31,8 @@ from dependencies import get_current_user
 from services.docker_service import docker_client, list_all_agents_fast
 from services.deployment_lock_service import (
     LOCK_HEADER,
-    DeploymentLockRejected,
-    DeploymentLockUnavailable,
-    begin_mutation,
-    end_mutation,
+    DeploymentAdmissionMiddleware,
     governed_background_mutation,
-    mutation_admission_context,
-    mutation_requires_admission,
     spawn_governed_mutation,
 )
 from utils.helpers import utc_now_iso
@@ -582,10 +577,10 @@ async def lifespan(app: FastAPI):
     # /internal/execute-task route doesn't 503 forever if recovery raises.
     from services.cleanup_service import (
         mark_startup_recovery_complete,
-        recover_orphaned_executions,
+        recover_orphaned_executions_governed,
     )
     try:
-        task_recovery = await recover_orphaned_executions()
+        task_recovery = await recover_orphaned_executions_governed()
         if task_recovery["recovered"] > 0:
             logger.info(
                 f"Task execution recovery: "
@@ -862,25 +857,7 @@ app.add_middleware(
 # Respects an incoming X-Request-ID header if present (e.g. from nginx or upstream proxy).
 import uuid as _uuid
 
-@app.middleware("http")
-async def enforce_deployment_lock(request: Request, call_next):
-    """Serialize every mutating HTTP entry while a fleet lease is active."""
-    counted = None
-    if mutation_requires_admission(request.method, request.url.path):
-        try:
-            counted = begin_mutation(request.headers.get(LOCK_HEADER))
-        except DeploymentLockRejected as exc:
-            return JSONResponse(status_code=423, content={"detail": str(exc)})
-        except DeploymentLockUnavailable as exc:
-            return JSONResponse(status_code=503, content={"detail": str(exc)})
-    try:
-        if counted:
-            with mutation_admission_context(counted):
-                return await call_next(request)
-        return await call_next(request)
-    finally:
-        if counted:
-            end_mutation(counted)
+app.add_middleware(DeploymentAdmissionMiddleware)
 
 
 @app.middleware("http")

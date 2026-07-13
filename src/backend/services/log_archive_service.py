@@ -18,6 +18,7 @@ from apscheduler.triggers.cron import CronTrigger
 
 from .archive_storage import get_archive_storage
 from utils.helpers import utc_now_iso
+from services.deployment_lock_service import governed_background_mutation
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +68,7 @@ class LogArchiveService:
 
         # Schedule nightly archival
         self.scheduler.add_job(
-            self.archive_old_logs,
+            self.archive_old_logs_governed,
             CronTrigger(hour=LOG_CLEANUP_HOUR, minute=0),
             id="log_archival",
             name="Nightly Log Archival",
@@ -186,6 +187,12 @@ class LogArchiveService:
             "retention_days": retention_days,
             "cutoff_date": cutoff_date.isoformat(),
         }
+
+    @governed_background_mutation
+    async def archive_old_logs_governed(
+        self, retention_days: Optional[int] = None, delete_after_archive: bool = True
+    ) -> Dict[str, Any]:
+        return await self.archive_old_logs(retention_days, delete_after_archive)
 
     async def _compress_file(self, source: Path, dest: Path) -> bool:
         """
@@ -307,4 +314,3 @@ class LogArchiveService:
 
 # Global instance
 log_archive_service = LogArchiveService()
-

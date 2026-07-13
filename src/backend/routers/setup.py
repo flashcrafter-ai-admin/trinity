@@ -148,12 +148,14 @@ async def set_admin_password(
     # and swallows all errors (air-gapped / blocked / offline).
     if data.consent_updates:
         background_tasks.add_task(
-            submit_operator_intake,
-            email=normalized_email,
-            company=(data.company or "").strip() or None,
-            name=(data.name or "").strip() or None,
-            role=(data.role or "").strip() or None,
-            use_case=(data.use_case or "").strip() or None,
+            reserve_governed_call(
+                submit_operator_intake,
+                email=normalized_email,
+                company=(data.company or "").strip() or None,
+                name=(data.name or "").strip() or None,
+                role=(data.role or "").strip() or None,
+                use_case=(data.use_case or "").strip() or None,
+            )
         )
 
     return {"success": True, "email_registered": email_registered}

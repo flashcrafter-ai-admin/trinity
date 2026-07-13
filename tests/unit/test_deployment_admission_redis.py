@@ -1,0 +1,98 @@
+"""Real-Redis expiry, heartbeat, and generation-safety tests."""
+
+from __future__ import annotations
+
+import asyncio
+import os
+
+import pytest
+import redis
+
+import deployment_admission as admission
+
+
+@pytest.fixture
+def authority():
+    url = os.getenv("TRINITY_ADMISSION_TEST_REDIS_URL")
+    if not url:
+        pytest.skip("TRINITY_ADMISSION_TEST_REDIS_URL is not configured")
+    client = redis.Redis.from_url(url, decode_responses=True)
+    client.flushdb()
+    yield admission.MutationAdmissionAuthority(lambda: client), client
+    client.flushdb()
+    client.close()
+
+
+def test_late_release_cannot_delete_a_new_generation(authority):
+    gate, client = authority
+    old = gate.begin(None)
+    gate.end(old)
+    current = gate.begin(None)
+
+    gate.end(old)
+
+    assert gate.count(admission.ORDINARY_RESERVATIONS_KEY) == 1
+    assert client.zscore(current.key, current.reservation_id) is not None
+    gate.end(current)
+
+
+def test_synchronous_reservation_does_not_require_an_event_loop(authority):
+    gate, _ = authority
+
+    assert gate.run_sync(lambda: "ok") == "ok"
+    assert gate.count(admission.ORDINARY_RESERVATIONS_KEY) == 0
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_keeps_long_operation_visible(authority, monkeypatch):
+    gate, _ = authority
+    monkeypatch.setattr(admission, "RESERVATION_TTL_SECONDS", 1)
+    monkeypatch.setattr(admission, "RESERVATION_HEARTBEAT_SECONDS", 0.1)
+    started = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def operation():
+        started.set()
+        await finish.wait()
+
+    task = gate.spawn(operation())
+    await started.wait()
+    await asyncio.sleep(1.2)
+    assert gate.count(admission.ORDINARY_RESERVATIONS_KEY) == 1
+    finish.set()
+    await task
+    assert gate.count(admission.ORDINARY_RESERVATIONS_KEY) == 0
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loss_cancels_the_mutation_owner(authority, monkeypatch):
+    gate, client = authority
+    monkeypatch.setattr(admission, "RESERVATION_TTL_SECONDS", 1)
+    monkeypatch.setattr(admission, "RESERVATION_HEARTBEAT_SECONDS", 0.05)
+    started = asyncio.Event()
+
+    async def operation():
+        started.set()
+        await asyncio.Event().wait()
+
+    task = gate.spawn(operation())
+    await started.wait()
+    reservation_id = client.zrange(admission.ORDINARY_RESERVATIONS_KEY, 0, 0)[0]
+    client.zrem(admission.ORDINARY_RESERVATIONS_KEY, reservation_id)
+
+    with pytest.raises(admission.DeploymentLockRejected, match="was lost"):
+        await asyncio.wait_for(task, timeout=1)
+    assert gate.count(admission.ORDINARY_RESERVATIONS_KEY) == 0
+
+
+def test_expired_generation_cannot_damage_replacement(authority, monkeypatch):
+    gate, client = authority
+    monkeypatch.setattr(admission, "RESERVATION_TTL_SECONDS", 1)
+    expired = gate.begin(None)
+    client.zadd(expired.key, {expired.reservation_id: 0})
+    replacement = gate.begin(None)
+
+    gate.end(expired)
+
+    assert gate.count(admission.ORDINARY_RESERVATIONS_KEY) == 1
+    assert client.zscore(replacement.key, replacement.reservation_id) is not None

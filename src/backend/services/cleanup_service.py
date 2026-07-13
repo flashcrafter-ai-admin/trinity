@@ -1711,6 +1711,12 @@ async def recover_orphaned_executions() -> Dict:
     }
 
 
+@governed_background_mutation
+async def recover_orphaned_executions_governed() -> Dict:
+    """Startup recovery entrypoint shared across backend workers and deployments."""
+    return await recover_orphaned_executions()
+
+
 def _within_startup_grace(execution: Dict) -> bool:
     """Return True if the execution's started_at is within the startup grace window.
 

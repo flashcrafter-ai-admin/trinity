@@ -8,6 +8,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import docker
 import pytest
+from fastapi import BackgroundTasks, FastAPI, Request
+from fastapi.testclient import TestClient
 
 from services import deployment_lock_service as locks
 from services import deployment_rollback_service as rollback
@@ -20,8 +22,11 @@ class FakeRedis:
         self.values = {}
         self.runtime_keys = []
         self.sets = {}
+        self.zsets = {}
 
     def get(self, key):
+        if key in self.zsets:
+            return str(len(self.zsets[key]))
         return self.values.get(key)
 
     def set(self, key, value, *, nx=False, ex=None):
@@ -34,6 +39,7 @@ class FakeRedis:
         for key in keys:
             self.values.pop(key, None)
             self.sets.pop(key, None)
+            self.zsets.pop(key, None)
             if key in self.runtime_keys:
                 self.runtime_keys.remove(key)
 
@@ -46,7 +52,104 @@ class FakeRedis:
     def sismember(self, key, value):
         return value in self.sets.get(key, set())
 
+    def zadd(self, key, mapping):
+        self.zsets.setdefault(key, {}).update({str(k): float(v) for k, v in mapping.items()})
+        return len(mapping)
+
+    def zrem(self, key, *members):
+        rows = self.zsets.get(key, {})
+        removed = 0
+        for member in members:
+            if str(member) in rows:
+                del rows[str(member)]
+                removed += 1
+        if not rows:
+            self.zsets.pop(key, None)
+        return removed
+
+    def zcard(self, key):
+        return len(self.zsets.get(key, {}))
+
+    def zscore(self, key, member):
+        return self.zsets.get(key, {}).get(str(member))
+
+    def zremrangebyscore(self, key, _minimum, maximum):
+        rows = self.zsets.get(key, {})
+        expired = [member for member, score in rows.items() if score <= float(maximum)]
+        return self.zrem(key, *expired)
+
     def eval(self, script, key_count, *args):
+        if "trinity:reservation:begin" in script:
+            lock_key, ordinary_key, lease_key, token, digest, now, expiry, reservation_id = args
+            self.zremrangebyscore(ordinary_key, "-inf", now)
+            raw = self.values.get(lock_key)
+            if raw is None:
+                if token:
+                    return [3, ""]
+                self.zadd(ordinary_key, {reservation_id: expiry})
+                return [1, ordinary_key]
+            state = json.loads(raw)
+            if state["phase"] != "active":
+                return [2, raw]
+            if state["tokenDigest"] != digest:
+                return [3, raw]
+            self.zremrangebyscore(lease_key, "-inf", now)
+            self.zadd(lease_key, {reservation_id: expiry})
+            return [1, lease_key]
+        if "trinity:reservation:adopt" in script:
+            lock_key, key, parent_id, ordinary_key, digest, now, expiry, child_id = args
+            self.zremrangebyscore(key, "-inf", now)
+            if self.zscore(key, parent_id) is None:
+                return 0
+            raw = self.values.get(lock_key)
+            if key == ordinary_key:
+                if raw is not None and json.loads(raw)["phase"] != "draining":
+                    return 0
+            else:
+                if raw is None:
+                    return 0
+                state = json.loads(raw)
+                if state["tokenDigest"] != digest or state["phase"] not in {"active", "releasing"}:
+                    return 0
+            self.zadd(key, {child_id: expiry})
+            return 1
+        if "trinity:reservation:refresh" in script:
+            lock_key, key, reservation_id, ordinary_key, digest, now, expiry = args
+            self.zremrangebyscore(key, "-inf", now)
+            if self.zscore(key, reservation_id) is None:
+                return 0
+            raw = self.values.get(lock_key)
+            if key == ordinary_key:
+                if raw is not None and json.loads(raw)["phase"] != "draining":
+                    return 0
+            else:
+                if raw is None:
+                    return 0
+                state = json.loads(raw)
+                if state["tokenDigest"] != digest or state["phase"] not in {"active", "releasing"}:
+                    return 0
+            self.zadd(key, {reservation_id: expiry})
+            return 1
+        if "trinity:reservation:count" in script:
+            key, now = args
+            self.zremrangebyscore(key, "-inf", now)
+            return self.zcard(key)
+        if "trinity:reservation:activate" in script:
+            lock_key, reservations_key, expected, updated, _ttl, now = args
+            self.zremrangebyscore(reservations_key, "-inf", now)
+            if self.values.get(lock_key) != expected or self.zcard(reservations_key) != 0:
+                return 0
+            self.values[lock_key] = updated
+            return 1
+        if "trinity:reservation:release" in script:
+            lock_key, enrolled_key, reservations_key, expected, now = args
+            self.zremrangebyscore(reservations_key, "-inf", now)
+            if self.values.get(lock_key) != expected or self.zcard(reservations_key) != 0:
+                return 0
+            self.sets.pop(enrolled_key, None)
+            self.zsets.pop(reservations_key, None)
+            del self.values[lock_key]
+            return 1
         if key_count == 2 and "count <= 0" in script:
             lock_key, counter_key, ordinary_key, digest = args
             count = int(self.values.get(counter_key, "0"))
@@ -172,7 +275,7 @@ async def test_lock_drains_preexisting_mutation_and_blocks_new_ones(monkeypatch)
     redis = FakeRedis()
     monkeypatch.setattr(locks, "get_breaker_redis", lambda: redis)
     counted = locks.begin_mutation(None)
-    assert counted == locks.IN_FLIGHT_KEY
+    assert counted.key == locks.IN_FLIGHT_KEY
     _, token = locks.acquire_lock(
         owner="creator",
         fleet_lock_digest="a" * 64,
@@ -187,7 +290,7 @@ async def test_lock_drains_preexisting_mutation_and_blocks_new_ones(monkeypatch)
     with pytest.raises(locks.DeploymentLockRejected, match="token"):
         locks.begin_mutation(None)
     lease_counter = locks.begin_mutation(token)
-    assert lease_counter.startswith(locks.LEASE_IN_FLIGHT_PREFIX)
+    assert lease_counter.key.startswith(locks.LEASE_IN_FLIGHT_PREFIX)
     locks.end_mutation(lease_counter)
 
 
@@ -220,11 +323,11 @@ async def test_background_mutation_is_counted_and_authority_absence_cannot_hide_
     monkeypatch.setattr(locks, "get_breaker_redis", lambda: redis)
     @locks.governed_background_mutation
     async def job():
-        assert redis.values[locks.IN_FLIGHT_KEY] == "1"
+        assert redis.get(locks.IN_FLIGHT_KEY) == "1"
         return "done"
 
     assert await job() == "done"
-    assert locks.IN_FLIGHT_KEY not in redis.values
+    assert redis.get(locks.IN_FLIGHT_KEY) is None
     monkeypatch.setattr(locks, "get_breaker_redis", lambda: None)
     with pytest.raises(locks.DeploymentLockUnavailable):
         await job()
@@ -269,7 +372,7 @@ async def test_raw_task_cannot_reuse_parent_admission_context(monkeypatch):
 
     @locks.governed_background_mutation
     async def child():
-        assert redis.values[locks.IN_FLIGHT_KEY] == "2"
+        assert redis.get(locks.IN_FLIGHT_KEY) == "2"
         observed.set()
         await finish.wait()
 
@@ -278,10 +381,10 @@ async def test_raw_task_cannot_reuse_parent_admission_context(monkeypatch):
         task = asyncio.create_task(child())
         await observed.wait()
     locks.end_mutation(parent_counter)
-    assert redis.values[locks.IN_FLIGHT_KEY] == "1"
+    assert redis.get(locks.IN_FLIGHT_KEY) == "1"
     finish.set()
     await task
-    assert locks.IN_FLIGHT_KEY not in redis.values
+    assert redis.get(locks.IN_FLIGHT_KEY) is None
 
 
 @pytest.mark.asyncio
@@ -374,13 +477,16 @@ async def test_slot_release_callback_is_adopted_before_detach(monkeypatch):
     with locks.mutation_admission_context(parent_counter):
         await service.release_slot("agent-web", "execution-1")
     await callback_started.wait()
-    assert redis.values[locks.IN_FLIGHT_KEY] == "2"
+    assert redis.get(locks.IN_FLIGHT_KEY) == "2"
     locks.end_mutation(parent_counter)
-    assert redis.values[locks.IN_FLIGHT_KEY] == "1"
+    assert redis.get(locks.IN_FLIGHT_KEY) == "1"
     callback_finish.set()
     await callback_done.wait()
-    await asyncio.sleep(0)
-    assert locks.IN_FLIGHT_KEY not in redis.values
+    for _ in range(10):
+        if redis.get(locks.IN_FLIGHT_KEY) is None:
+            break
+        await asyncio.sleep(0)
+    assert redis.get(locks.IN_FLIGHT_KEY) is None
 
 
 @pytest.mark.asyncio
@@ -391,18 +497,18 @@ async def test_cleanup_startup_write_and_first_sweep_share_one_admission(monkeyp
     monkeypatch.setattr(
         cleanup_module.db,
         "mark_orphan_loops_interrupted",
-        lambda: observed.append(redis.values.get(locks.IN_FLIGHT_KEY)) or 0,
+        lambda: observed.append(redis.get(locks.IN_FLIGHT_KEY)) or 0,
     )
     service = cleanup_module.CleanupService(poll_interval=1)
 
     async def first_sweep():
-        observed.append(redis.values.get(locks.IN_FLIGHT_KEY))
+        observed.append(redis.get(locks.IN_FLIGHT_KEY))
         return cleanup_module.CleanupReport()
 
     monkeypatch.setattr(service, "run_cleanup", first_sweep)
     await service._run_startup_cleanup_governed()
     assert observed == ["1", "1"]
-    assert locks.IN_FLIGHT_KEY not in redis.values
+    assert redis.get(locks.IN_FLIGHT_KEY) is None
 
 
 def test_deployment_lock_fails_closed_without_authority(monkeypatch):
@@ -441,6 +547,91 @@ def test_lock_lifecycle_endpoints_are_the_only_special_admission_paths():
         locks.mutation_requires_admission("DELETE", "/api/agents/deployment-lock")
         is False
     )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/ws/voice/session-1",
+        "/api/voip/voice/call-1",
+        "/api/agents/agent-web/terminal",
+        "/api/system-agent/terminal",
+    ],
+)
+@pytest.mark.asyncio
+async def test_mutating_websockets_are_rejected_by_an_active_release_lock(
+    monkeypatch, path
+):
+    redis = FakeRedis()
+    monkeypatch.setattr(locks, "get_breaker_redis", lambda: redis)
+    _, token = locks.acquire_lock(
+        owner="release-test",
+        fleet_lock_digest="a" * 64,
+        agent_names=["agent-web"],
+        ttl_seconds=900,
+    )
+    await locks.activate_lock_after_drain(token)
+    downstream_called = False
+    messages = []
+
+    async def downstream(_scope, _receive, _send):
+        nonlocal downstream_called
+        downstream_called = True
+
+    async def receive():
+        return {"type": "websocket.connect"}
+
+    async def send(message):
+        messages.append(message)
+
+    await locks.DeploymentAdmissionMiddleware(downstream)(
+        {"type": "websocket", "path": path, "headers": []}, receive, send
+    )
+
+    assert downstream_called is False
+    assert messages == [
+        {
+            "type": "websocket.close",
+            "code": 1013,
+            "reason": "active deployment lock token is required",
+        }
+    ]
+
+
+def test_read_only_websockets_do_not_require_mutation_admission():
+    assert locks.websocket_requires_admission("/ws") is False
+    assert locks.websocket_requires_admission("/ws/events") is False
+
+
+def test_pure_asgi_gate_adopts_real_base_http_route_and_background_tasks(monkeypatch):
+    redis = FakeRedis()
+    monkeypatch.setattr(locks, "get_breaker_redis", lambda: redis)
+    app = FastAPI()
+    observed = {}
+
+    @app.middleware("http")
+    async def task_boundary(request: Request, call_next):
+        observed["middleware_task"] = id(asyncio.current_task())
+        return await call_next(request)
+
+    @app.post("/mutate")
+    async def mutate(background_tasks: BackgroundTasks):
+        observed["route_task"] = id(asyncio.current_task())
+
+        async def after_response():
+            observed["background_count"] = redis.get(locks.IN_FLIGHT_KEY)
+
+        background_tasks.add_task(locks.reserve_governed_call(after_response))
+        return {"ok": True}
+
+    gated = locks.DeploymentAdmissionMiddleware(app)
+    with TestClient(gated) as client:
+        response = client.post("/mutate")
+
+    assert response.status_code == 200
+    assert observed["middleware_task"] != observed["route_task"]
+    assert observed["background_count"] == "2"
+    assert redis.get(locks.IN_FLIGHT_KEY) is None
 
 
 @pytest.mark.asyncio
