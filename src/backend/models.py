@@ -113,6 +113,23 @@ class AgentConfig(BaseModel):
     ephemeral: Optional[EphemeralConfig] = None
 
 
+class DeploymentLockRequest(BaseModel):
+    """Scope and lifetime for one governed fleet deployment transaction."""
+
+    fleet_lock_digest: str = Field(..., pattern=r"^[0-9a-f]{64}$")
+    agent_names: List[str] = Field(..., min_length=1, max_length=100)
+    ttl_seconds: int = Field(900, ge=60, le=3600)
+
+    @field_validator("agent_names")
+    @classmethod
+    def _validate_agent_names(cls, values: List[str]) -> List[str]:
+        if len(set(values)) != len(values):
+            raise ValueError("agent_names must be unique")
+        if any(not re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,127}", value) for value in values):
+            raise ValueError("agent_names contain an invalid Trinity agent name")
+        return values
+
+
 class AgentStatus(BaseModel):
     """Status of an agent container."""
     name: str

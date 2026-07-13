@@ -15,6 +15,7 @@ import logging
 import random
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, Query, WebSocket
+from fastapi.responses import JSONResponse
 
 from models import (
     AgentConfig,
@@ -28,6 +29,7 @@ from models import (
     VoiceReplyRequest,
     TaskExecutionStatus,
     User,
+    DeploymentLockRequest,
 )
 from database import db
 from dependencies import get_current_user, decode_token, require_role, AuthorizedAgentByName, OwnedAgentByName, CurrentUser, enforce_agent_spawn_scope
@@ -43,6 +45,17 @@ from services.platform_audit_service import (
     platform_audit_service,
     AuditEventType,
 )
+from services.deployment_lock_service import (
+    LOCK_HEADER,
+    DeploymentLockConflict,
+    DeploymentLockRejected,
+    DeploymentLockUnavailable,
+    acquire_lock,
+    release_lock,
+    require_candidate,
+    require_lock_token,
+)
+from services.deployment_rollback_service import rollback_candidate
 
 # Import service layer functions
 from services.agent_service import (
@@ -418,6 +431,75 @@ async def get_agent_endpoint(agent_name: AuthorizedAgentByName, request: Request
     return agent_dict
 
 
+@router.post("/deployment-lock")
+async def acquire_deployment_lock_endpoint(
+    body: DeploymentLockRequest,
+    request: Request,
+    current_user: User = Depends(require_role("creator")),
+):
+    """Acquire the Trinity-wide lease used by a governed fleet deployment."""
+    try:
+        state, token = acquire_lock(
+            owner=current_user.username,
+            fleet_lock_digest=body.fleet_lock_digest,
+            agent_names=body.agent_names,
+            ttl_seconds=body.ttl_seconds,
+        )
+    except DeploymentLockConflict as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except DeploymentLockUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    await platform_audit_service.log(
+        event_type=AuditEventType.AGENT_LIFECYCLE,
+        event_action="deployment_lock_acquire",
+        source="api",
+        actor_user=current_user,
+        actor_ip=request.client.host if request.client else None,
+        target_type="fleet",
+        target_id=body.fleet_lock_digest,
+        endpoint=str(request.url.path),
+        details={"agent_names": state["agentNames"], "ttl_seconds": state["ttlSeconds"]},
+    )
+    return {
+        "schemaVersion": state["schemaVersion"],
+        "fleetLockDigest": state["fleetLockDigest"],
+        "agentNames": state["agentNames"],
+        "ttlSeconds": state["ttlSeconds"],
+        "lockToken": token,
+    }
+
+
+@router.delete("/deployment-lock")
+async def release_deployment_lock_endpoint(
+    request: Request,
+    current_user: User = Depends(require_role("creator")),
+):
+    """Release the active deployment lease using its unlogged bearer token."""
+    try:
+        state = require_lock_token(request.headers.get(LOCK_HEADER))
+    except DeploymentLockRejected as exc:
+        raise HTTPException(status_code=423, detail=str(exc)) from exc
+    except DeploymentLockUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if state["owner"] != current_user.username and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="deployment lock belongs to another creator")
+    try:
+        release_lock(request.headers.get(LOCK_HEADER))
+    except DeploymentLockRejected as exc:
+        raise HTTPException(status_code=423, detail=str(exc)) from exc
+    await platform_audit_service.log(
+        event_type=AuditEventType.AGENT_LIFECYCLE,
+        event_action="deployment_lock_release",
+        source="api",
+        actor_user=current_user,
+        actor_ip=request.client.host if request.client else None,
+        target_type="fleet",
+        target_id=state["fleetLockDigest"],
+        endpoint=str(request.url.path),
+    )
+    return {"released": True, "fleetLockDigest": state["fleetLockDigest"]}
+
+
 @router.post("")
 async def create_agent_endpoint(config: AgentConfig, request: Request, current_user: User = Depends(require_role("creator"))):
     """Create a new agent. Requires creator role or above."""
@@ -439,6 +521,38 @@ async def create_agent_endpoint(config: AgentConfig, request: Request, current_u
         },
     )
     return result
+
+
+@router.delete("/{agent_name}/deployment-rollback")
+async def rollback_deployment_candidate_endpoint(
+    agent_name: str,
+    request: Request,
+    current_user: User = Depends(require_role("creator")),
+):
+    """Irreversibly remove one candidate named by the active deployment lease."""
+    try:
+        state = require_candidate(request.headers.get(LOCK_HEADER), agent_name)
+    except DeploymentLockRejected as exc:
+        raise HTTPException(status_code=423, detail=str(exc)) from exc
+    except DeploymentLockUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if state["owner"] != current_user.username and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="deployment lock belongs to another creator")
+    if not db.can_user_delete_agent(current_user.username, agent_name):
+        raise HTTPException(status_code=403, detail="You don't have permission to delete this agent")
+    result = await rollback_candidate(agent_name)
+    await platform_audit_service.log(
+        event_type=AuditEventType.AGENT_LIFECYCLE,
+        event_action="deployment_rollback",
+        source="api",
+        actor_user=current_user,
+        actor_ip=request.client.host if request.client else None,
+        target_type="agent",
+        target_id=agent_name,
+        endpoint=str(request.url.path),
+        details={"complete": result["complete"], "proof": result["proof"]},
+    )
+    return JSONResponse(status_code=200 if result["complete"] else 409, content=result)
 
 
 @router.post("/deploy-local")

@@ -29,6 +29,12 @@
 - **Description**: Delete agents and cleanup resources
 - **Key Features**: Container cleanup, network cleanup, cascade delete sharing records
 
+### 1.4.1 Governed Fleet Deployment
+- **Status**: Implemented
+- **Description**: Creator-operated fleet releases use one Trinity-wide, expiring deployment lease so agent mutations cannot race a checked inventory transition.
+- **Key Features**: Redis-backed atomic lease acquisition, exact fleet-lock digest and candidate-name binding, fail-closed mutation admission while a lease is active, and constant-time lease-token verification.
+- **Rollback**: A lease owner can hard-purge only a candidate named in the active lease. Success requires machine-checkable absence of its container, ownership and child rows, connector/MCP keys, credential artifacts, runtime state, and persistent volumes; ordinary deletion remains recoverable soft-delete.
+
 ### 1.5 Agent Logs Viewing
 - **Status**: ✅ Implemented
 - **Description**: View container logs for debugging

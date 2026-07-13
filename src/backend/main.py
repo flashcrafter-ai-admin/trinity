@@ -22,12 +22,20 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, Depends, Request, Query
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 import httpx
 
 from config import CORS_ORIGINS, VOICE_ENABLED, GEMINI_API_KEY
 from models import User
 from dependencies import get_current_user
 from services.docker_service import docker_client, list_all_agents_fast
+from services.deployment_lock_service import (
+    LOCK_HEADER,
+    DeploymentLockRejected,
+    DeploymentLockUnavailable,
+    mutation_requires_admission,
+    require_mutation_admission,
+)
 from utils.helpers import utc_now_iso
 
 # OpenTelemetry imports for distributed tracing (RELIABILITY-002)
@@ -838,13 +846,26 @@ app.add_middleware(
     allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
-    allow_headers=["Authorization", "Content-Type", "X-Source-Agent", "Accept"],
+    allow_headers=["Authorization", "Content-Type", "X-Source-Agent", "Accept", LOCK_HEADER],
 )
 
 # Request-ID middleware — generates a correlation ID for every request.
 # Stored on request.state.request_id for use by audit logging (SEC-001 Phase 2b).
 # Respects an incoming X-Request-ID header if present (e.g. from nginx or upstream proxy).
 import uuid as _uuid
+
+@app.middleware("http")
+async def enforce_deployment_lock(request: Request, call_next):
+    """Serialize all agent-affecting mutations while a fleet lease is active."""
+    if mutation_requires_admission(request.method, request.url.path):
+        try:
+            require_mutation_admission(request.headers.get(LOCK_HEADER))
+        except DeploymentLockRejected as exc:
+            return JSONResponse(status_code=423, content={"detail": str(exc)})
+        except DeploymentLockUnavailable as exc:
+            return JSONResponse(status_code=503, content={"detail": str(exc)})
+    return await call_next(request)
+
 
 @app.middleware("http")
 async def add_request_id(request: Request, call_next):
