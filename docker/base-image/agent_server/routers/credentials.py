@@ -5,7 +5,6 @@ import os
 import base64
 import binascii
 import logging
-from datetime import datetime
 from pathlib import Path
 from typing import List
 
@@ -25,6 +24,7 @@ from ..models import (
 from ..state import agent_state
 from ..services.trinity_mcp import inject_trinity_mcp_if_configured
 from ..utils.credential_sanitizer import refresh_credential_values
+from ..utils.credential_status import credential_file_status
 # Second-layer credential-path policy (Invariant #5) — byte-identical vendored
 # copy of src/backend/services/credential_paths.py (#11).
 from ..credential_paths import is_allowed_credential_path
@@ -238,12 +238,7 @@ async def get_credentials_status():
     for filename in credential_files:
         filepath = home_dir / filename
         if filepath.exists():
-            stat = filepath.stat()
-            files_status[filename] = {
-                "exists": True,
-                "size": stat.st_size,
-                "modified": datetime.fromtimestamp(stat.st_mtime).isoformat()
-            }
+            files_status[filename] = credential_file_status(filepath)
         else:
             files_status[filename] = {"exists": False}
 

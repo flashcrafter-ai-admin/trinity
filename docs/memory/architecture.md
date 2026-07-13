@@ -843,7 +843,7 @@ The per-agent VoIP config + voice-picker UI lives in the agent Settings/Sharing 
 ### Credentials (CRED-002)
 | Method | Path | Description |
 |--------|------|-------------|
-| GET | `/api/agents/{name}/credentials/status` | Check credential files in agent |
+| GET | `/api/agents/{name}/credentials/status` | Check credential files in agent, including SHA-256 integrity metadata for each existing file |
 | POST | `/api/agents/{name}/credentials/inject` | Write credential files directly to agent (`files` text + `files_b64` binary) |
 | POST | `/api/agents/{name}/credentials/export` | Export to `.credentials.enc` (AES-256-GCM) |
 | POST | `/api/agents/{name}/credentials/import` | Import from encrypted file |

@@ -28,4 +28,9 @@
 - **Status**: ✅ Implemented
 - **Description**: Extract from `.mcp.json.template` and show configured vs missing status
 
+### CRED-INTEGRITY-001 Injected File Integrity Readback
+- **Status**: Implemented
+- **Description**: Credential status returns a SHA-256 digest for each existing injected file so an authenticated deployer can verify exact bytes without reading or logging the credential value.
+- **Security**: The endpoint returns only metadata and a one-way digest; credential contents remain available only through the separately governed credential-read flow.
+
 ---
