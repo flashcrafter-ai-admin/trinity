@@ -217,6 +217,7 @@ def loop_module(monkeypatch):
     monkeypatch.setattr(ls, "db", fake_db)
     monkeypatch.setattr(ls, "get_task_execution_service", lambda: fake_task_service)
     monkeypatch.setattr(ls, "_websocket_manager", None)
+    monkeypatch.setattr(ls, "spawn_governed_mutation", asyncio.create_task)
 
     return ls, fake_db, fake_task_service
 

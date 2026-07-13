@@ -36,7 +36,9 @@ from services.deployment_lock_service import (
     begin_mutation,
     end_mutation,
     governed_background_mutation,
+    mutation_admission_context,
     mutation_requires_admission,
+    spawn_governed_mutation,
 )
 from utils.helpers import utc_now_iso
 
@@ -419,7 +421,7 @@ async def lifespan(app: FastAPI):
         # workers, so scheduling it in every worker is safe.
         try:
             if _db.get_setting_value('setup_completed', 'false') == 'true':
-                asyncio.create_task(cornelius_agent_service.ensure_seeded_governed())
+                spawn_governed_mutation(cornelius_agent_service.ensure_seeded_governed())
         except Exception as e:
             logger.error(f"Error scheduling Cornelius seed: {e}")
     else:
@@ -872,6 +874,9 @@ async def enforce_deployment_lock(request: Request, call_next):
         except DeploymentLockUnavailable as exc:
             return JSONResponse(status_code=503, content={"detail": str(exc)})
     try:
+        if counted:
+            with mutation_admission_context(counted):
+                return await call_next(request)
         return await call_next(request)
     finally:
         if counted:

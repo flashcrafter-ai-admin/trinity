@@ -20,6 +20,7 @@ from typing import Optional, Tuple
 from fastapi import Request
 
 from adapters.transports.base import ChannelTransport
+from services.deployment_lock_service import spawn_governed_mutation
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +76,7 @@ class SlackWebhookTransport(ChannelTransport):
 
         # Handle event callback — process async, return 200 immediately
         if event_type == "event_callback":
-            asyncio.create_task(self.on_event(event_data))
+            spawn_governed_mutation(self.on_event(event_data))
 
         return {"ok": True, "challenge": None}
 

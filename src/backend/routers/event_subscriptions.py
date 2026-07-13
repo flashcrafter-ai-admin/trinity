@@ -17,6 +17,7 @@ from models import EmitEventRequest
 
 from database import db
 from dependencies import get_current_user, AuthorizedAgent, OwnedAgent
+from services.deployment_lock_service import spawn_governed_mutation
 from db_models import (
     User,
     EventSubscriptionCreate,
@@ -402,7 +403,7 @@ async def emit_event(
 
     # Trigger matching subscriptions (fire-and-forget)
     for sub in matching_subs:
-        asyncio.create_task(_trigger_subscription(sub, event))
+        spawn_governed_mutation(_trigger_subscription(sub, event))
 
     # Broadcast event via WebSocket
     await _broadcast_event(event, len(matching_subs))
@@ -444,7 +445,7 @@ async def emit_event_for_agent(
     )
 
     for sub in matching_subs:
-        asyncio.create_task(_trigger_subscription(sub, event))
+        spawn_governed_mutation(_trigger_subscription(sub, event))
 
     await _broadcast_event(event, len(matching_subs))
 

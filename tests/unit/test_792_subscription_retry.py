@@ -132,6 +132,7 @@ def _run(*, responses, switch_result, timeout_seconds=300):
         patch("services.task_execution_service.agent_post_with_retry", side_effect=_agent_post),
         patch("services.task_execution_service.dispatch_breaker_active", return_value=False),
         patch("services.task_execution_service._record_dispatch_terminal", AsyncMock()),
+        patch("services.task_execution_service._spawn_bg", lambda coro: coro.close()),
         patch("services.task_execution_service.platform_audit_service", mock_audit),
         patch("services.task_execution_service._SWITCH_RETRY_DELAY_S", 0),
         patch("services.subscription_auto_switch.handle_subscription_failure", mock_switch),

@@ -38,6 +38,7 @@ from config import REDIS_URL, VOIP_MAX_CALL_DURATION
 from database import db
 from services.gemini_voice import voice_service
 from services.voip_service import voip_service, intent_key
+from services.deployment_lock_service import spawn_governed_mutation
 from services.ws_ticket_service import consume_ticket
 
 logger = logging.getLogger(__name__)
@@ -344,7 +345,7 @@ async def _finalize(call_id: str, session, intent: dict, r):
 
     # Post-call processing (default ON): hand the transcript to the MAIN agent.
     if intent.get("process_transcript", True):
-        task = asyncio.create_task(
+        task = spawn_governed_mutation(
             voip_service.process_call_transcript(
                 agent_name=intent["agent_name"],
                 chat_session_id=intent.get("chat_session_id"),

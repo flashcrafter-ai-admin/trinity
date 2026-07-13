@@ -45,7 +45,10 @@ from services.capacity_manager import (
     get_capacity_manager,
 )
 from services.dispatch_breaker import DispatchBreaker
-from services.deployment_lock_service import governed_background_mutation
+from services.deployment_lock_service import (
+    governed_background_mutation,
+    spawn_governed_mutation,
+)
 from services.platform_audit_service import AuditEventType, platform_audit_service
 from services.settings_service import settings_service
 from utils.credential_sanitizer import sanitize_dict, sanitize_execution_log, sanitize_response, sanitize_text
@@ -661,7 +664,7 @@ _background_breaker_tasks: "set[asyncio.Task[Any]]" = set()
 def _spawn_bg(coro: "Coroutine[Any, Any, None]") -> None:
     """Schedule a fire-and-forget breaker task with a strong reference held until
     it finishes — prevents the asyncio weak-ref GC footgun (#526)."""
-    task = asyncio.create_task(coro)
+    task = spawn_governed_mutation(coro)
     _background_breaker_tasks.add(task)
     task.add_done_callback(_background_breaker_tasks.discard)
 

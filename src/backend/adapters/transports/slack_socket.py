@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 from adapters.transports.base import ChannelTransport
+from services.deployment_lock_service import spawn_governed_mutation
 
 logger = logging.getLogger(__name__)
 
@@ -430,7 +431,7 @@ class SlackSocketTransport(ChannelTransport):
                 await self.on_event(req.payload)
             except Exception as e:
                 logger.error(f"Error processing event: {e}", exc_info=True)
-        asyncio.create_task(_process())
+        spawn_governed_mutation(_process())
 
     async def _watchdog(self, ctx: _ClientCtx) -> None:
         """Per-client watchdog. Detects silent socket death and reconnects.

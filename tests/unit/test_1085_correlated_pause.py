@@ -260,6 +260,7 @@ def _run_apply_with_governor(error_code, *, cas_won, flag_on):
         patch("services.task_execution_service.get_capacity_manager", return_value=mock_capacity),
         patch("services.task_execution_service.activity_service", mock_activity),
         patch("services.task_execution_service._record_dispatch_terminal", AsyncMock()),
+        patch("services.task_execution_service._spawn_bg", lambda coro: coro.close()),
         patch("services.redelivery_governor.get_redelivery_governor", return_value=mock_governor),
         patch.object(config, "REDELIVERY_GOVERNOR_ENABLED", flag_on),
     ):

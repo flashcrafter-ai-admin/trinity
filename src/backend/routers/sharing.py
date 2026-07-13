@@ -18,6 +18,7 @@ from services.docker_service import get_agent_container
 from services.client_roster_service import get_client_roster
 from services.platform_audit_service import platform_audit_service, AuditEventType
 from services.proactive_message_service import proactive_message_service
+from services.deployment_lock_service import spawn_governed_mutation
 
 logger = logging.getLogger(__name__)
 
@@ -355,7 +356,7 @@ async def decide_access_request_endpoint(
         # of delivered/skipped/failed lives in the service method.
         channel = (existing.get("channel") or "").lower()
         if channel in _NOTIFIABLE_APPROVAL_CHANNELS:
-            asyncio.create_task(
+            spawn_governed_mutation(
                 _notify_access_request_approval(
                     agent_name=agent_name,
                     recipient_email=existing["email"],

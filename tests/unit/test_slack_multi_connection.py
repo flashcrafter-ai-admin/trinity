@@ -119,6 +119,10 @@ MIN_CONNECTION_COUNT = _mod.MIN_CONNECTION_COUNT
 MAX_CONNECTION_COUNT = _mod.MAX_CONNECTION_COUNT
 DEDUP_RING_SIZE = _mod.DEDUP_RING_SIZE
 
+# Admission semantics are covered by test_deployment_lock_service; these tests
+# isolate Slack's connection and dedup behavior from Redis.
+_mod.spawn_governed_mutation = asyncio.create_task
+
 
 # ---------------------------------------------------------------------------
 # Fakes

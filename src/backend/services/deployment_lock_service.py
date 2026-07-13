@@ -7,6 +7,8 @@ import hmac
 import json
 import secrets
 import asyncio
+from contextlib import contextmanager
+from contextvars import ContextVar
 from functools import wraps
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable
@@ -20,6 +22,11 @@ ENROLLED_KEY_PREFIX = "trinity:agent-deployment-enrolled:v1:"
 LOCK_HEADER = "X-Trinity-Deployment-Lock"
 MIN_TTL_SECONDS = 60
 MAX_TTL_SECONDS = 3600
+_CURRENT_MUTATION_COUNTER: ContextVar[tuple[str, asyncio.Task | None] | None] = ContextVar(
+    "trinity_deployment_mutation_counter", default=None
+)
+
+
 class DeploymentLockUnavailable(RuntimeError):
     pass
 
@@ -212,13 +219,104 @@ def end_mutation(counter_key: str) -> None:
     _redis().eval(script, 1, counter_key)
 
 
+def adopt_mutation(counter_key: str) -> str:
+    """Synchronously extend an already-admitted mutation for a detached child."""
+    if counter_key != IN_FLIGHT_KEY and not counter_key.startswith(LEASE_IN_FLIGHT_PREFIX):
+        raise DeploymentLockUnavailable("invalid inherited deployment mutation counter")
+    client = _redis()
+    script = (
+        "local count = tonumber(redis.call('get', KEYS[2]) or '0'); "
+        "if count <= 0 then return 0 end; "
+        "local lock = redis.call('get', KEYS[1]); "
+        "if KEYS[2] == ARGV[1] then "
+        "if lock then local state = cjson.decode(lock); "
+        "if state['phase'] ~= 'draining' then return 0 end end; "
+        "else if not lock then return 0 end; local state = cjson.decode(lock); "
+        "if state['tokenDigest'] ~= ARGV[2] or "
+        "(state['phase'] ~= 'active' and state['phase'] ~= 'releasing') then return 0 end end; "
+        "redis.call('incr', KEYS[2]); redis.call('expire', KEYS[2], 3600); return 1"
+    )
+    digest = (
+        counter_key.removeprefix(LEASE_IN_FLIGHT_PREFIX)
+        if counter_key.startswith(LEASE_IN_FLIGHT_PREFIX)
+        else ""
+    )
+    if int(client.eval(script, 2, LOCK_KEY, counter_key, IN_FLIGHT_KEY, digest)) != 1:
+        raise DeploymentLockRejected("inherited deployment mutation is no longer admitted")
+    return counter_key
+
+
+@contextmanager
+def mutation_admission_context(counter_key: str):
+    """Expose one admitted counter to awaited work and synchronously spawned children."""
+    token = _CURRENT_MUTATION_COUNTER.set((counter_key, asyncio.current_task()))
+    try:
+        yield
+    finally:
+        _CURRENT_MUTATION_COUNTER.reset(token)
+
+
+def _inherited_mutation_counter() -> str | None:
+    admission = _CURRENT_MUTATION_COUNTER.get()
+    if admission is None:
+        return None
+    counter_key, owner_task = admission
+    return counter_key if owner_task is asyncio.current_task() else None
+
+
+def _reserve_governed_mutation(coro):
+    inherited = _inherited_mutation_counter()
+    try:
+        counter_key = adopt_mutation(inherited) if inherited else begin_mutation(None)
+    except Exception:
+        coro.close()
+        raise
+
+    async def run():
+        try:
+            with mutation_admission_context(counter_key):
+                return await coro
+        finally:
+            end_mutation(counter_key)
+
+    return counter_key, run
+
+
+def reserve_governed_mutation(coro):
+    """Reserve now and return an async callable suitable for BackgroundTasks."""
+    _, run = _reserve_governed_mutation(coro)
+    return run
+
+
+def reserve_governed_call(function, *args, **kwargs):
+    """Reserve an async call before a response-owned background handoff."""
+    return reserve_governed_mutation(function(*args, **kwargs))
+
+
+def spawn_governed_mutation(coro, *, name: str | None = None) -> asyncio.Task:
+    """Reserve before detaching and hold admission through the entire child chain."""
+    counter_key, run = _reserve_governed_mutation(coro)
+    task_coro = run()
+
+    try:
+        return asyncio.create_task(task_coro, name=name)
+    except Exception:
+        task_coro.close()
+        end_mutation(counter_key)
+        coro.close()
+        raise
+
+
 def governed_background_mutation(function):
     """Count non-HTTP mutation jobs so lease acquisition drains them too."""
     @wraps(function)
     async def wrapped(*args, **kwargs):
+        if _inherited_mutation_counter():
+            return await function(*args, **kwargs)
         counted = begin_mutation(None)
         try:
-            return await function(*args, **kwargs)
+            with mutation_admission_context(counted):
+                return await function(*args, **kwargs)
         finally:
             end_mutation(counted)
 

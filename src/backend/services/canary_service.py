@@ -32,6 +32,7 @@ from canary import collect_snapshot, run_invariants
 from canary.snapshot import ViolationReport
 from database import db
 from services.canary_alerts import CanaryAlerts
+from services.deployment_lock_service import governed_background_mutation
 
 
 @dataclass
@@ -140,7 +141,7 @@ class CanaryService:
         await asyncio.sleep(30)
         while self._running:
             try:
-                await self.run_cycle()
+                await self._run_cycle_governed()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -174,6 +175,10 @@ class CanaryService:
             return CycleResult(skipped=True)
         async with self._lock:
             return await self._run_cycle_inner(invariant_ids)
+
+    @governed_background_mutation
+    async def _run_cycle_governed(self) -> CycleResult:
+        return await self.run_cycle()
 
     async def _run_cycle_inner(
         self,

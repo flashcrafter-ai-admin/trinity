@@ -26,6 +26,7 @@ import time
 
 from dataclasses import dataclass
 from utils.helpers import utc_now_iso
+from services.deployment_lock_service import spawn_governed_mutation
 
 logger = logging.getLogger(__name__)
 
@@ -196,7 +197,7 @@ class SlotService:
         if removed and self._on_release_callbacks:
             for cb in self._on_release_callbacks:
                 try:
-                    asyncio.create_task(self._safe_invoke(cb, agent_name))
+                    spawn_governed_mutation(self._safe_invoke(cb, agent_name))
                 except RuntimeError:
                     # No running loop (e.g. called from sync cleanup context).
                     # Skipping the callback is safe — the 60s maintenance task

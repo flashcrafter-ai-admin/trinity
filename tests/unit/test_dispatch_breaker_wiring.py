@@ -180,8 +180,11 @@ class TestRecordDispatchTerminalRouting:
 
 
 class TestSpawnBgRefRetention:
-    def test_ref_held_until_done_then_discarded(self):
+    def test_ref_held_until_done_then_discarded(self, monkeypatch):
         async def _run():
+            monkeypatch.setattr(
+                mod, "spawn_governed_mutation", asyncio.create_task
+            )
             mod._background_breaker_tasks.clear()
             started = asyncio.Event()
             release = asyncio.Event()

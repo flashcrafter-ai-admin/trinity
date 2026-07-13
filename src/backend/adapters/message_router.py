@@ -31,6 +31,7 @@ from services.platform_prompt_service import (
 )
 from services.settings_service import settings_service
 from services.task_execution_service import get_task_execution_service
+from services.deployment_lock_service import spawn_governed_mutation
 from services.docker_utils import container_exec_run
 from services.telegram_media import process_voice
 from services.upload_service import process_file_uploads, format_file_size, sanitize_filename
@@ -712,7 +713,7 @@ class ChannelMessageRouter:
                     agent_name, verified_email
                 )
                 if new_count and new_count % 5 == 0:
-                    asyncio.create_task(summarize_user_memory_background(
+                    spawn_governed_mutation(summarize_user_memory_background(
                         agent_name=agent_name,
                         user_email=verified_email,
                         session_id=session_id,

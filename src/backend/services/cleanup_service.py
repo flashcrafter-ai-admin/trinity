@@ -1515,27 +1515,7 @@ class CleanupService:
 
     async def _cleanup_loop(self):
         """Main cleanup loop."""
-        # One-shot startup hook for #740: any non-terminal agent_loops left
-        # over from a prior process get marked `interrupted`. Loops do not
-        # auto-resume. Runs once on boot, not every cycle.
-        try:
-            interrupted = db.mark_orphan_loops_interrupted()
-            if interrupted > 0:
-                logger.info(
-                    f"[Cleanup] Startup: marked {interrupted} orphan agent_loops as interrupted (#740)"
-                )
-        except Exception as e:
-            logger.error(f"[Cleanup] Loop orphan sweep error: {e}")
-
-        # Run initial cleanup on startup
-        try:
-            startup_report = await self.run_cleanup_governed()
-            if startup_report.total > 0:
-                logger.info(f"[Cleanup] Startup sweep: {startup_report.to_dict()}")
-            else:
-                logger.info("[Cleanup] Startup sweep: no stale resources found")
-        except Exception as e:
-            logger.error(f"[Cleanup] Startup sweep error: {e}")
+        await self._run_startup_cleanup_governed()
 
         while self._running:
             try:
@@ -1550,6 +1530,30 @@ class CleanupService:
             except Exception as e:
                 logger.error(f"[Cleanup] Cycle error: {e}")
 
+    @governed_background_mutation
+    async def _run_startup_cleanup_governed(self) -> None:
+        """Keep startup reconciliation and its first sweep under one admission."""
+        # One-shot startup hook for #740: any non-terminal agent_loops left
+        # over from a prior process get marked `interrupted`. Loops do not
+        # auto-resume. Runs once on boot, not every cycle.
+        try:
+            interrupted = db.mark_orphan_loops_interrupted()
+            if interrupted > 0:
+                logger.info(
+                    f"[Cleanup] Startup: marked {interrupted} orphan agent_loops as interrupted (#740)"
+                )
+        except Exception as e:
+            logger.error(f"[Cleanup] Loop orphan sweep error: {e}")
+
+        # Run initial cleanup on startup
+        try:
+            startup_report = await self.run_cleanup()
+            if startup_report.total > 0:
+                logger.info(f"[Cleanup] Startup sweep: {startup_report.to_dict()}")
+            else:
+                logger.info("[Cleanup] Startup sweep: no stale resources found")
+        except Exception as e:
+            logger.error(f"[Cleanup] Startup sweep error: {e}")
 
 # Global service instance
 cleanup_service = CleanupService()

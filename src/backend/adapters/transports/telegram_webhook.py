@@ -20,6 +20,7 @@ from fastapi import Request
 
 from adapters.transports.base import ChannelTransport
 from database import db
+from services.deployment_lock_service import spawn_governed_mutation
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +79,7 @@ class TelegramWebhookTransport(ChannelTransport):
         update["_agent_name"] = binding["agent_name"]
 
         # 6. Process asynchronously — return 200 immediately
-        asyncio.create_task(self._process_update(update, binding))
+        spawn_governed_mutation(self._process_update(update, binding))
 
         return {"ok": True}
 

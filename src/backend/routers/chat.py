@@ -1689,7 +1689,9 @@ async def execute_parallel_task(
             elif exc := task.exception():
                 logger.error(f"[Task Async] Unhandled exception in background task for agent '{name}', execution_id={execution_id}: {exc}")
 
-        bg_task = asyncio.create_task(
+        from services.deployment_lock_service import spawn_governed_mutation
+
+        bg_task = spawn_governed_mutation(
             _run_async_task_with_persistence(
                 agent_name=name,
                 request=request,

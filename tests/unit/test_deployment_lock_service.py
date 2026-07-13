@@ -11,6 +11,8 @@ import pytest
 
 from services import deployment_lock_service as locks
 from services import deployment_rollback_service as rollback
+from services import cleanup_service as cleanup_module
+from services import slot_service as slot_module
 
 
 class FakeRedis:
@@ -45,6 +47,26 @@ class FakeRedis:
         return value in self.sets.get(key, set())
 
     def eval(self, script, key_count, *args):
+        if key_count == 2 and "count <= 0" in script:
+            lock_key, counter_key, ordinary_key, digest = args
+            count = int(self.values.get(counter_key, "0"))
+            if count <= 0:
+                return 0
+            raw = self.values.get(lock_key)
+            if counter_key == ordinary_key:
+                if raw is not None and json.loads(raw)["phase"] != "draining":
+                    return 0
+            else:
+                if raw is None:
+                    return 0
+                state = json.loads(raw)
+                if state["tokenDigest"] != digest or state["phase"] not in {
+                    "active",
+                    "releasing",
+                }:
+                    return 0
+            self.values[counter_key] = str(count + 1)
+            return 1
         if key_count == 3 and "cjson.decode" in script:
             lock_key, counter_key, lease_counter, token, digest = args
             raw = self.values.get(lock_key)
@@ -206,6 +228,181 @@ async def test_background_mutation_is_counted_and_authority_absence_cannot_hide_
     monkeypatch.setattr(locks, "get_breaker_redis", lambda: None)
     with pytest.raises(locks.DeploymentLockUnavailable):
         await job()
+
+
+@pytest.mark.asyncio
+async def test_acquisition_waits_for_detached_ordinary_child(monkeypatch):
+    redis = FakeRedis()
+    monkeypatch.setattr(locks, "get_breaker_redis", lambda: redis)
+    child_started = asyncio.Event()
+    child_finish = asyncio.Event()
+
+    async def child():
+        child_started.set()
+        await child_finish.wait()
+
+    parent_counter = locks.begin_mutation(None)
+    with locks.mutation_admission_context(parent_counter):
+        task = locks.spawn_governed_mutation(child())
+    locks.end_mutation(parent_counter)
+    await child_started.wait()
+    _, token = locks.acquire_lock(
+        owner="creator",
+        fleet_lock_digest="a" * 64,
+        agent_names=["agent-web"],
+        ttl_seconds=900,
+    )
+    activation = asyncio.create_task(locks.activate_lock_after_drain(token, timeout_seconds=1))
+    await asyncio.sleep(0.06)
+    assert activation.done() is False
+    child_finish.set()
+    await task
+    assert (await activation)["phase"] == "active"
+
+
+@pytest.mark.asyncio
+async def test_raw_task_cannot_reuse_parent_admission_context(monkeypatch):
+    redis = FakeRedis()
+    monkeypatch.setattr(locks, "get_breaker_redis", lambda: redis)
+    observed = asyncio.Event()
+    finish = asyncio.Event()
+
+    @locks.governed_background_mutation
+    async def child():
+        assert redis.values[locks.IN_FLIGHT_KEY] == "2"
+        observed.set()
+        await finish.wait()
+
+    parent_counter = locks.begin_mutation(None)
+    with locks.mutation_admission_context(parent_counter):
+        task = asyncio.create_task(child())
+        await observed.wait()
+    locks.end_mutation(parent_counter)
+    assert redis.values[locks.IN_FLIGHT_KEY] == "1"
+    finish.set()
+    await task
+    assert locks.IN_FLIGHT_KEY not in redis.values
+
+
+@pytest.mark.asyncio
+async def test_release_timeout_is_retryable_and_nested_child_extends_releasing_lease(monkeypatch):
+    redis = FakeRedis()
+    monkeypatch.setattr(locks, "get_breaker_redis", lambda: redis)
+    parent_continue = asyncio.Event()
+    grandchild_finish = asyncio.Event()
+    grandchild_started = asyncio.Event()
+
+    async def grandchild():
+        grandchild_started.set()
+        await grandchild_finish.wait()
+
+    async def child():
+        await parent_continue.wait()
+        nested = locks.spawn_governed_mutation(grandchild())
+        await nested
+
+    _, token = locks.acquire_lock(
+        owner="creator",
+        fleet_lock_digest="a" * 64,
+        agent_names=["agent-web"],
+        ttl_seconds=900,
+    )
+    await locks.activate_lock_after_drain(token)
+    parent_counter = locks.begin_mutation(token)
+    with locks.mutation_admission_context(parent_counter):
+        child_task = locks.spawn_governed_mutation(child())
+    locks.end_mutation(parent_counter)
+
+    with pytest.raises(locks.DeploymentLockConflict, match="did not drain"):
+        await locks.release_lock_after_drain(token, timeout_seconds=0.01)
+    assert locks.active_lock()["phase"] == "releasing"
+    parent_continue.set()
+    await grandchild_started.wait()
+    retry = asyncio.create_task(locks.release_lock_after_drain(token, timeout_seconds=1))
+    await asyncio.sleep(0.06)
+    assert retry.done() is False
+    grandchild_finish.set()
+    await child_task
+    assert (await retry)["phase"] == "releasing"
+    assert locks.active_lock() is None
+
+
+@pytest.mark.asyncio
+async def test_authority_loss_prevents_detached_child_from_starting(monkeypatch):
+    started = False
+
+    async def child():
+        nonlocal started
+        started = True
+
+    monkeypatch.setattr(locks, "get_breaker_redis", lambda: None)
+    with pytest.raises(locks.DeploymentLockUnavailable):
+        locks.spawn_governed_mutation(child())
+    await asyncio.sleep(0)
+    assert started is False
+
+
+@pytest.mark.asyncio
+async def test_slot_release_callback_is_adopted_before_detach(monkeypatch):
+    redis = FakeRedis()
+    monkeypatch.setattr(locks, "get_breaker_redis", lambda: redis)
+    callback_started = asyncio.Event()
+    callback_finish = asyncio.Event()
+    callback_done = asyncio.Event()
+
+    class SlotRedis:
+        def zrem(self, *_args):
+            return 1
+
+        def delete(self, *_args):
+            return 1
+
+        def zcard(self, *_args):
+            return 0
+
+    async def callback(_agent_name):
+        callback_started.set()
+        await callback_finish.wait()
+        callback_done.set()
+
+    service = slot_module.SlotService.__new__(slot_module.SlotService)
+    service.redis = SlotRedis()
+    service.slots_prefix = "agent:slots:"
+    service.metadata_prefix = "agent:slot:"
+    service._on_release_callbacks = [callback]
+    parent_counter = locks.begin_mutation(None)
+    with locks.mutation_admission_context(parent_counter):
+        await service.release_slot("agent-web", "execution-1")
+    await callback_started.wait()
+    assert redis.values[locks.IN_FLIGHT_KEY] == "2"
+    locks.end_mutation(parent_counter)
+    assert redis.values[locks.IN_FLIGHT_KEY] == "1"
+    callback_finish.set()
+    await callback_done.wait()
+    await asyncio.sleep(0)
+    assert locks.IN_FLIGHT_KEY not in redis.values
+
+
+@pytest.mark.asyncio
+async def test_cleanup_startup_write_and_first_sweep_share_one_admission(monkeypatch):
+    redis = FakeRedis()
+    monkeypatch.setattr(locks, "get_breaker_redis", lambda: redis)
+    observed = []
+    monkeypatch.setattr(
+        cleanup_module.db,
+        "mark_orphan_loops_interrupted",
+        lambda: observed.append(redis.values.get(locks.IN_FLIGHT_KEY)) or 0,
+    )
+    service = cleanup_module.CleanupService(poll_interval=1)
+
+    async def first_sweep():
+        observed.append(redis.values.get(locks.IN_FLIGHT_KEY))
+        return cleanup_module.CleanupReport()
+
+    monkeypatch.setattr(service, "run_cleanup", first_sweep)
+    await service._run_startup_cleanup_governed()
+    assert observed == ["1", "1"]
+    assert locks.IN_FLIGHT_KEY not in redis.values
 
 
 def test_deployment_lock_fails_closed_without_authority(monkeypatch):

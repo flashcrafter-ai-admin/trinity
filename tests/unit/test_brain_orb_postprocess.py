@@ -20,6 +20,11 @@ import pytest
 import services.brain_orb_postprocess as pp
 
 
+@pytest.fixture(autouse=True)
+def governed_spawn_stub(monkeypatch):
+    monkeypatch.setattr(pp, "spawn_governed_mutation", asyncio.create_task)
+
+
 class _FakeClientCM:
     def __init__(self, *, status=200, content=b"", exc=None):
         self._status = status

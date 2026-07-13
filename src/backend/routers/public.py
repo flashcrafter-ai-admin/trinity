@@ -31,6 +31,7 @@ from services.agent_auth import agent_httpx_client
 from services.docker_service import get_agent_container
 from services.email_service import email_service
 from services.task_execution_service import get_task_execution_service
+from services.deployment_lock_service import spawn_governed_mutation
 from services.platform_prompt_service import (
     build_public_channel_caller_prompt,
     format_user_memory_block,
@@ -580,7 +581,7 @@ async def public_chat(
         execution_id = execution.id if execution else None
 
         # Spawn background task
-        asyncio.create_task(_execute_public_chat_background(
+        spawn_governed_mutation(_execute_public_chat_background(
             agent_name=agent_name,
             context_prompt=context_prompt,
             source_email=source_email,
@@ -660,7 +661,7 @@ async def public_chat(
     if identifier_type == "email" and verified_email:
         new_count = db.increment_public_user_memory_count(agent_name, verified_email)
         if new_count % 5 == 0:
-            asyncio.create_task(summarize_user_memory_background(
+            spawn_governed_mutation(summarize_user_memory_background(
                 agent_name=agent_name,
                 user_email=verified_email,
                 session_id=chat_session.id,
@@ -967,7 +968,7 @@ async def _execute_public_chat_background(
             if identifier_type == "email" and verified_email:
                 new_count = db.increment_public_user_memory_count(agent_name, verified_email)
                 if new_count % 5 == 0:
-                    asyncio.create_task(summarize_user_memory_background(
+                    spawn_governed_mutation(summarize_user_memory_background(
                         agent_name=agent_name,
                         user_email=verified_email,
                         session_id=chat_session_id,

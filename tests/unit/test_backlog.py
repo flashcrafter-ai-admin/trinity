@@ -64,6 +64,16 @@ sys.path.insert(0, _BACKEND_STR)
 from db_harness import db_backend, run as _hrun  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def governed_spawn_stub(monkeypatch):
+    """Unit tests isolate backlog/slot behavior from the Redis admission authority."""
+    import services.backlog_service as backlog_mod
+    import services.slot_service as slot_mod
+
+    monkeypatch.setattr(backlog_mod, "spawn_governed_mutation", asyncio.create_task)
+    monkeypatch.setattr(slot_mod, "spawn_governed_mutation", asyncio.create_task)
+
+
 @pytest.fixture
 def tmp_db(db_backend):
     """Active backend with a fresh FULL production schema (db_harness, #300).

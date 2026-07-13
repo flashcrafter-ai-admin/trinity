@@ -32,6 +32,7 @@ from datetime import datetime
 from typing import Any, Dict, Optional
 
 from models import ParallelTaskRequest, TaskExecutionStatus
+from services.deployment_lock_service import spawn_governed_mutation
 from services.slot_service import get_slot_service
 from utils.helpers import utc_now_iso
 
@@ -280,7 +281,7 @@ class BacklogService:
             inject_result=metadata.get("inject_result") or False,
         )
 
-        task = asyncio.create_task(
+        task = spawn_governed_mutation(
             _run_async_task_with_persistence(
                 agent_name=agent_name,
                 request=request,

@@ -496,6 +496,7 @@ class TestDrainWiring:
         monkeypatch.setattr(tse, "DispatchBreaker", lambda _name: breaker)
         drain = AsyncMock()
         monkeypatch.setattr(tse, "_fail_backlog_and_audit", drain)
+        monkeypatch.setattr(tse, "spawn_governed_mutation", asyncio.create_task)
         tse._background_breaker_tasks.clear()
 
         async def _run():

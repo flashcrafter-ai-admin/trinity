@@ -22,6 +22,7 @@ from google import genai
 from google.genai import types as genai_types
 
 from config import GEMINI_API_KEY, VOICE_MODEL, VOICE_MAX_DURATION, REDIS_URL
+from services.deployment_lock_service import spawn_governed_mutation
 
 logger = logging.getLogger(__name__)
 
@@ -483,7 +484,7 @@ class GeminiVoiceService:
                         fc_list = getattr(response.tool_call, 'function_calls', []) or []
                         for fc in fc_list:
                             call_id = getattr(fc, 'id', None) or secrets.token_hex(8)
-                            task = asyncio.create_task(
+                            task = spawn_governed_mutation(
                                 self._execute_and_respond(session, call_id, fc)
                             )
                             session._pending_tool_tasks[call_id] = task

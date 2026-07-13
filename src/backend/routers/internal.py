@@ -31,6 +31,7 @@ from services.activity_service import activity_service
 from services.task_execution_service import get_task_execution_service
 from services.platform_audit_service import platform_audit_service, AuditEventType
 from services import idempotency_service
+from services.deployment_lock_service import spawn_governed_mutation
 
 logger = logging.getLogger(__name__)
 
@@ -311,7 +312,7 @@ async def execute_task_internal(
 
     if request.async_mode:
         # Fire-and-forget: spawn background task, return immediately
-        asyncio.create_task(_execute_task_internal_background(
+        spawn_governed_mutation(_execute_task_internal_background(
             task_service, request
         ))
         accepted = {
@@ -453,7 +454,7 @@ async def validate_execution(request: ValidateExecutionRequest):
     validation_service = get_validation_service()
 
     # Run validation in background to not block the scheduler
-    asyncio.create_task(
+    spawn_governed_mutation(
         _run_validation_background(
             validation_service=validation_service,
             execution_id=request.execution_id,

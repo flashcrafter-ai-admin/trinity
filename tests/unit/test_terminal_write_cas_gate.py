@@ -88,6 +88,7 @@ class TestSuccessPathCasGate:
             patch("services.task_execution_service.agent_post_with_retry", AsyncMock(return_value=_success_response())),
             patch("services.task_execution_service.dispatch_breaker_active", return_value=False),
             patch("services.task_execution_service._record_dispatch_terminal", mock_record),
+            patch("services.task_execution_service._spawn_bg", lambda coro: coro.close()),
         ):
             svc = TaskExecutionService()
             result = self._await(

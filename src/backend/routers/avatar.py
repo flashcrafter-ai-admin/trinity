@@ -20,6 +20,7 @@ from models import AvatarGenerateRequest, User
 from services.agent_auth import agent_httpx_client
 from services.image_generation_prompts import AVATAR_EMOTIONS, AVATAR_EMOTION_PROMPTS
 from services.image_generation_service import get_image_generation_service
+from services.deployment_lock_service import spawn_governed_mutation
 from utils.image_optimize import optimize_avatar
 
 router = APIRouter(prefix="/api/agents", tags=["avatars"])
@@ -459,7 +460,7 @@ async def generate_avatar(
                 ep.unlink()
 
     # Kick off background emotion generation (AVATAR-002)
-    asyncio.create_task(
+    spawn_governed_mutation(
         _generate_emotions_background(agent_name, result.image_data, identity_prompt)
     )
 

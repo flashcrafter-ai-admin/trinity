@@ -27,6 +27,7 @@ import logging
 from typing import Optional
 
 from services.agent_auth import agent_httpx_client
+from services.deployment_lock_service import spawn_governed_mutation
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +40,7 @@ _background_tasks: set = set()
 
 
 def _spawn_bg(coro) -> None:
-    task = asyncio.create_task(coro)
+    task = spawn_governed_mutation(coro)
     _background_tasks.add(task)
     task.add_done_callback(_background_tasks.discard)
 

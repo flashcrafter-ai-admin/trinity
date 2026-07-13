@@ -32,6 +32,7 @@ from services.monitoring_service import (
     stop_monitoring_service,
     DEFAULT_CONFIG,
 )
+from services.deployment_lock_service import reserve_governed_call
 from services.agent_service import get_accessible_agents
 
 
@@ -584,7 +585,7 @@ async def trigger_fleet_health_check(
     async def run_checks():
         await perform_fleet_health_check(running_agents, DEFAULT_CONFIG, store_results=True)
 
-    background_tasks.add_task(run_checks)
+    background_tasks.add_task(reserve_governed_call(run_checks))
 
     return {
         "status": "started",

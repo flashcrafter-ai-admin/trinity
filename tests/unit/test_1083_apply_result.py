@@ -65,6 +65,7 @@ def _run_apply(envelope, *, cas_won=True, reconciled_status="cancelled",
         patch("services.task_execution_service.get_capacity_manager", return_value=mock_capacity),
         patch("services.task_execution_service.activity_service", mock_activity),
         patch("services.task_execution_service._record_dispatch_terminal", mock_record),
+        patch("services.task_execution_service._spawn_bg", lambda coro: coro.close()),
     ):
         svc = TaskExecutionService()
         result = _await(

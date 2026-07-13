@@ -78,6 +78,9 @@ def patched(monkeypatch):
     monkeypatch.setattr(setup, "db", db)
     monkeypatch.setattr(setup, "validate_password_strength", lambda p: [])
     monkeypatch.setattr(setup, "hash_password", lambda p: "hashed:" + p)
+    monkeypatch.setattr(
+        setup, "reserve_governed_call", lambda function, *args, **kwargs: function
+    )
     return db
 
 

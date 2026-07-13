@@ -78,6 +78,7 @@ def _run(*, triggered_by, dispatch_async, agent_resp):
         patch("services.task_execution_service.agent_post_with_retry", post_mock),
         patch("services.task_execution_service.dispatch_breaker_active", return_value=False),
         patch("services.task_execution_service._record_dispatch_terminal", AsyncMock()),
+        patch("services.task_execution_service._spawn_bg", lambda coro: coro.close()),
     ):
         svc = TaskExecutionService()
         result = _await(

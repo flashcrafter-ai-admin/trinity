@@ -79,6 +79,7 @@ _STUBBED_MODULE_NAMES = [
     "config",
     "database",
     "services",
+    "services.deployment_lock_service",
     "services.gemini_voice",
     "services.voip_service",
     "services.ws_ticket_service",
@@ -141,6 +142,9 @@ def _load_media_stream_module() -> types.ModuleType:
 
     services_pkg = _pkg("services")
 
+    deployment_lock_mod = types.ModuleType("services.deployment_lock_service")
+    deployment_lock_mod.spawn_governed_mutation = lambda coro: asyncio.create_task(coro)
+
     gemini_mod = types.ModuleType("services.gemini_voice")
     gemini_mod.voice_service = MagicMock()
 
@@ -165,6 +169,7 @@ def _load_media_stream_module() -> types.ModuleType:
         "config": config_mod,
         "database": database_mod,
         "services": services_pkg,
+        "services.deployment_lock_service": deployment_lock_mod,
         "services.gemini_voice": gemini_mod,
         "services.voip_service": voip_svc_mod,
         "services.ws_ticket_service": ws_ticket_mod,

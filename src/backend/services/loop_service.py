@@ -34,6 +34,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 from database import db
+from services.deployment_lock_service import spawn_governed_mutation
 from services.task_execution_service import (
     TaskExecutionResult,
     get_task_execution_service,
@@ -145,7 +146,7 @@ class LoopService:
             source_mcp_key_name=source_mcp_key_name,
         )
         loop_id = loop_row["id"]
-        task = asyncio.create_task(self._run(loop_id))
+        task = spawn_governed_mutation(self._run(loop_id))
         async with self._lock:
             self._handles[loop_id] = _LoopHandle(
                 loop_id=loop_id,

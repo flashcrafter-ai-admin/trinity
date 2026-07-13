@@ -60,6 +60,7 @@ def _run_apply(envelope, *, cas_won=True, activity_id="act-1", release_slot=Fals
         patch("services.task_execution_service.get_capacity_manager", return_value=mock_capacity),
         patch("services.task_execution_service.activity_service", mock_activity),
         patch("services.task_execution_service._record_dispatch_terminal", mock_record),
+        patch("services.task_execution_service._spawn_bg", lambda coro: coro.close()),
     ):
         svc = TaskExecutionService()
         result = _await(
@@ -170,6 +171,7 @@ def _run_execute_task(response_payload: dict):
               AsyncMock(return_value=_agent_response(response_payload))),
         patch("services.task_execution_service.dispatch_breaker_active", return_value=False),
         patch("services.task_execution_service._record_dispatch_terminal", AsyncMock()),
+        patch("services.task_execution_service._spawn_bg", lambda coro: coro.close()),
     ):
         svc = TaskExecutionService()
         result = _await(

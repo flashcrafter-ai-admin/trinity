@@ -22,6 +22,7 @@ from twilio.request_validator import RequestValidator
 
 from adapters.transports.base import ChannelTransport
 from database import db
+from services.deployment_lock_service import spawn_governed_mutation
 
 logger = logging.getLogger(__name__)
 
@@ -142,7 +143,7 @@ class TwilioWebhookTransport(ChannelTransport):
         raw_event["_agent_name"] = binding["agent_name"]
 
         # 6. Process asynchronously — return 200 immediately
-        asyncio.create_task(self._process_update(raw_event, binding))
+        spawn_governed_mutation(self._process_update(raw_event, binding))
 
         return {"ok": True}
 
