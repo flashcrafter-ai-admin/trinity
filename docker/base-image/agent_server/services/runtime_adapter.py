@@ -30,6 +30,7 @@ class RuntimeCapabilities:
     session_tab_resume: bool = False
     mcp_support: bool = False
     cost_reporting: str = "estimated"  # "native" | "estimated"
+    sealed_operation_grant: bool = False
 
     def to_dict(self) -> Dict[str, object]:
         return asdict(self)
@@ -137,6 +138,7 @@ class AgentRuntime(ABC):
         resume_session_id: Optional[str] = None,
         persist_session: bool = False,
         images: Optional[List[Dict]] = None,
+        operation_grant: Optional[str] = None,
     ) -> Tuple[str, List[ExecutionLogEntry], ExecutionMetadata, str]:
         """
         Execute a stateless task in headless mode (no conversation context).
@@ -161,6 +163,8 @@ class AgentRuntime(ABC):
                 JSONL is written and a future ``--resume`` can reattach.
                 Default False preserves stateless headless behavior for all
                 existing callers (schedules, MCP, fan-out, webhooks).
+            operation_grant: Optional signed authorization delivered outside
+                the model prompt through a sealed runtime context.
 
         Returns:
             Tuple of (response_text, execution_log, metadata, session_id)
@@ -223,4 +227,3 @@ def get_runtime() -> AgentRuntime:
         f"Known runtimes: {sorted(KNOWN_RUNTIMES)}. "
         "Refusing to silently fall back to Claude Code."
     )
-

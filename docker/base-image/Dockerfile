@@ -68,6 +68,13 @@ RUN npm install -g @google/gemini-cli
 # the linux-x64 build lands here. Bump deliberately after testing.
 RUN npm install -g @openai/codex@0.139.0
 
+COPY ./task-context-runner.c /tmp/task-context-runner.c
+RUN gcc -std=c11 -O2 -Wall -Wextra -Werror -fPIE -pie \
+        /tmp/task-context-runner.c -o /usr/local/bin/trinity-task-context && \
+    chown root:root /usr/local/bin/trinity-task-context && \
+    chmod 4555 /usr/local/bin/trinity-task-context && \
+    rm /tmp/task-context-runner.c
+
 RUN useradd -m -s /bin/bash -u 1000 developer && \
     echo "developer:developer" | chpasswd && \
     usermod -aG sudo developer && \
@@ -158,4 +165,3 @@ RUN mkdir -p /var/lib/trinity && \
 USER developer
 
 CMD ["/app/startup.sh"]
-

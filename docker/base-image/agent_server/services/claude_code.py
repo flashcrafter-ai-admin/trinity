@@ -84,6 +84,7 @@ class ClaudeCodeRuntime(AgentRuntime):
             session_tab_resume=True,
             mcp_support=True,
             cost_reporting="native",
+            sealed_operation_grant=True,
         )
 
     def is_available(self) -> bool:
@@ -158,6 +159,7 @@ class ClaudeCodeRuntime(AgentRuntime):
         resume_session_id: Optional[str] = None,
         persist_session: bool = False,
         images: Optional[List[Dict]] = None,
+        operation_grant: Optional[str] = None,
     ) -> Tuple[str, List[ExecutionLogEntry], ExecutionMetadata, str]:
         """Execute Claude Code in headless mode for parallel tasks.
 
@@ -170,6 +172,7 @@ class ClaudeCodeRuntime(AgentRuntime):
             prompt, model, allowed_tools, system_prompt, timeout_seconds,
             max_turns, execution_id, resume_session_id,
             persist_session=persist_session, images=images,
+            operation_grant=operation_grant,
         )
 
 

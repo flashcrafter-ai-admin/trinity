@@ -20,6 +20,7 @@ def test_default_capabilities_are_conservative():
     assert caps.session_tab_resume is False
     assert caps.mcp_support is False
     assert caps.cost_reporting == "estimated"
+    assert caps.sealed_operation_grant is False
 
 
 def test_claude_is_the_reference_runtime():
@@ -28,6 +29,7 @@ def test_claude_is_the_reference_runtime():
     assert caps.session_tab_resume is True   # the Session tab is Claude's machinery
     assert caps.mcp_support is True
     assert caps.cost_reporting == "native"   # Claude emits total_cost_usd
+    assert caps.sealed_operation_grant is True
 
 
 def test_gemini_has_continuity_but_no_session_resume():
@@ -35,6 +37,7 @@ def test_gemini_has_continuity_but_no_session_resume():
     assert caps.chat_continuity is True
     assert caps.session_tab_resume is False  # execute_headless ignores resume
     assert caps.cost_reporting == "estimated"
+    assert caps.sealed_operation_grant is False
 
 
 def test_codex_matches_gemini_shape_for_resume_and_cost():
@@ -43,6 +46,7 @@ def test_codex_matches_gemini_shape_for_resume_and_cost():
     assert caps.session_tab_resume is False   # MVP: Session tab stays Claude/Gemini
     assert caps.mcp_support is True
     assert caps.cost_reporting == "estimated"
+    assert caps.sealed_operation_grant is False
 
 
 def test_capabilities_to_dict_is_serializable_for_callers():
@@ -55,4 +59,5 @@ def test_capabilities_to_dict_is_serializable_for_callers():
         "session_tab_resume": False,
         "mcp_support": True,
         "cost_reporting": "estimated",
+        "sealed_operation_grant": False,
     }

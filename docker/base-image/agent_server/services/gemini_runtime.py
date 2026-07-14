@@ -582,6 +582,7 @@ class GeminiRuntime(AgentRuntime):
         resume_session_id: Optional[str] = None,
         persist_session: bool = False,
         images: Optional[List[Dict]] = None,
+        operation_grant: Optional[str] = None,
     ) -> Tuple[str, List[ExecutionLogEntry], ExecutionMetadata, str]:
         """
         Execute Gemini CLI in headless mode for parallel tasks.
@@ -595,6 +596,11 @@ class GeminiRuntime(AgentRuntime):
         Note: resume_session_id and persist_session are not supported by
         Gemini CLI (accepted for ABC parity, ignored at runtime).
         """
+        if operation_grant:
+            raise HTTPException(
+                status_code=422,
+                detail="Gemini runtime does not support sealed operation grants",
+            )
         # Note: resume_session_id and persist_session are ignored — Gemini CLI doesn't support resume
         if not self.is_available():
             raise HTTPException(
@@ -791,4 +797,3 @@ def get_gemini_runtime() -> GeminiRuntime:
     if _gemini_runtime is None:
         _gemini_runtime = GeminiRuntime()
     return _gemini_runtime
-

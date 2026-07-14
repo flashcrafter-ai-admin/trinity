@@ -127,6 +127,11 @@ async def execute_task(request: ParallelTaskRequest):
     else:
         logger.info(f"[Task] Executing parallel task: {request.message[:50]}...")
 
+    sealed_grant = getattr(request, "operation_grant", None)
+    operation_grant = sealed_grant.get_secret_value() if sealed_grant else None
+    if operation_grant and request.async_result:
+        raise HTTPException(status_code=422, detail="operation grants require synchronous tasks")
+
     # #1083 fire-and-forget: when the backend requests async AND this is the
     # Claude runtime, accept with 202 and run the turn in a detached task that
     # reports the terminal to the backend's result-callback endpoint. The detached
@@ -141,11 +146,16 @@ async def execute_task(request: ParallelTaskRequest):
 
     # Execute via runtime adapter in headless mode (no lock, no --continue)
     runtime = get_runtime()
+    if operation_grant and not runtime.capabilities().sealed_operation_grant:
+        raise HTTPException(
+            status_code=422,
+            detail="selected runtime does not support sealed operation grants",
+        )
     # #1020: feed the richer /health signal — count this execution and record
     # success/failure (drives consecutive_failures, consumed by #526).
     agent_state.record_task_start()
     try:
-        response_text, raw_messages, metadata, session_id = await runtime.execute_headless(
+        runtime_arguments = dict(
             prompt=request.message,
             model=request.model,
             allowed_tools=request.allowed_tools,
@@ -156,6 +166,11 @@ async def execute_task(request: ParallelTaskRequest):
             resume_session_id=request.resume_session_id,  # Resume previous session (EXEC-023)
             persist_session=bool(request.persist_session),  # Session tab: write JSONL for future --resume
             images=request.images,  # Vision images from channel adapters (#562)
+        )
+        if operation_grant:
+            runtime_arguments["operation_grant"] = operation_grant
+        response_text, raw_messages, metadata, session_id = await runtime.execute_headless(
+            **runtime_arguments
         )
     except HTTPException as exc:
         # #679 (F3): a terminated turn that surfaces a non-auth/non-rate terminal

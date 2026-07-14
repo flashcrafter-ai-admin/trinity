@@ -1009,7 +1009,13 @@ class CodexRuntime(AgentRuntime):
         resume_session_id: Optional[str] = None,
         persist_session: bool = False,
         images: Optional[List[Dict]] = None,
+        operation_grant: Optional[str] = None,
     ) -> Tuple[str, List[ExecutionLogEntry], ExecutionMetadata, Optional[str]]:
+        if operation_grant:
+            raise HTTPException(
+                status_code=422,
+                detail="Codex runtime does not support sealed operation grants",
+            )
         if not self.is_available():
             raise HTTPException(
                 status_code=503,

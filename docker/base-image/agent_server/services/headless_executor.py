@@ -283,6 +283,7 @@ class HeadlessRunContext:
     effective_timeout: int
     images: Optional[List[Dict]]
     prompt: str
+    operation_grant: Optional[str] = field(default=None, repr=False)
     # #678: UUID we passed to `claude --session-id`. Used as the JSONL
     # filename fallback when the reader race fires before any stdout
     # arrives, leaving `metadata.session_id` unset. Empty string when
@@ -365,6 +366,7 @@ def _setup_headless_command(
     resume_session_id: Optional[str],
     persist_session: bool,
     images: Optional[List[Dict]],
+    operation_grant: Optional[str] = None,
 ) -> HeadlessRunContext:
     """Build the claude CLI command and initialise the run context.
 
@@ -467,6 +469,11 @@ def _setup_headless_command(
     cmd.extend(["--max-turns", str(effective_max_turns)])
     logger.info(f"[Headless Task] Limiting to {effective_max_turns} agentic turns")
 
+    if operation_grant:
+        if len(operation_grant) < 64 or len(operation_grant) > 32768:
+            raise HTTPException(status_code=422, detail="operation grant framing is invalid")
+        cmd = ["/usr/local/bin/trinity-task-context", "/usr/local/bin/claude", *cmd[1:]]
+
     # Use provided execution_id if available (enables termination tracking from backend)
     task_session_id = execution_id or str(uuid.uuid4())
 
@@ -484,6 +491,7 @@ def _setup_headless_command(
         effective_timeout=timeout_seconds,
         images=images,
         prompt=prompt,
+        operation_grant=operation_grant,
         claude_session_uuid=claude_session_uuid,
         # #1521: seed the fallback context window from the model catalog. The
         # stream parser overwrites it from the runtime's modelUsage.contextWindow
@@ -692,8 +700,17 @@ def _run_headless_subprocess(ctx: HeadlessRunContext) -> None:
     stderr_thread.start()
     stdout_thread.start()
 
-    # Build and write stdin payload. For vision tasks use stream-json
-    # format so images arrive as proper content blocks (#562).
+    stdin_payload = _headless_stdin_payload(ctx)
+
+    process.stdin.write(stdin_payload)
+    process.stdin.close()
+    _wait_for_headless_subprocess(ctx, process, stdout_thread, stderr_thread)
+
+
+def _headless_stdin_payload(ctx: HeadlessRunContext) -> str:
+    """Build task stdin, keeping the sealed grant out of argv and env."""
+    # For vision tasks use stream-json format so images arrive as proper
+    # content blocks (#562).
     if ctx.images:
         content_blocks: List[Dict] = [
             {
@@ -714,10 +731,19 @@ def _run_headless_subprocess(ctx: HeadlessRunContext) -> None:
     else:
         stdin_payload = ctx.prompt
 
-    process.stdin.write(stdin_payload)
-    process.stdin.close()
+    if ctx.operation_grant:
+        stdin_payload = f"{ctx.operation_grant}\n{stdin_payload}"
+    return stdin_payload
 
-    # Bounded, polling wait. Three exits beyond the overall budget (#970):
+
+def _wait_for_headless_subprocess(
+    ctx: HeadlessRunContext,
+    process: subprocess.Popen,
+    stdout_thread: threading.Thread,
+    stderr_thread: threading.Thread,
+) -> None:
+    """Wait for a spawned task while enforcing result, stall, and wall-clock bounds."""
+    # Three exits beyond the overall budget (#970):
     #   (a) early-completion — claude emitted its {"type":"result"} (the turn
     #       is definitively over) but the process lingers in teardown (e.g. a
     #       stdio MCP child holding the pipe). Finalize with the captured
@@ -1149,6 +1175,7 @@ async def execute_headless_task(
     resume_session_id: Optional[str] = None,
     persist_session: bool = False,
     images: Optional[List[Dict]] = None,
+    operation_grant: Optional[str] = None,
 ) -> tuple[str, List[ExecutionLogEntry], ExecutionMetadata, str]:
     """
     Execute Claude Code in headless mode for parallel task execution.
@@ -1199,6 +1226,7 @@ async def execute_headless_task(
             resume_session_id=resume_session_id,
             persist_session=persist_session,
             images=images,
+            operation_grant=operation_grant,
         )
 
         registry = get_process_registry()
