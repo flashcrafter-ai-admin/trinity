@@ -1385,6 +1385,14 @@ async def execute_parallel_task(
     if container.status != "running":
         raise HTTPException(status_code=503, detail="Agent is not running")
 
+    sealed_grant = request.operation_grant
+    operation_grant = sealed_grant.get_secret_value() if sealed_grant else None
+    if operation_grant and request.async_mode:
+        raise HTTPException(
+            status_code=422,
+            detail="Sealed operation grants require synchronous tasks",
+        )
+
     # #1068 (demotion PR 1): normalize the deprecated per-task timeout override once
     # here — in place, so every downstream site (acquire, execute_task, backlog
     # payload) sees the clamped value and the warning fires once. No-override path skipped.
@@ -1740,9 +1748,11 @@ async def execute_parallel_task(
             max_concurrent=sync_max_parallel_tasks,
             message_preview=request.message[:100] if request.message else "",
             timeout_seconds=sync_effective_timeout,
-            overflow_policy="queue_persistent",
+            overflow_policy="reject" if operation_grant else "queue_persistent",
             breaker_enabled=sync_cb_enabled,
-            overflow_payload=PersistentTaskPayload(
+            overflow_payload=None
+            if operation_grant
+            else PersistentTaskPayload(
                 request=request,
                 effective_timeout=sync_effective_timeout,
                 user_id=current_user.id,
@@ -1772,7 +1782,10 @@ async def execute_parallel_task(
         raise HTTPException(
             status_code=429,
             detail=(
-                f"Agent '{name}' is at capacity ({sync_max_parallel_tasks} parallel tasks) "
+                f"Agent '{name}' is at capacity and sealed operation grants require immediate "
+                "synchronous capacity. Try again later."
+                if operation_grant
+                else f"Agent '{name}' is at capacity ({sync_max_parallel_tasks} parallel tasks) "
                 f"and its backlog is full. Try again later."
             ),
         ) from e
@@ -1898,6 +1911,7 @@ async def execute_parallel_task(
         slot_already_held=True,  # Issue #498: router pre-acquired
         images=_image_data,
         dispatch_gate_checked=True,  # #526: router already gated at acquire()
+        operation_grant=operation_grant,
     )
 
     # Complete collaboration activity based on result

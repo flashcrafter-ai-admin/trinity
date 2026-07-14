@@ -212,6 +212,10 @@ class ParallelTaskRequest(BaseModel):
     resume_session_id: Optional[str] = None  # Claude Code session ID to resume (EXEC-023)
     inject_result: Optional[bool] = False  # If true and self-task, inject result as message in originating chat session (SELF-EXEC-001)
     files: Optional[List[WebFileUpload]] = None  # File attachments (#364)
+    # Signed capability delivered only to the target agent's native task-context
+    # runner. Excluding it prevents backlog/model serialization if a caller ever
+    # attempts to combine it with an asynchronous task.
+    operation_grant: Optional[SecretStr] = Field(default=None, exclude=True, repr=False)
 
 
 # ============================================================================

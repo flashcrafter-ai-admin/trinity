@@ -77,9 +77,11 @@ def _env(idem, acquire_exc):
         yield {"isvc": isvc, "cap": cap, "db": db}
 
 
-def _call(async_mode):
+def _call(async_mode, operation_grant=None):
     return asyncio.run(execute_parallel_task(
-        request=ParallelTaskRequest(message="hi", async_mode=async_mode),
+        request=ParallelTaskRequest(
+            message="hi", async_mode=async_mode, operation_grant=operation_grant
+        ),
         name="agent1",
         current_user=_user(),
         x_source_agent=None,
@@ -116,3 +118,17 @@ def test_async_capacity_full_still_releases_idem_and_429():
             _call(async_mode=True)
     assert exc.value.status_code == 429
     m["isvc"].fail.assert_called_once()
+
+
+def test_sync_sealed_grant_never_enters_persistent_overflow():
+    """WHY: secret capability bytes must not be serialized into the backlog."""
+    full = CapacityFull(agent_name="agent1", max_concurrent=3, reason="rejected", depth=0)
+    grant = f"{'a' * 96}.{'b' * 96}"
+    with _env(_idem(), full) as m:
+        with pytest.raises(HTTPException) as exc:
+            _call(async_mode=False, operation_grant=grant)
+
+    assert exc.value.status_code == 429
+    kwargs = m["cap"].acquire.await_args.kwargs
+    assert kwargs["overflow_policy"] == "reject"
+    assert kwargs["overflow_payload"] is None

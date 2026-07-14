@@ -900,6 +900,7 @@ class TaskExecutionService:
         source_channel: Optional[str] = None,
         source_channel_chat_id: Optional[str] = None,
         source_channel_thread: Optional[str] = None,
+        operation_grant: Optional[str] = None,
     ) -> TaskExecutionResult:
         """
         Execute a task on an agent container with full lifecycle management.
@@ -949,6 +950,12 @@ class TaskExecutionService:
         # the agent ACKs 202 we hand the slot lease to the callback and skip the
         # `finally` release. Best-effort read; defaults off.
         async_dispatch = dispatch_async_eligible(triggered_by)
+        if operation_grant:
+            # Sealed grants are never persisted or handed to the callback path.
+            # The authenticated public route rejects async_mode before creating
+            # an execution row; this service guard keeps every direct caller
+            # synchronous as well.
+            async_dispatch = False
         # Set True once a 202 ACK hands the slot lease to the result callback, so
         # the `finally` does NOT release it (the callback/reaper owns it now).
         async_handoff = False
@@ -1203,6 +1210,8 @@ class TaskExecutionService:
                 # it and runs synchronously (200 → sync fallback below).
                 "async_result": async_dispatch,
             }
+            if operation_grant:
+                payload["operation_grant"] = operation_grant
 
             effective_timeout = float(timeout_seconds or 600) + 10
             logger.info(f"[TaskExecService] Calling agent {agent_name} /api/task (timeout={effective_timeout}s, tools={allowed_tools}, msg_len={len(message)})")

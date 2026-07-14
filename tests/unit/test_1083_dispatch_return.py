@@ -43,7 +43,7 @@ def _resp(status_code, body=None):
     return r
 
 
-def _run(*, triggered_by, dispatch_async, agent_resp):
+def _run(*, triggered_by, dispatch_async, agent_resp, operation_grant=None):
     """Drive execute_task with config.DISPATCH_ASYNC=dispatch_async and a mocked
     agent response. Returns (result, mocks dict)."""
     import config
@@ -89,6 +89,7 @@ def _run(*, triggered_by, dispatch_async, agent_resp):
                 execution_id="exec-1083",
                 timeout_seconds=300,
                 model="sonnet",
+                operation_grant=operation_grant,
             )
         )
     return result, {"db": mock_db, "capacity": mock_capacity, "post": post_mock}
@@ -100,6 +101,27 @@ def _payload_of(post_mock):
 
 
 class TestAsyncDispatchReturn:
+    def test_sealed_grant_forces_sync_and_reaches_agent_payload(self):
+        grant = f"{'a' * 96}.{'b' * 96}"
+        _, mocks = _run(
+            triggered_by="schedule",
+            dispatch_async=True,
+            agent_resp=_resp(
+                200,
+                {
+                    "response": "done",
+                    "session_id": "s1",
+                    "metadata": {"cost_usd": 0.0, "context_window": 200000},
+                    "execution_log": [],
+                },
+            ),
+            operation_grant=grant,
+        )
+
+        payload = _payload_of(mocks["post"])
+        assert payload["async_result"] is False
+        assert payload["operation_grant"] == grant
+
     def test_schedule_202_returns_running_no_slot_release(self):
         from services.task_execution_service import TaskExecutionStatus
 

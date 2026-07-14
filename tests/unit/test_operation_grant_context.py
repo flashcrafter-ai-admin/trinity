@@ -98,8 +98,22 @@ def test_native_runner_is_fixed_to_claude_and_root_context_paths():
     ).read_text()
 
     assert '"/usr/local/bin/claude"' in source
-    assert 'CONTEXT_DIR "/run/trinity-task-context"' in source
-    assert 'CONTEXT_FILE CONTEXT_DIR "/operation-grant"' in source
+    assert 'CONTEXT_ROOT "/run/trinity-task-context"' in source
+    assert "setsid()" in source
+    assert '"session-start"' in source
+    assert '"/proc/%ld/stat"' in source
+    assert "PR_SET_PDEATHSIG" in source
     assert "O_NOFOLLOW" in source
-    assert "LOCK_EX | LOCK_NB" in source
     assert "setresuid(1000, 1000, 1000)" in source
+
+
+def test_public_request_masks_and_excludes_operation_grant():
+    from models import ParallelTaskRequest as PublicParallelTaskRequest
+
+    grant = _grant()
+    request = PublicParallelTaskRequest(message="run", operation_grant=grant)
+
+    assert request.operation_grant is not None
+    assert request.operation_grant.get_secret_value() == grant
+    assert grant not in repr(request)
+    assert "operation_grant" not in request.model_dump()
