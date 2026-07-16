@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 SCRIPT="$ROOT/scripts/deploy/backup-persistent-state.sh"
 UPGRADE_SCRIPT="$ROOT/scripts/deploy/safe-upgrade.sh"
+SEMANTIC_TREE_TEST="$ROOT/tests/deploy/test_verify_restored_tree.py"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin" "$TMP/backups"
@@ -176,7 +177,7 @@ case "${1:-}" in
       printf 'agent-workspace\n' > "$fixture/state"
       tar -czf "$backup/$archive" -C "$fixture" .
       rm -rf "$fixture"
-    elif [[ "$joined" == *"source_digest="* && "$joined" == *"restore_digest="* ]]; then
+    elif [[ "$joined" == *"verify-restored-tree.py"* ]]; then
       exit 0
     elif [[ "$joined" == *"tar -tzf"* ]]; then
       archive=$(printf '%s\n' "$joined" | sed -n 's#.* /backup/\([^ ]*\.tgz\).*#\1#p')
@@ -213,6 +214,12 @@ case "${1:-}" in
 esac
 EOF
 chmod 755 "$TMP/bin/docker"
+python3 "$SEMANTIC_TREE_TEST"
+grep -q 'verify-restored-tree.py' "$SCRIPT"
+if grep -q 'source_digest=.*tar -cf' "$SCRIPT"; then
+  echo 'raw tar-stream equality remains in the backup verifier' >&2
+  exit 1
+fi
 export FAKE_DOCKER_STATE="$TMP/docker-state"
 : > "$FAKE_DOCKER_STATE"
 
