@@ -263,15 +263,11 @@ verify_archive_against_volume() {
   docker run --rm \
     -v "${volume}:/source:ro" \
     -v "${archive_dir}:/backup:ro" \
-    --tmpfs /restore:rw,nosuid,nodev \
-    alpine:3.20 \
-    sh -ec '
-      mkdir -p /restore/tree
-      tar -xzf "/backup/$1" -C /restore/tree
-      source_digest=$(cd /source && tar -cf - . | sha256sum | awk "{print \$1}")
-      restore_digest=$(cd /restore/tree && tar -cf - . | sha256sum | awk "{print \$1}")
-      test "$source_digest" = "$restore_digest"
-    ' sh "${archive_name}" \
+    -v "${SCRIPT_DIR}/verify-restored-tree.py:/verify-restored-tree.py:ro" \
+    --user root \
+    --entrypoint python3 \
+    "${BACKEND_IMAGE}" \
+    /verify-restored-tree.py /source "/backup/${archive_name}" \
     || die "Archive content does not exactly restore the live volume: ${volume}"
 }
 
@@ -632,6 +628,10 @@ fi
 log "Writing backup bundle: ${RUN_DIR}"
 
 [[ -n "${BACKEND_CONTAINER}" ]] || die "No backend container exists for compose project ${PROJECT_NAME}"
+BACKEND_IMAGE="$(docker inspect "${BACKEND_CONTAINER}" --format '{{.Image}}')"
+[[ -n "${BACKEND_IMAGE}" ]] || die "Could not resolve the backend image for archive verification"
+[[ -f "${SCRIPT_DIR}/verify-restored-tree.py" ]] \
+  || die "Semantic archive verifier is missing"
 
 if [[ ${INCLUDE_ENV} -eq 1 ]]; then
   if [[ -s "${ENV_FILE}" ]]; then
@@ -793,8 +793,6 @@ elif [[ "${DATABASE_SOURCE}" == external-postgres ]]; then
   warn "External PostgreSQL snapshot is represented by a signed, fresh, provider-verified receipt"
 else
   log "Backend declares SQLite at its authoritative mounted path; taking an online backup"
-  BACKEND_IMAGE="$(docker inspect "${BACKEND_CONTAINER}" --format '{{.Image}}')"
-  [[ -n "${BACKEND_IMAGE}" ]] || die "Could not resolve the backend image for SQLite backup"
   SQLITE_MOUNT=()
   while IFS= read -r field; do
     SQLITE_MOUNT+=("${field}")
@@ -879,15 +877,11 @@ if [[ ${INCLUDE_BACKEND_DATA} -eq 1 ]]; then
   docker run --rm \
     --volumes-from "${BACKEND_CONTAINER}:ro" \
     -v "${RUN_DIR}:/backup:ro" \
-    --tmpfs /restore:rw,nosuid,nodev \
-    alpine:3.20 \
-    sh -ec '
-      mkdir -p /restore/tree
-      tar -xzf /backup/backend-data.tgz -C /restore/tree
-      source_digest=$(cd /data && tar -cf - . | sha256sum | awk "{print \$1}")
-      restore_digest=$(cd /restore/tree && tar -cf - . | sha256sum | awk "{print \$1}")
-      test "$source_digest" = "$restore_digest"
-    ' \
+    -v "${SCRIPT_DIR}/verify-restored-tree.py:/verify-restored-tree.py:ro" \
+    --user root \
+    --entrypoint python3 \
+    "${BACKEND_IMAGE}" \
+    /verify-restored-tree.py /data /backup/backend-data.tgz \
     || die "Backend data archive does not exactly restore the paused /data mount"
   echo "backend_data_verified=yes" >> "${MANIFEST}"
   echo "backend_data_live_consistency_verified=yes" >> "${MANIFEST}"
