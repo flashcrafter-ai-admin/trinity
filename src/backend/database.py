@@ -24,6 +24,7 @@ Redis is still used for:
 import os
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 
 # Re-export models for backward compatibility
 from db_models import (

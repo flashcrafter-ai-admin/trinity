@@ -93,6 +93,10 @@ def test_fresh_upgrade_builds_full_schema(pg):
     # baseline because schema.py TABLES is at head
     cols = {c["name"] for c in insp.get_columns("operator_queue")}
     assert "cleared_at" in cols
+    idempotency_cols = {
+        c["name"] for c in insp.get_columns("idempotency_keys")
+    }
+    assert "request_digest" in idempotency_cols
 
 
 def test_upgrade_is_idempotent(pg):
