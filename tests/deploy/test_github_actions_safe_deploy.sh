@@ -34,6 +34,8 @@ grep -q 'deploy \$GITHUB_SHA' "$ROOT/.github/workflows/deploy-dev.yml"
 grep -q 'TRINITY_EXPECTED_SOURCE_REVISION="$target_commit"' "$SCRIPT"
 [[ "$(grep -c 'assert_governed_source' "$ROOT/scripts/deploy/safe-upgrade.sh")" -ge 5 ]]
 grep -q '.git_commit == $commit' "$ROOT/scripts/deploy/safe-upgrade.sh"
+grep -q 'GIT_CONFIG_GLOBAL=/dev/null' "$SCRIPT"
+grep -q "GIT_CONFIG_VALUE_6='!gh auth git-credential'" "$SCRIPT"
 
 tmp=$(mktemp -d)
 configured_worktree=$(mktemp -d)
