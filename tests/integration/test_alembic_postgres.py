@@ -122,13 +122,15 @@ def test_pre_alembic_db_is_stamped_not_rebuilt(pg):
     """A DB already at head schema (built by the old init_schema_postgres) must
     be stamped at the baseline, not rebuilt — and end up at head."""
     runner, eng = pg
+    from alembic.script import ScriptDirectory
     from db.schema import init_schema_postgres
     init_schema_postgres(eng)
     assert not inspect(eng).has_table("alembic_version")
     runner.upgrade_to_head()
     with eng.connect() as c:
         ver = c.execute(text("SELECT version_num FROM alembic_version")).scalar()
-    assert ver == "0001_baseline"
+    expected_head = ScriptDirectory.from_config(runner._config()).get_current_head()
+    assert ver == expected_head
     assert "users" in _table_names(eng)
 
 
