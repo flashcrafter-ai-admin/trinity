@@ -404,6 +404,7 @@ grep -q 'docker exec -i.*backend_container' "$UPGRADE_SCRIPT"
 grep -q 'http://127.0.0.1:8000/token' "$UPGRADE_SCRIPT"
 grep -q 'verify-compose-readiness.sh' "$UPGRADE_SCRIPT"
 ! grep -q 'api/version.*|| true' "$UPGRADE_SCRIPT"
+grep -q 'BACKUP_SOURCE_REVISION="$(git_no_replace -C "${PROJECT_ROOT}" rev-parse HEAD' "$SCRIPT"
 
 governed="$TMP/governed"
 mkdir -p "$governed/scripts/deploy"

@@ -36,7 +36,8 @@ grep -q 'TRINITY_EXPECTED_SOURCE_REVISION="$target_commit"' "$SCRIPT"
 grep -q '.git_commit == $commit' "$ROOT/scripts/deploy/safe-upgrade.sh"
 
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+configured_worktree=$(mktemp -d)
+trap 'rm -rf "$tmp" "$configured_worktree"' EXIT
 git -C "$tmp" init -q
 git -C "$tmp" config user.email test@example.com
 git -C "$tmp" config user.name test
@@ -86,6 +87,18 @@ if assert_exact_clean_worktree "$tmp" "$commit" >/dev/null 2>&1; then
     exit 1
 fi
 git -C "$tmp" update-index --no-skip-worktree tracked.txt
+git -C "$tmp" restore tracked.txt
+assert_exact_clean_worktree "$tmp" "$commit"
+
+cp "$tmp/.gitignore" "$configured_worktree/.gitignore"
+cp "$tmp/tracked.txt" "$configured_worktree/tracked.txt"
+git -C "$tmp" config core.worktree "$configured_worktree"
+printf 'hidden by local core.worktree\n' >> "$tmp/tracked.txt"
+if assert_exact_clean_worktree "$tmp" "$commit" >/dev/null 2>&1; then
+    echo "repository-local worktree redirection was accepted" >&2
+    exit 1
+fi
+git -C "$tmp" config --unset core.worktree
 git -C "$tmp" restore tracked.txt
 assert_exact_clean_worktree "$tmp" "$commit"
 

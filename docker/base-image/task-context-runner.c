@@ -11,6 +11,7 @@
 #include <sys/file.h>
 #include <sys/random.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <sys/prctl.h>
@@ -35,6 +36,9 @@
 #define DEVELOPER_UID 1000
 #define DEVELOPER_GID 1000
 #define OPERATION_HOME "/var/empty"
+#ifndef RENAME_EXCHANGE
+#define RENAME_EXCHANGE (1 << 1)
+#endif
 
 static volatile sig_atomic_t child_pid = -1;
 static char active_codex_task_home[CODEX_TASK_PATH_BYTES] = {0};
@@ -400,13 +404,72 @@ static int codex_refresh_temporary_name(char *name, size_t size) {
   return written > 0 && written < (int)size ? 0 : -1;
 }
 
+static int named_path_matches_fd(int directory_fd, const char *name, int fd) {
+  struct stat descriptor;
+  struct stat named;
+  return fstat(fd, &descriptor) == 0 &&
+         fstatat(directory_fd, name, &named, AT_SYMLINK_NOFOLLOW) == 0 &&
+         descriptor.st_dev == named.st_dev && descriptor.st_ino == named.st_ino;
+}
+
+static int protected_file_matches_buffer(int fd, const char *buffer, size_t length,
+                                         uid_t uid, gid_t gid) {
+  struct stat before;
+  struct stat after;
+  if (fstat(fd, &before) != 0 || !S_ISREG(before.st_mode) || before.st_uid != uid ||
+      before.st_gid != gid || (before.st_mode & 0777) != 0600 || before.st_nlink != 1 ||
+      before.st_size != (off_t)length)
+    return 0;
+  unsigned char chunk[4096];
+  size_t offset = 0;
+  int matches = 1;
+  while (offset < length) {
+    size_t remaining = length - offset;
+    size_t requested = remaining < sizeof(chunk) ? remaining : sizeof(chunk);
+    ssize_t count = pread(fd, chunk, requested, (off_t)offset);
+    if (count < 0 && errno == EINTR) continue;
+    if (count != (ssize_t)requested || memcmp(chunk, buffer + offset, requested) != 0) {
+      matches = 0;
+      break;
+    }
+    offset += requested;
+  }
+  memset(chunk, 0, sizeof(chunk));
+  return matches && fstat(fd, &after) == 0 && same_file_identity(&before, &after);
+}
+
+static int rename_auth_exchange(int directory_fd, const char *temporary_name) {
+#ifdef SYS_renameat2
+  return (int)syscall(SYS_renameat2, directory_fd, temporary_name,
+                      directory_fd, "auth.json", RENAME_EXCHANGE);
+#else
+  (void)directory_fd;
+  (void)temporary_name;
+  errno = ENOSYS;
+  return -1;
+#endif
+}
+
+static int rollback_auth_exchange(int directory_fd, const char *temporary_name,
+                                  int temporary_fd, int auth_source_fd) {
+  if (!named_path_matches_fd(directory_fd, "auth.json", temporary_fd) ||
+      !named_path_matches_fd(directory_fd, temporary_name, auth_source_fd) ||
+      rename_auth_exchange(directory_fd, temporary_name) != 0 ||
+      fsync(directory_fd) != 0 ||
+      !named_path_matches_fd(directory_fd, "auth.json", auth_source_fd) ||
+      !named_path_matches_fd(directory_fd, temporary_name, temporary_fd))
+    return -1;
+  return 0;
+}
+
 static int atomic_replace_codex_auth(
     int auth_source_parent_fd, int auth_source_directory_fd, int auth_source_fd,
     const struct stat *directory_identity, const struct stat *auth_identity,
     const char *buffer, size_t length, uid_t expected_uid, gid_t expected_gid) {
   int result = -1;
   int temporary_fd = -1;
-  int renamed = 0;
+  int exchanged = 0;
+  int committed = 0;
   char temporary_name[96] = {0};
   if (codex_refresh_temporary_name(temporary_name, sizeof(temporary_name)) != 0 ||
       !source_projection_unchanged(auth_source_parent_fd, auth_source_directory_fd,
@@ -414,44 +477,69 @@ static int atomic_replace_codex_auth(
     goto cleanup;
 
   temporary_fd = openat(auth_source_directory_fd, temporary_name,
-                        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
-  if (temporary_fd < 0 || fchown(temporary_fd, expected_uid, expected_gid) != 0 ||
-      fchmod(temporary_fd, 0600) != 0 ||
+                        O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+  uid_t privileged_uid = geteuid();
+  gid_t privileged_gid = getegid();
+  if (temporary_fd < 0 || fchmod(temporary_fd, 0600) != 0 ||
       write_all_status(temporary_fd, buffer, length) != 0 || fsync(temporary_fd) != 0)
     goto cleanup;
 
-  struct stat temporary_identity;
-  if (fstat(temporary_fd, &temporary_identity) != 0 ||
-      !S_ISREG(temporary_identity.st_mode) ||
-      temporary_identity.st_uid != expected_uid ||
-      temporary_identity.st_gid != expected_gid ||
-      (temporary_identity.st_mode & 0777) != 0600 || temporary_identity.st_nlink != 1 ||
-      temporary_identity.st_size != (off_t)length ||
+  if (!protected_file_matches_buffer(temporary_fd, buffer, length,
+                                     privileged_uid, privileged_gid) ||
+      !named_path_matches_fd(auth_source_directory_fd, temporary_name, temporary_fd) ||
       !source_projection_target_unchanged(
           auth_source_parent_fd, auth_source_directory_fd, auth_source_fd,
           directory_identity, auth_identity) ||
-      renameat(auth_source_directory_fd, temporary_name,
-               auth_source_directory_fd, "auth.json") != 0)
+      rename_auth_exchange(auth_source_directory_fd, temporary_name) != 0)
     goto cleanup;
 
-  renamed = 1;
-  struct stat named_auth;
-  struct stat current_auth;
-  if (fsync(auth_source_directory_fd) != 0 || fstat(temporary_fd, &current_auth) != 0 ||
-      fstatat(auth_source_directory_fd, "auth.json", &named_auth, AT_SYMLINK_NOFOLLOW) != 0 ||
-      current_auth.st_dev != named_auth.st_dev || current_auth.st_ino != named_auth.st_ino ||
-      !S_ISREG(named_auth.st_mode) || named_auth.st_uid != expected_uid ||
-      named_auth.st_gid != expected_gid || (named_auth.st_mode & 0777) != 0600 ||
-      named_auth.st_nlink != 1)
+  exchanged = 1;
+  if (!named_path_matches_fd(auth_source_directory_fd, "auth.json", temporary_fd) ||
+      !named_path_matches_fd(auth_source_directory_fd, temporary_name, auth_source_fd) ||
+      fchown(temporary_fd, expected_uid, expected_gid) != 0 ||
+      fchmod(temporary_fd, 0600) != 0 || fsync(temporary_fd) != 0 ||
+      !protected_file_matches_buffer(temporary_fd, buffer, length,
+                                     expected_uid, expected_gid) ||
+      !named_path_matches_fd(auth_source_directory_fd, "auth.json", temporary_fd) ||
+      !named_path_matches_fd(auth_source_directory_fd, temporary_name, auth_source_fd) ||
+      fsync(auth_source_directory_fd) != 0 ||
+      !named_path_matches_fd(auth_source_directory_fd, "auth.json", temporary_fd) ||
+      !named_path_matches_fd(auth_source_directory_fd, temporary_name, auth_source_fd) ||
+      unlinkat(auth_source_directory_fd, temporary_name, 0) != 0)
     goto cleanup;
 
+  committed = 1;
   result = 0;
+  // The exchange is already durable. Cleanup persistence cannot be rolled back
+  // after unlinking the old inode, so it must not turn a committed refresh into failure.
+  if (fsync(auth_source_directory_fd) != 0)
+    fputs("Codex subscription auth cleanup durability is uncertain\n", stderr);
 
 cleanup:
+  if (exchanged && !committed) {
+    int rollback_status = rollback_auth_exchange(auth_source_directory_fd, temporary_name,
+                                                 temporary_fd, auth_source_fd);
+    if (named_path_matches_fd(auth_source_directory_fd, "auth.json", auth_source_fd) &&
+        named_path_matches_fd(auth_source_directory_fd, temporary_name, temporary_fd))
+      exchanged = 0;
+    if (rollback_status != 0) result = -1;
+  }
+  if (!exchanged && !committed && temporary_fd >= 0 && temporary_name[0] != '\0') {
+    struct stat descriptor;
+    struct stat named;
+    if (fstat(temporary_fd, &descriptor) != 0)
+      result = -1;
+    else if (fstatat(auth_source_directory_fd, temporary_name, &named,
+                     AT_SYMLINK_NOFOLLOW) == 0) {
+      if (descriptor.st_dev != named.st_dev || descriptor.st_ino != named.st_ino ||
+          unlinkat(auth_source_directory_fd, temporary_name, 0) != 0 ||
+          fsync(auth_source_directory_fd) != 0)
+        result = -1;
+    } else if (errno != ENOENT) {
+      result = -1;
+    }
+  }
   if (temporary_fd >= 0 && close(temporary_fd) != 0) result = -1;
-  if (!renamed && temporary_name[0] != '\0' &&
-      unlinkat(auth_source_directory_fd, temporary_name, 0) != 0 && errno != ENOENT)
-    result = -1;
   return result;
 }
 

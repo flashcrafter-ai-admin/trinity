@@ -416,10 +416,14 @@ def test_codex_refresh_is_atomic_and_every_fatal_path_attempts_cleanup():
         )
     ]
     assert "ftruncate(" not in atomic_replace
-    assert "renameat(" in atomic_replace
+    assert "rename_auth_exchange(" in atomic_replace
+    assert "rollback_auth_exchange(" in atomic_replace
     assert "fsync(auth_source_directory_fd)" in atomic_replace
     assert "unlinkat(auth_source_directory_fd, temporary_name, 0)" in atomic_replace
     assert "source_projection_target_unchanged(" in atomic_replace
+    assert atomic_replace.index("rename_auth_exchange(") < atomic_replace.index(
+        "fchown(temporary_fd"
+    )
 
     refresh = source[
         source.index("static int refresh_codex_auth(") : source.index(

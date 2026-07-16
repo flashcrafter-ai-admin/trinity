@@ -6,6 +6,13 @@ log() {
 }
 
 git_no_replace() {
+    if [[ "${1:-}" != "-C" || -z "${2:-}" || ! -d "${2:-}" ]]; then
+        log "Governed Git invocation requires an existing explicit worktree"
+        return 64
+    fi
+    local worktree_path
+    worktree_path=$(cd "$2" && pwd -P)
+    shift 2
     env \
         -u GIT_DIR \
         -u GIT_WORK_TREE \
@@ -23,12 +30,37 @@ git_no_replace() {
         -u GIT_CONFIG_GLOBAL \
         -u GIT_CONFIG_SYSTEM \
         -u GIT_EXEC_PATH \
-        GIT_NO_REPLACE_OBJECTS=1 git "$@"
+        PATH=/usr/local/bin:/usr/bin:/bin \
+        GIT_CONFIG_GLOBAL=/dev/null \
+        GIT_CONFIG_NOSYSTEM=1 \
+        GIT_CONFIG_COUNT=6 \
+        GIT_CONFIG_KEY_0=core.fsmonitor \
+        GIT_CONFIG_VALUE_0=false \
+        GIT_CONFIG_KEY_1=core.untrackedcache \
+        GIT_CONFIG_VALUE_1=false \
+        GIT_CONFIG_KEY_2=core.ignorestat \
+        GIT_CONFIG_VALUE_2=false \
+        GIT_CONFIG_KEY_3=core.filemode \
+        GIT_CONFIG_VALUE_3=true \
+        GIT_CONFIG_KEY_4=core.precomposeunicode \
+        GIT_CONFIG_VALUE_4=false \
+        GIT_CONFIG_KEY_5=core.hooksPath \
+        GIT_CONFIG_VALUE_5=/dev/null \
+        GIT_LITERAL_PATHSPECS=1 \
+        GIT_NO_REPLACE_OBJECTS=1 \
+        GIT_WORK_TREE="$worktree_path" \
+        git -C "$worktree_path" "$@"
 }
 
 assert_no_git_replacement_refs() {
     local worktree_path="$1"
-    local replacement_refs
+    local replacement_refs worktree_redirect worktree_status=0
+    worktree_redirect=$(git_no_replace -C "$worktree_path" \
+        config --get-all core.worktree) || worktree_status=$?
+    if [[ "$worktree_status" -gt 1 || -n "$worktree_redirect" ]]; then
+        log "Deployment repository contains a local core.worktree redirect: $worktree_path"
+        return 74
+    fi
     replacement_refs=$(git_no_replace -C "$worktree_path" \
         for-each-ref --format='%(refname)' refs/replace)
     if [[ -n "$replacement_refs" ]]; then

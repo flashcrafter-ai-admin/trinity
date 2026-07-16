@@ -12,6 +12,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd -P)"
+# shellcheck source=github-actions-safe-deploy.sh
+source "${SCRIPT_DIR}/github-actions-safe-deploy.sh"
 
 PROJECT_NAME="${COMPOSE_PROJECT_NAME:-trinity}"
 OUTPUT_DIR="${PROJECT_ROOT}/backups/persistent-state"
@@ -598,7 +600,10 @@ if [[ -n "${BACKUP_SOURCE_REVISION}" ]]; then
   [[ "${BACKUP_SOURCE_REVISION}" =~ ^[0-9a-f]{40}$ ]] \
     || die "TRINITY_EXPECTED_SOURCE_REVISION must be an exact lowercase commit SHA"
 else
-  BACKUP_SOURCE_REVISION="$(git -C "${PROJECT_ROOT}" rev-parse HEAD 2>/dev/null || echo unknown)"
+  BACKUP_SOURCE_REVISION="$(git_no_replace -C "${PROJECT_ROOT}" rev-parse HEAD 2>/dev/null)" \
+    || die "Backup source revision cannot be verified"
+  [[ "${BACKUP_SOURCE_REVISION}" =~ ^[0-9a-f]{40}$ ]] \
+    || die "Backup source revision is not an exact lowercase commit SHA"
 fi
 
 {
