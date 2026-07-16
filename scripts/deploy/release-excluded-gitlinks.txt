@@ -1,0 +1,3 @@
+# Optional development and enterprise trees are intentionally absent from OSS releases.
+.claude
+src/backend/enterprise

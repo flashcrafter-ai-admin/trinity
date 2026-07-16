@@ -12,6 +12,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd -P)"
+AGENT_MOUNT_VERIFIER="${SCRIPT_DIR}/verify-agent-mount-inventory.py"
 # shellcheck source=github-actions-safe-deploy.sh
 source "${SCRIPT_DIR}/github-actions-safe-deploy.sh"
 
@@ -158,9 +159,36 @@ agent_volume_inventory() {
   docker volume ls --format '{{.Name}}' | grep -E '^agent-.+-workspace$' | sort || true
 }
 
+agent_persistent_volume_inventory() {
+  docker volume ls --format '{{.Name}}' \
+    | grep -E '^(encrypted-data|agent-.+-(workspace|public|shared))$' \
+    | sort || true
+}
+
 agent_container_inventory() {
   docker ps -a --no-trunc --format '{{.ID}} {{.Names}} {{.Image}}' \
     | awk '$2 ~ /^agent-.+/' | sort || true
+}
+
+agent_container_names() {
+  docker ps -a --format '{{.Names}}' | grep -E '^agent-.+' | sort || true
+}
+
+agent_mount_inventory() {
+  local container
+  for container in "$@"; do
+    docker inspect "${container}" \
+      | python3 "${AGENT_MOUNT_VERIFIER}" inspect "${container}"
+  done | sort
+}
+
+agent_mounted_volume_inventory() {
+  python3 "${AGENT_MOUNT_VERIFIER}" volume-names
+}
+
+snapshot_agent_mount_inventory() {
+  [[ -z "${AGENT_CONTAINERS[*]-}" ]] \
+    || agent_mount_inventory "${AGENT_CONTAINERS[@]}"
 }
 
 compose_named_volume_inventory() {
@@ -186,8 +214,12 @@ compose_named_volume_inventory() {
 assert_agent_inventory_unchanged() {
   [[ "$(agent_volume_inventory)" == "${AGENT_VOLUME_INVENTORY}" ]] \
     || die "Agent workspace volume inventory changed during backup"
+  [[ "$(agent_persistent_volume_inventory)" == "${AGENT_PERSISTENT_VOLUME_INVENTORY}" ]] \
+    || die "Agent persistent volume inventory changed during backup"
   [[ "$(agent_container_inventory)" == "${AGENT_CONTAINER_INVENTORY}" ]] \
     || die "Agent container inventory changed during backup"
+  [[ "$(snapshot_agent_mount_inventory)" == "${AGENT_MOUNT_INVENTORY}" ]] \
+    || die "Agent mount inventory changed during backup"
 }
 
 assert_writers_still_paused() {
@@ -546,6 +578,7 @@ PY
 }
 
 require_cmd docker
+require_cmd python3
 docker info >/dev/null 2>&1 || die "Docker is not running"
 
 TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -563,23 +596,28 @@ VECTOR_CONTAINER="$(service_container vector || true)"
 COMPOSE_NAMED_VOLUME_INVENTORY="$(compose_named_volume_inventory)"
 AGENT_WORKSPACE_VOLUMES=()
 AGENT_CONTAINERS=()
+AGENT_AUXILIARY_VOLUMES=()
 AGENT_WORKSPACE_VOLUME_COUNT=0
 AGENT_CONTAINER_COUNT=0
+while IFS= read -r container; do
+  if [[ -n "${container}" ]]; then
+    AGENT_CONTAINERS+=("${container}")
+    AGENT_CONTAINER_COUNT=$((AGENT_CONTAINER_COUNT + 1))
+  fi
+done < <(agent_container_names)
+AGENT_CONTAINER_INVENTORY="$(agent_container_inventory)"
+AGENT_MOUNT_INVENTORY="$(snapshot_agent_mount_inventory)"
+AGENT_MOUNTED_VOLUME_INVENTORY="$(printf '%s\n' "${AGENT_MOUNT_INVENTORY}" \
+  | agent_mounted_volume_inventory)"
+AGENT_VOLUME_INVENTORY="$(agent_volume_inventory)"
+AGENT_PERSISTENT_VOLUME_INVENTORY="$(agent_persistent_volume_inventory)"
 if [[ ${INCLUDE_AGENT_WORKSPACES} -eq 1 ]]; then
-  AGENT_VOLUME_INVENTORY="$(agent_volume_inventory)"
-  AGENT_CONTAINER_INVENTORY="$(agent_container_inventory)"
   while IFS= read -r volume; do
     if [[ -n "${volume}" ]]; then
       AGENT_WORKSPACE_VOLUMES+=("${volume}")
       AGENT_WORKSPACE_VOLUME_COUNT=$((AGENT_WORKSPACE_VOLUME_COUNT + 1))
     fi
   done < <(printf '%s\n' "${AGENT_VOLUME_INVENTORY}")
-  while IFS= read -r container; do
-    if [[ -n "${container}" ]]; then
-      AGENT_CONTAINERS+=("${container}")
-      AGENT_CONTAINER_COUNT=$((AGENT_CONTAINER_COUNT + 1))
-    fi
-  done < <(docker ps -a --format '{{.Names}}' | grep -E '^agent-.+' | sort || true)
   for container in ${AGENT_CONTAINERS[*]-}; do
     expected_volume="${container}-workspace"
     if ! printf '%s\n' ${AGENT_WORKSPACE_VOLUMES[*]-} | grep -Fxq "${expected_volume}"; then
@@ -590,10 +628,15 @@ if [[ ${INCLUDE_AGENT_WORKSPACES} -eq 1 ]]; then
     [[ "${mounted_workspace}" == "${expected_volume}" ]] \
       || die "Agent container ${container} does not mount ${expected_volume} at /home/developer"
   done
-else
-  AGENT_VOLUME_INVENTORY="$(agent_volume_inventory)"
-  AGENT_CONTAINER_INVENTORY="$(agent_container_inventory)"
 fi
+AGENT_AUXILIARY_VOLUME_INVENTORY="$(comm -23 \
+  <({ printf '%s\n' "${AGENT_MOUNTED_VOLUME_INVENTORY}"; printf '%s\n' "${AGENT_PERSISTENT_VOLUME_INVENTORY}"; } \
+    | sed '/^$/d' | sort -u) \
+  <({ printf '%s\n' "${AGENT_VOLUME_INVENTORY}"; printf '%s\n' "${COMPOSE_NAMED_VOLUME_INVENTORY}"; } \
+    | sed '/^$/d' | sort -u))"
+while IFS= read -r volume; do
+  [[ -n "${volume}" ]] && AGENT_AUXILIARY_VOLUMES+=("${volume}")
+done < <(printf '%s\n' "${AGENT_AUXILIARY_VOLUME_INVENTORY}")
 
 BACKUP_SOURCE_REVISION="${TRINITY_EXPECTED_SOURCE_REVISION:-}"
 if [[ -n "${BACKUP_SOURCE_REVISION}" ]]; then
@@ -667,6 +710,9 @@ echo "writer_pause_verified=yes" >> "${MANIFEST}"
 echo "paused_writer_count=${#PAUSED_CONTAINERS[@]}" >> "${MANIFEST}"
 echo "agent_volume_inventory_sha256=sha256:$(sha256_text "${AGENT_VOLUME_INVENTORY}")" >> "${MANIFEST}"
 echo "agent_container_inventory_sha256=sha256:$(sha256_text "${AGENT_CONTAINER_INVENTORY}")" >> "${MANIFEST}"
+echo "agent_mount_inventory_sha256=sha256:$(sha256_text "${AGENT_MOUNT_INVENTORY}")" >> "${MANIFEST}"
+echo "agent_mount_volume_inventory_sha256=sha256:$(sha256_text "${AGENT_MOUNTED_VOLUME_INVENTORY}")" >> "${MANIFEST}"
+echo "agent_persistent_volume_inventory_sha256=sha256:$(sha256_text "${AGENT_PERSISTENT_VOLUME_INVENTORY}")" >> "${MANIFEST}"
 
 DATABASE_URL="$(docker inspect "${BACKEND_CONTAINER}" --format '{{range .Config.Env}}{{println .}}{{end}}' \
   | sed -n 's/^DATABASE_URL=//p' | head -n 1)"
@@ -948,6 +994,42 @@ if [[ ${INCLUDE_AGENT_WORKSPACES} -eq 1 ]]; then
   echo "agent_workspace_archives_verified=yes" >> "${MANIFEST}"
   echo "agent_workspace_live_consistency_verified=yes" >> "${MANIFEST}"
   log "Archived ${agent_count} agent workspace volume(s)"
+
+  log "Archiving auxiliary and detached agent persistence volumes"
+  AGENT_AUXILIARY_ARCHIVE_DIR="${RUN_DIR}/agent-auxiliary-volumes"
+  auxiliary_count=0
+  for volume in ${AGENT_AUXILIARY_VOLUMES[*]-}; do
+    auxiliary_count=$((auxiliary_count + 1))
+    archive_volume "${volume}" "${AGENT_AUXILIARY_ARCHIVE_DIR}" "${volume}.tgz"
+  done
+  : > "${RUN_DIR}/agent-auxiliary-volumes.sha256"
+  for archive in "${AGENT_AUXILIARY_ARCHIVE_DIR}"/*.tgz; do
+    [[ -e "${archive}" ]] || continue
+    printf '%s  %s\n' "$(sha256_file "${archive}")" "$(basename "${archive}")" \
+      >> "${RUN_DIR}/agent-auxiliary-volumes.sha256"
+  done
+  [[ "$(wc -l < "${RUN_DIR}/agent-auxiliary-volumes.sha256" | tr -d ' ')" -eq ${auxiliary_count} ]] \
+    || die "Agent auxiliary volume digest inventory is incomplete"
+  covered_agent_volumes="$({
+    printf '%s\n' "${AGENT_VOLUME_INVENTORY}"
+    printf '%s\n' "${COMPOSE_NAMED_VOLUME_INVENTORY}"
+    printf '%s\n' "${AGENT_AUXILIARY_VOLUME_INVENTORY}"
+  } | sed '/^$/d' | sort -u)"
+  required_agent_volumes="$({
+    printf '%s\n' "${AGENT_MOUNTED_VOLUME_INVENTORY}"
+    printf '%s\n' "${AGENT_PERSISTENT_VOLUME_INVENTORY}"
+  } | sed '/^$/d' | sort -u)"
+  uncovered_agent_volumes="$(comm -23 \
+    <(printf '%s\n' "${required_agent_volumes}") \
+    <(printf '%s\n' "${covered_agent_volumes}"))"
+  [[ -z "${uncovered_agent_volumes}" ]] \
+    || die "Agent persistence volumes are outside backup coverage"
+  echo "agent_auxiliary_volume_archives=${auxiliary_count}" >> "${MANIFEST}"
+  echo "agent_auxiliary_volume_inventory_sha256=sha256:$(sha256_text "${AGENT_AUXILIARY_VOLUME_INVENTORY}")" >> "${MANIFEST}"
+  echo "agent_auxiliary_volume_digest_inventory_sha256=sha256:$(sha256_file "${RUN_DIR}/agent-auxiliary-volumes.sha256")" >> "${MANIFEST}"
+  echo "agent_auxiliary_volume_archives_verified=yes" >> "${MANIFEST}"
+  echo "agent_auxiliary_volume_live_consistency_verified=yes" >> "${MANIFEST}"
+  echo "agent_persistent_volume_coverage_verified=yes" >> "${MANIFEST}"
 fi
 
 if [[ -n "${REDIS_CONTAINER}" ]]; then
@@ -957,6 +1039,7 @@ fi
 assert_agent_inventory_unchanged
 assert_writers_still_paused
 echo "agent_inventory_stable=yes" >> "${MANIFEST}"
+echo "agent_mount_inventory_stable=yes" >> "${MANIFEST}"
 
 ARTIFACT_INVENTORY="${RUN_DIR}/backup-artifacts.sha256"
 : > "${ARTIFACT_INVENTORY}"

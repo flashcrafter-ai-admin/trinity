@@ -58,12 +58,32 @@ case "${1:-}" in
     if [[ "$joined" == *"label=com.docker.compose.project=trinity"* ]]; then
       printf '%s\n' "${FAKE_COMPOSE_VOLUMES:-}"
     else
-      printf '%s\n' "${FAKE_AGENT_VOLUMES:-}"
+      for volume in ${FAKE_AGENT_VOLUMES:-}; do printf '%s\n' "$volume"; done
     fi
     ;;
   inspect)
     container=${2:-${!#}}
-    if [[ "$joined" == *"{{json .Mounts}}"* ]]; then
+    if [[ "$container" == agent-* && "$joined" != *" --format "* ]]; then
+      workspace=${FAKE_AGENT_WORKSPACE_MOUNT:-${container}-workspace}
+      drift_mount=""
+      if [[ "${FAKE_AGENT_MOUNT_DRIFT:-0}" == 1 ]]; then
+        count_file=${FAKE_AGENT_INSPECT_COUNT_FILE:?}
+        count=0
+        [[ ! -f "$count_file" ]] || count=$(cat "$count_file")
+        count=$((count + 1))
+        printf '%s\n' "$count" > "$count_file"
+        if [[ $count -gt 1 ]]; then drift_mount=drift-volume; fi
+      fi
+      printf '[{"Name":"/%s","Mounts":[' "$container"
+      printf '{"Type":"volume","Name":"%s","Source":"/volumes/%s","Destination":"/home/developer","RW":true}' "$workspace" "$workspace"
+      for volume in ${FAKE_AGENT_MOUNTED_VOLUMES:-} ${drift_mount:-}; do
+        printf ',{"Type":"volume","Name":"%s","Source":"/volumes/%s","Destination":"/mounted/%s","RW":true}' "$volume" "$volume" "$volume"
+      done
+      if [[ "${FAKE_AGENT_WRITABLE_BIND:-0}" == 1 ]]; then
+        printf ',{"Type":"bind","Name":"","Source":"/host/work","Destination":"/work","RW":true}'
+      fi
+      printf ']}]\n'
+    elif [[ "$joined" == *"{{json .Mounts}}"* ]]; then
       printf '%s\n' '[{"Type":"volume","Name":"trinity-data","Source":"/var/lib/docker/volumes/trinity-data/_data","Destination":"/data"}]'
     elif [[ "$joined" == *"range .Mounts"* && "$joined" == *"eq .Type"*"volume"* ]]; then
       case "$container" in
@@ -142,6 +162,11 @@ case "${1:-}" in
     if [[ "$joined" == *" --detach "* && "$joined" == *" postgres:16-alpine "* ]]; then
       echo trinity-backup-restore-fixture
       exit 0
+    fi
+    if [[ -n "${FAKE_ARCHIVE_FAIL_VOLUME:-}" \
+      && "$joined" == *" -v ${FAKE_ARCHIVE_FAIL_VOLUME}:/source:ro "* \
+      && "$joined" == *" tar -czf "* ]]; then
+      exit 91
     fi
     if [[ "$joined" == *"sqlite_master"* ]]; then
       if [[ "${FAKE_SQLITE_INTEGRITY_FAIL:-0}" != 0 ]]; then
@@ -223,6 +248,10 @@ run_backup() {
     FAKE_AGENT_CONTAINERS="${FAKE_AGENT_CONTAINERS:-}" \
     FAKE_AGENT_VOLUMES="${FAKE_AGENT_VOLUMES:-}" \
     FAKE_AGENT_WORKSPACE_MOUNT="${FAKE_AGENT_WORKSPACE_MOUNT:-}" \
+    FAKE_AGENT_MOUNTED_VOLUMES="${FAKE_AGENT_MOUNTED_VOLUMES:-}" \
+    FAKE_AGENT_MOUNT_DRIFT="${FAKE_AGENT_MOUNT_DRIFT:-0}" \
+    FAKE_AGENT_INSPECT_COUNT_FILE="${FAKE_AGENT_INSPECT_COUNT_FILE:-}" \
+    FAKE_AGENT_WRITABLE_BIND="${FAKE_AGENT_WRITABLE_BIND:-0}" \
     FAKE_COMPOSE_VOLUMES="${FAKE_COMPOSE_VOLUMES:-}" \
     FAKE_DATABASE_URL="${FAKE_DATABASE_URL:-}" \
     FAKE_DOCKER_LOG="${FAKE_DOCKER_LOG:-}" \
@@ -232,6 +261,7 @@ run_backup() {
     FAKE_POSTGRES_RESTORE_DRIFT="${FAKE_POSTGRES_RESTORE_DRIFT:-0}" \
     FAKE_POSTGRES_SCHEMA_DRIFT="${FAKE_POSTGRES_SCHEMA_DRIFT:-0}" \
     FAKE_SQLITE_INTEGRITY_FAIL="${FAKE_SQLITE_INTEGRITY_FAIL:-0}" \
+    FAKE_ARCHIVE_FAIL_VOLUME="${FAKE_ARCHIVE_FAIL_VOLUME:-}" \
     PATH="$TMP/bin:$PATH" "$SCRIPT" \
     --project-name trinity \
     --output-dir "$output" \
@@ -259,6 +289,8 @@ test -s "$bundle/platform-volumes/redis-data.tgz"
 test -s "$bundle/platform-volumes/agent-configs.tgz"
 test -s "$bundle/platform-volumes/trinity-logs.tgz"
 grep -qx 'agent_inventory_stable=yes' "$bundle/manifest.txt"
+grep -qx 'agent_mount_inventory_stable=yes' "$bundle/manifest.txt"
+grep -qx 'agent_persistent_volume_coverage_verified=yes' "$bundle/manifest.txt"
 grep -qx 'artifact_inventory_verified=yes' "$bundle/manifest.txt"
 grep -qx 'backup_complete=yes' "$bundle/manifest.txt"
 
@@ -270,7 +302,8 @@ grep -qx 'platform_volume_archives=4' "$detached_bundle/manifest.txt"
 test -s "$detached_bundle/platform-volumes/trinity-detached.tgz"
 
 agent_result="$TMP/agent-result"
-FAKE_AGENT_VOLUMES='agent-paid-media-workspace' PATH="$TMP/bin:$PATH" "$SCRIPT" \
+FAKE_AGENT_VOLUMES='agent-paid-media-workspace agent-paid-media-public agent-paid-media-shared encrypted-data' \
+  PATH="$TMP/bin:$PATH" "$SCRIPT" \
   --project-name trinity \
   --output-dir "$TMP/agent-backups" \
   --env-file "$TMP/trinity.env" \
@@ -279,6 +312,56 @@ agent_bundle=$(cat "$agent_result")
 test -s "$agent_bundle/agent-workspaces/agent-paid-media-workspace.tgz"
 grep -qx 'agent_workspace_archives=1' "$agent_bundle/manifest.txt"
 grep -qx 'agent_workspace_archives_verified=yes' "$agent_bundle/manifest.txt"
+grep -qx 'agent_auxiliary_volume_archives=3' "$agent_bundle/manifest.txt"
+test -s "$agent_bundle/agent-auxiliary-volumes/agent-paid-media-public.tgz"
+test -s "$agent_bundle/agent-auxiliary-volumes/agent-paid-media-shared.tgz"
+test -s "$agent_bundle/agent-auxiliary-volumes/encrypted-data.tgz"
+
+mounted_result="$TMP/mounted-result"
+FAKE_AGENT_CONTAINERS='agent-paid-media' \
+FAKE_AGENT_VOLUMES='agent-paid-media-workspace encrypted-data package-fixture' \
+FAKE_AGENT_MOUNTED_VOLUMES='encrypted-data package-fixture' \
+PATH="$TMP/bin:$PATH" "$SCRIPT" --project-name trinity \
+  --output-dir "$TMP/mounted-backups" --env-file "$TMP/trinity.env" \
+  --result-file "$mounted_result" >/dev/null
+mounted_bundle=$(cat "$mounted_result")
+grep -qx 'agent_auxiliary_volume_archives=2' "$mounted_bundle/manifest.txt"
+grep -qx 'agent_auxiliary_volume_archives_verified=yes' "$mounted_bundle/manifest.txt"
+grep -qx 'agent_auxiliary_volume_live_consistency_verified=yes' "$mounted_bundle/manifest.txt"
+grep -qx 'agent_persistent_volume_coverage_verified=yes' "$mounted_bundle/manifest.txt"
+test -s "$mounted_bundle/agent-auxiliary-volumes/encrypted-data.tgz"
+test -s "$mounted_bundle/agent-auxiliary-volumes/package-fixture.tgz"
+
+if FAKE_AGENT_CONTAINERS='agent-paid-media' \
+  FAKE_AGENT_VOLUMES='agent-paid-media-workspace' \
+  FAKE_AGENT_WRITABLE_BIND=1 PATH="$TMP/bin:$PATH" "$SCRIPT" \
+  --project-name trinity --output-dir "$TMP/writable-bind" \
+  --env-file "$TMP/trinity.env" --result-file "$TMP/writable-bind-result" \
+  >/dev/null 2>&1; then
+  echo 'writable agent bind mount outside backup coverage was accepted' >&2
+  exit 1
+fi
+
+: > "$TMP/agent-inspect-count"
+if FAKE_AGENT_CONTAINERS='agent-paid-media' \
+  FAKE_AGENT_VOLUMES='agent-paid-media-workspace' \
+  FAKE_AGENT_MOUNT_DRIFT=1 FAKE_AGENT_INSPECT_COUNT_FILE="$TMP/agent-inspect-count" \
+  PATH="$TMP/bin:$PATH" "$SCRIPT" --project-name trinity \
+  --output-dir "$TMP/agent-mount-drift" --env-file "$TMP/trinity.env" \
+  --result-file "$TMP/agent-mount-drift-result" >/dev/null 2>&1; then
+  echo 'agent mount inventory drift was accepted' >&2
+  exit 1
+fi
+
+if FAKE_AGENT_CONTAINERS='agent-paid-media' \
+  FAKE_AGENT_VOLUMES='agent-paid-media-workspace encrypted-data' \
+  FAKE_AGENT_MOUNTED_VOLUMES='encrypted-data' FAKE_ARCHIVE_FAIL_VOLUME='encrypted-data' \
+  PATH="$TMP/bin:$PATH" "$SCRIPT" --project-name trinity \
+  --output-dir "$TMP/agent-archive-failure" --env-file "$TMP/trinity.env" \
+  --result-file "$TMP/agent-archive-failure-result" >/dev/null 2>&1; then
+  echo 'failed agent-mounted volume archive was accepted' >&2
+  exit 1
+fi
 
 if FAKE_AGENT_CONTAINERS='agent-paid-media' PATH="$TMP/bin:$PATH" "$SCRIPT" \
   --project-name trinity --output-dir "$TMP/missing-agent-volume" \
@@ -397,6 +480,9 @@ grep -q "postgres_restore_verified=yes" "$UPGRADE_SCRIPT"
 grep -q "postgres_content_fingerprint_sha256" "$UPGRADE_SCRIPT"
 grep -q "environment_semantics_verified=yes" "$UPGRADE_SCRIPT"
 grep -q "agent_workspace_archives_verified=yes" "$UPGRADE_SCRIPT"
+grep -q "agent_auxiliary_volume_archives_verified=yes" "$UPGRADE_SCRIPT"
+grep -q "agent_persistent_volume_coverage_verified=yes" "$UPGRADE_SCRIPT"
+grep -q "agent_mount_inventory_stable=yes" "$UPGRADE_SCRIPT"
 grep -q "platform_volume_archives_verified=yes" "$UPGRADE_SCRIPT"
 grep -q "platform_volume_inventory_stable=yes" "$UPGRADE_SCRIPT"
 grep -q "Authenticated version endpoint verification failed" "$UPGRADE_SCRIPT"
@@ -413,6 +499,8 @@ cp "$ROOT/scripts/deploy/backup-persistent-state.sh" "$governed/scripts/deploy/b
 cp "$ROOT/scripts/deploy/github-actions-safe-deploy.sh" "$governed/scripts/deploy/github-actions-safe-deploy.sh"
 cp "$ROOT/scripts/deploy/validate-compose-build-inputs.py" "$governed/scripts/deploy/validate-compose-build-inputs.py"
 cp "$ROOT/scripts/deploy/verify-exact-git-tree.py" "$governed/scripts/deploy/verify-exact-git-tree.py"
+cp "$ROOT/scripts/deploy/verify-agent-mount-inventory.py" "$governed/scripts/deploy/verify-agent-mount-inventory.py"
+cp "$ROOT/scripts/deploy/release-excluded-gitlinks.txt" "$governed/scripts/deploy/release-excluded-gitlinks.txt"
 cp "$ROOT/scripts/deploy/verify-compose-readiness.sh" "$governed/scripts/deploy/verify-compose-readiness.sh"
 chmod 755 "$governed/scripts/deploy/"*.sh
 chmod 755 "$governed/scripts/deploy/"*.py
@@ -423,7 +511,23 @@ git -C "$governed" init -q
 git -C "$governed" config user.email test@example.com
 git -C "$governed" config user.name test
 git -C "$governed" add .
+git -C "$governed" commit -qm gitlink-target
+gitlink_target=$(git -C "$governed" rev-parse HEAD)
+cat > "$governed/.gitmodules" <<'EOF'
+[submodule ".claude"]
+	path = .claude
+	url = https://example.invalid/development.git
+	update = none
+[submodule "src/backend/enterprise"]
+	path = src/backend/enterprise
+	url = https://example.invalid/enterprise.git
+	update = none
+EOF
+git -C "$governed" add .gitmodules
+git -C "$governed" update-index --add --cacheinfo 160000 "$gitlink_target" .claude
+git -C "$governed" update-index --add --cacheinfo 160000 "$gitlink_target" src/backend/enterprise
 git -C "$governed" commit -qm governed
+mkdir -p "$governed/.claude" "$governed/src/backend/enterprise"
 governed_commit=$(git -C "$governed" rev-parse HEAD)
 governed_plan=$(TRINITY_EXPECTED_SOURCE_REVISION="$governed_commit" \
   GIT_COMMIT="$governed_commit" FAKE_AGENT_VOLUMES='agent-paid-media-workspace' \
@@ -434,6 +538,50 @@ printf '%s\n' "$governed_plan" | grep -q "Prepared exact-commit build source $go
 printf '%s\n' "$governed_plan" | grep -q 'trinity-release-inputs.*source.*build'
 printf '%s\n' "$governed_plan" | grep -q -- '--env-file .*trinity-release-inputs.*config/runtime.env'
 printf '%s\n' "$governed_plan" | grep -q 'up --no-build -d backend'
+
+extracted="$TMP/extracted-governed"
+mkdir "$extracted"
+git -C "$governed" archive "$governed_commit" | tar -x -C "$extracted"
+printf 'not releasable\n' > "$extracted/.claude/private.txt"
+if python3 "$governed/scripts/deploy/verify-exact-git-tree.py" \
+  "$governed" "$governed_commit" "$extracted" >/dev/null 2>&1; then
+  echo 'release projection accepted bytes beneath an excluded gitlink' >&2
+  exit 1
+fi
+
+unknown_gitlink="$TMP/governed-unknown-gitlink"
+git clone -q --no-local "$governed" "$unknown_gitlink"
+git -C "$unknown_gitlink" config user.email test@example.com
+git -C "$unknown_gitlink" config user.name test
+git -C "$unknown_gitlink" update-index --add --cacheinfo 160000 "$gitlink_target" vendor/private
+git -C "$unknown_gitlink" commit -qm unknown-gitlink
+mkdir -p "$unknown_gitlink/vendor/private"
+unknown_commit=$(git -C "$unknown_gitlink" rev-parse HEAD)
+if TRINITY_EXPECTED_SOURCE_REVISION="$unknown_commit" GIT_COMMIT="$unknown_commit" \
+  FAKE_AGENT_VOLUMES='agent-paid-media-workspace' PATH="$TMP/bin:$PATH" \
+  "$unknown_gitlink/scripts/deploy/safe-upgrade.sh" --allow-fresh --dry-run \
+  --env-file "$TMP/trinity.env" -f "$unknown_gitlink/docker-compose.yml" >/dev/null 2>&1; then
+  echo 'release projection accepted an undeclared gitlink' >&2
+  exit 1
+fi
+
+misconfigured_gitlink="$TMP/governed-misconfigured-gitlink"
+git clone -q --no-local "$governed" "$misconfigured_gitlink"
+git -C "$misconfigured_gitlink" config user.email test@example.com
+git -C "$misconfigured_gitlink" config user.name test
+sed 's/update = none/update = checkout/' "$misconfigured_gitlink/.gitmodules" \
+  > "$misconfigured_gitlink/.gitmodules.next"
+mv "$misconfigured_gitlink/.gitmodules.next" "$misconfigured_gitlink/.gitmodules"
+git -C "$misconfigured_gitlink" add .gitmodules
+git -C "$misconfigured_gitlink" commit -qm misconfigured-gitlink
+misconfigured_commit=$(git -C "$misconfigured_gitlink" rev-parse HEAD)
+if TRINITY_EXPECTED_SOURCE_REVISION="$misconfigured_commit" GIT_COMMIT="$misconfigured_commit" \
+  FAKE_AGENT_VOLUMES='agent-paid-media-workspace' PATH="$TMP/bin:$PATH" \
+  "$misconfigured_gitlink/scripts/deploy/safe-upgrade.sh" --allow-fresh --dry-run \
+  --env-file "$TMP/trinity.env" -f "$misconfigured_gitlink/docker-compose.yml" >/dev/null 2>&1; then
+  echo 'release projection accepted a gitlink without update=none' >&2
+  exit 1
+fi
 
 default_governed_plan=$(FAKE_AGENT_VOLUMES='agent-paid-media-workspace' \
   PATH="$TMP/bin:$PATH" "$governed/scripts/deploy/safe-upgrade.sh" \

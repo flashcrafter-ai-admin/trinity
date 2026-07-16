@@ -289,10 +289,6 @@ prepare_immutable_release_inputs() {
   [[ -n "${EXPECTED_SOURCE_REVISION}" ]] || return 0
   command -v python3 >/dev/null 2>&1 || die "python3 is required for immutable release inputs"
   command -v tar >/dev/null 2>&1 || die "tar is required for immutable release inputs"
-  if git_no_replace -C "${PROJECT_ROOT}" ls-tree -r "${EXPECTED_SOURCE_REVISION}" \
-    | awk '$1 == "160000" { found=1 } END { exit(found ? 0 : 1) }'; then
-    die "Governed release source contains unsupported Git submodules"
-  fi
 
   IMMUTABLE_RELEASE_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/trinity-release-inputs.XXXXXX")"
   local source_root="${IMMUTABLE_RELEASE_ROOT}/source"
@@ -549,12 +545,20 @@ if [[ ${FRESH_INSTALL} -eq 0 ]]; then
       || die "Backup did not verify agent workspace coverage"
     grep -qx 'agent_workspace_live_consistency_verified=yes' "${BACKUP_MANIFEST}" \
       || die "Backup did not compare agent workspaces with paused live sources"
+    grep -qx 'agent_auxiliary_volume_archives_verified=yes' "${BACKUP_MANIFEST}" \
+      || die "Backup did not verify auxiliary and detached agent volumes"
+    grep -qx 'agent_auxiliary_volume_live_consistency_verified=yes' "${BACKUP_MANIFEST}" \
+      || die "Backup did not compare auxiliary agent volumes with paused live sources"
+    grep -qx 'agent_persistent_volume_coverage_verified=yes' "${BACKUP_MANIFEST}" \
+      || die "Backup did not cover every governed agent persistence volume"
     grep -qx 'environment_semantics_verified=yes' "${BACKUP_MANIFEST}" \
       || die "Backup did not validate required environment keys"
     grep -qx 'writer_pause_verified=yes' "${BACKUP_MANIFEST}" \
       || die "Backup did not hold every application writer paused"
     grep -qx 'agent_inventory_stable=yes' "${BACKUP_MANIFEST}" \
       || die "Backup did not prove stable agent container/workspace coverage"
+    grep -qx 'agent_mount_inventory_stable=yes' "${BACKUP_MANIFEST}" \
+      || die "Backup did not prove stable agent mount coverage"
     grep -qx 'artifact_inventory_verified=yes' "${BACKUP_MANIFEST}" \
       || die "Backup did not produce a verified artifact digest inventory"
     grep -qx 'platform_volume_archives_verified=yes' "${BACKUP_MANIFEST}" \
