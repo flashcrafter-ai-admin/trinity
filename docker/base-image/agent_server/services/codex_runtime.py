@@ -739,8 +739,12 @@ class CodexRuntime(AgentRuntime):
         execution_id = execution_id or str(uuid.uuid4())
 
         codex_home = _ensure_codex_home()
-        api_key = _load_openai_api_key()
-        if not api_key and not _has_chatgpt_subscription_auth(codex_home):
+        subscription_auth = _has_chatgpt_subscription_auth(codex_home)
+        # ChatGPT subscription identity is authoritative when present. A stale
+        # process/.env API key must never silently switch a subscription-backed
+        # agent onto metered billing.
+        api_key = None if subscription_auth else _load_openai_api_key()
+        if not subscription_auth and not api_key:
             raise HTTPException(
                 status_code=503,
                 detail=(
@@ -768,7 +772,10 @@ class CodexRuntime(AgentRuntime):
             EXECUTION_TAG_NAME: execution_id,
             "CODEX_HOME": codex_home,
         }
-        if api_key:
+        if subscription_auth:
+            env.pop("OPENAI_API_KEY", None)
+            env.pop("CODEX_API_KEY", None)
+        elif api_key:
             # Inject under both names — the ecosystem standard is OPENAI_API_KEY;
             # some Codex builds also read CODEX_API_KEY. Subscription auth reads
             # auth.json from CODEX_HOME and deliberately sets neither variable.

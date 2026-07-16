@@ -1375,6 +1375,18 @@ async def _read_sealed_task_body(raw_request: Request) -> bytes:
     return bytes(body)
 
 
+def _reject_sealed_attribution_headers(raw_request: Request) -> None:
+    """Reject caller-supplied provenance before parsing any sealed secret."""
+    forbidden = (
+        "x-source-agent",
+        "x-via-mcp",
+        "x-mcp-key-id",
+        "x-mcp-key-name",
+    )
+    if any(name in raw_request.headers for name in forbidden):
+        raise HTTPException(status_code=403, detail="Sealed task contract rejected")
+
+
 @router.post("/{name}/task/sealed")
 async def execute_sealed_parallel_task(
     raw_request: Request,
@@ -1383,6 +1395,7 @@ async def execute_sealed_parallel_task(
     idempotency_key: Optional[str] = Header(None),
 ):
     """Parse and execute one exact signed task under a sealed-executor key."""
+    _reject_sealed_attribution_headers(raw_request)
     request = parse_sealed_task_wire(await _read_sealed_task_body(raw_request))
     return await execute_parallel_task(
         request=request,

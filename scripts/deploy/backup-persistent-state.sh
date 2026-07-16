@@ -19,7 +19,8 @@ ENV_FILE="${PROJECT_ROOT}/.env"
 INCLUDE_AGENT_WORKSPACES=1
 INCLUDE_BACKEND_DATA=1
 INCLUDE_ENV=1
-ALLOW_EXTERNAL_DB_WITHOUT_DUMP=0
+EXTERNAL_DB_SNAPSHOT_RECEIPT=""
+RESULT_FILE=""
 
 usage() {
   cat <<'EOF'
@@ -32,7 +33,9 @@ Options:
   --skip-agent-workspaces          Do not archive agent-*-workspace Docker volumes
   --skip-backend-data              Do not archive the backend /data mount
   --skip-env                       Do not copy .env into the backup bundle
-  --allow-external-db-without-dump Do not fail when DATABASE_URL points at an external PostgreSQL DB
+  --external-db-snapshot-receipt FILE
+                                   JSON receipt for an already-completed managed PostgreSQL snapshot
+  --result-file FILE               Write the completed backup directory to FILE
   -h, --help                       Show this help
 
 The backup directory contains secrets if .env is copied. It is chmod 700 and
@@ -66,9 +69,13 @@ while [[ $# -gt 0 ]]; do
       INCLUDE_ENV=0
       shift
       ;;
-    --allow-external-db-without-dump)
-      ALLOW_EXTERNAL_DB_WITHOUT_DUMP=1
-      shift
+    --external-db-snapshot-receipt)
+      EXTERNAL_DB_SNAPSHOT_RECEIPT="${2:?--external-db-snapshot-receipt requires a value}"
+      shift 2
+      ;;
+    --result-file)
+      RESULT_FILE="${2:?--result-file requires a value}"
+      shift 2
       ;;
     -h|--help)
       usage
@@ -100,11 +107,26 @@ require_cmd() {
 }
 
 service_container() {
-  docker ps \
+  docker ps -a \
     --filter "label=com.docker.compose.project=${PROJECT_NAME}" \
     --filter "label=com.docker.compose.service=$1" \
     --format '{{.Names}}' \
     | head -n 1
+}
+
+container_running() {
+  [[ "$(docker inspect --format '{{.State.Running}}' "$1")" == "true" ]]
+}
+
+verify_archive() {
+  local archive_dir="$1"
+  local archive_name="$2"
+  [[ -s "${archive_dir}/${archive_name}" ]] || die "Archive is missing or empty: ${archive_name}"
+  docker run --rm \
+    -v "${archive_dir}:/backup:ro" \
+    alpine:3.20 \
+    tar -tzf "/backup/${archive_name}" >/dev/null \
+    || die "Archive verification failed: ${archive_name}"
 }
 
 archive_volume() {
@@ -118,6 +140,7 @@ archive_volume() {
     -v "${archive_dir}:/backup" \
     alpine:3.20 \
     sh -c 'cd /source && tar -czf "/backup/$1" .' sh "${archive_name}"
+  verify_archive "${archive_dir}" "${archive_name}"
 }
 
 require_cmd docker
@@ -143,7 +166,7 @@ REDIS_CONTAINER="$(service_container redis || true)"
   echo "postgres_container=${POSTGRES_CONTAINER:-missing}"
   echo "redis_container=${REDIS_CONTAINER:-missing}"
   echo "env_file=${ENV_FILE}"
-  echo "contains_secrets=$([[ ${INCLUDE_ENV} -eq 1 && -f "${ENV_FILE}" ]] && echo yes || echo no)"
+  echo "contains_secrets=$([[ ${INCLUDE_ENV} -eq 1 && -s "${ENV_FILE}" ]] && echo yes || echo no)"
   echo
   echo "docker_volumes:"
   docker volume ls --format '{{.Name}}' | sort | sed 's/^/  - /'
@@ -156,22 +179,24 @@ REDIS_CONTAINER="$(service_container redis || true)"
 
 log "Writing backup bundle: ${RUN_DIR}"
 
+[[ -n "${BACKEND_CONTAINER}" ]] || die "No backend container exists for compose project ${PROJECT_NAME}"
+
 if [[ ${INCLUDE_ENV} -eq 1 ]]; then
-  if [[ -f "${ENV_FILE}" ]]; then
+  if [[ -s "${ENV_FILE}" ]]; then
     cp "${ENV_FILE}" "${RUN_DIR}/env.backup"
     chmod 600 "${RUN_DIR}/env.backup"
     log "Copied ${ENV_FILE} to env.backup"
   else
-    warn "Env file not found at ${ENV_FILE}; skipping env backup"
+    die "Env file is missing or empty at ${ENV_FILE}; refusing an unrecoverable credential backup"
   fi
 fi
 
-DATABASE_URL=""
-if [[ -n "${BACKEND_CONTAINER}" ]]; then
-  DATABASE_URL="$(docker exec "${BACKEND_CONTAINER}" sh -lc 'printf "%s" "${DATABASE_URL:-}"' 2>/dev/null || true)"
-fi
+DATABASE_URL="$(docker inspect "${BACKEND_CONTAINER}" --format '{{range .Config.Env}}{{println .}}{{end}}' \
+  | sed -n 's/^DATABASE_URL=//p' | head -n 1)"
 
 if [[ -n "${POSTGRES_CONTAINER}" ]]; then
+  container_running "${POSTGRES_CONTAINER}" \
+    || die "PostgreSQL container ${POSTGRES_CONTAINER} is stopped; refusing an unverifiable dump"
   log "Creating PostgreSQL custom-format dump from ${POSTGRES_CONTAINER}"
   docker exec "${POSTGRES_CONTAINER}" sh -lc \
     'export PGPASSWORD="${POSTGRES_PASSWORD:-}"; pg_dump -U "${POSTGRES_USER:-trinity}" -d "${POSTGRES_DB:-trinity}" -Fc' \
@@ -181,39 +206,73 @@ if [[ -n "${POSTGRES_CONTAINER}" ]]; then
     log "Verified postgres.dump with pg_restore -l"
     echo "postgres_dump_verified=yes" >> "${MANIFEST}"
   else
-    warn "Could not verify postgres.dump with pg_restore; dump file was still written"
     echo "postgres_dump_verified=no" >> "${MANIFEST}"
+    die "Could not verify postgres.dump with pg_restore"
   fi
 elif [[ "${DATABASE_URL}" == postgresql://* || "${DATABASE_URL}" == postgres://* ]]; then
   echo "external_postgres_detected=yes" >> "${MANIFEST}"
-  if [[ ${ALLOW_EXTERNAL_DB_WITHOUT_DUMP} -eq 0 ]]; then
-    die "Backend uses PostgreSQL but no compose postgres service was found. Take a managed DB snapshot or rerun with --allow-external-db-without-dump after doing that."
-  fi
-  warn "External PostgreSQL detected; this bundle does not include a database dump"
-else
-  if [[ -n "${BACKEND_CONTAINER}" ]]; then
-    log "No PostgreSQL service detected; archiving SQLite files from backend /data if present"
-    docker run --rm \
-      --volumes-from "${BACKEND_CONTAINER}:ro" \
-      -v "${RUN_DIR}:/backup" \
-      alpine:3.20 \
-      sh -c 'cd /data && tar -czf /backup/sqlite-data.tgz trinity.db trinity.db-wal trinity.db-shm 2>/dev/null || true'
+  [[ -s "${EXTERNAL_DB_SNAPSHOT_RECEIPT}" ]] \
+    || die "Backend uses external PostgreSQL; provide --external-db-snapshot-receipt after completing a managed snapshot"
+  require_cmd jq
+  if command -v sha256sum >/dev/null 2>&1; then
+    DATABASE_URL_DIGEST="sha256:$(printf '%s' "${DATABASE_URL}" | sha256sum | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    DATABASE_URL_DIGEST="sha256:$(printf '%s' "${DATABASE_URL}" | shasum -a 256 | awk '{print $1}')"
   else
-    warn "No backend container found; skipped SQLite/backend database backup"
+    die "sha256sum or shasum is required to bind the external database snapshot receipt"
   fi
+  jq -e --arg digest "${DATABASE_URL_DIGEST}" '
+    (keys | sort) == ["createdAt","databaseUrlDigest","provider","schemaVersion","snapshotId"]
+    and .schemaVersion == "trinity-external-database-snapshot/1"
+    and .databaseUrlDigest == $digest
+    and (.provider | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._-]{1,63}$"))
+    and (.snapshotId | type == "string" and test("^[A-Za-z0-9][A-Za-z0-9._:/-]{2,255}$"))
+    and (.createdAt | type == "string" and test("^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$"))
+  ' "${EXTERNAL_DB_SNAPSHOT_RECEIPT}" >/dev/null \
+    || die "External PostgreSQL snapshot receipt is invalid or bound to another database"
+  cp "${EXTERNAL_DB_SNAPSHOT_RECEIPT}" "${RUN_DIR}/external-postgres-snapshot.json"
+  chmod 600 "${RUN_DIR}/external-postgres-snapshot.json"
+  echo "external_postgres_snapshot_verified=yes" >> "${MANIFEST}"
+  warn "External PostgreSQL snapshot is represented by its bound managed-provider receipt"
+else
+  log "No PostgreSQL service detected; taking an online SQLite backup"
+  BACKEND_IMAGE="$(docker inspect "${BACKEND_CONTAINER}" --format '{{.Image}}')"
+  [[ -n "${BACKEND_IMAGE}" ]] || die "Could not resolve the backend image for SQLite backup"
+  docker run --rm \
+    --volumes-from "${BACKEND_CONTAINER}:ro" \
+    -v "${RUN_DIR}:/backup" \
+    --user root \
+    --entrypoint python3 \
+    "${BACKEND_IMAGE}" \
+    -c 'import sqlite3; source=sqlite3.connect("file:/data/trinity.db?mode=ro", uri=True); target=sqlite3.connect("/backup/trinity.db"); source.backup(target); target.close(); source.close()'
+  [[ -s "${RUN_DIR}/trinity.db" ]] || die "SQLite online backup is missing or empty"
+  docker run --rm \
+    -v "${RUN_DIR}:/backup:ro" \
+    --user root \
+    --entrypoint python3 \
+    "${BACKEND_IMAGE}" \
+    -c 'import sqlite3,sys; db=sqlite3.connect("file:/backup/trinity.db?mode=ro", uri=True); result=db.execute("PRAGMA integrity_check").fetchone(); db.close(); sys.exit(0 if result == ("ok",) else 1)' \
+    || die "SQLite online backup failed PRAGMA integrity_check"
+  docker run --rm \
+    -v "${RUN_DIR}:/backup" \
+    alpine:3.20 \
+    tar -czf /backup/sqlite-data.tgz -C /backup trinity.db
+  verify_archive "${RUN_DIR}" "sqlite-data.tgz"
+  docker run --rm -v "${RUN_DIR}:/backup:ro" alpine:3.20 \
+    tar -tzf /backup/sqlite-data.tgz trinity.db >/dev/null \
+    || die "SQLite backup does not contain trinity.db"
+  echo "sqlite_backup_verified=yes" >> "${MANIFEST}"
 fi
 
 if [[ ${INCLUDE_BACKEND_DATA} -eq 1 ]]; then
-  if [[ -n "${BACKEND_CONTAINER}" ]]; then
-    log "Archiving backend /data mount"
-    docker run --rm \
-      --volumes-from "${BACKEND_CONTAINER}:ro" \
-      -v "${RUN_DIR}:/backup" \
-      alpine:3.20 \
-      sh -c 'cd /data && tar -czf /backup/backend-data.tgz .'
-  else
-    warn "No backend container found; skipped backend /data archive"
-  fi
+  log "Archiving backend /data mount"
+  docker run --rm \
+    --volumes-from "${BACKEND_CONTAINER}:ro" \
+    -v "${RUN_DIR}:/backup" \
+    alpine:3.20 \
+    sh -ec 'cd /data; tar -czf /backup/backend-data.tgz .'
+  verify_archive "${RUN_DIR}" "backend-data.tgz"
+  echo "backend_data_verified=yes" >> "${MANIFEST}"
 fi
 
 if [[ ${INCLUDE_AGENT_WORKSPACES} -eq 1 ]]; then
@@ -234,6 +293,13 @@ if [[ -n "${REDIS_CONTAINER}" ]]; then
 fi
 
 du -sh "${RUN_DIR}" | awk '{print "backup_size=" $1}' >> "${MANIFEST}"
+echo "backup_complete=yes" >> "${MANIFEST}"
+
+if [[ -n "${RESULT_FILE}" ]]; then
+  mkdir -p "$(dirname "${RESULT_FILE}")"
+  printf '%s\n' "${RUN_DIR}" > "${RESULT_FILE}"
+  chmod 600 "${RESULT_FILE}"
+fi
 
 log "Backup complete"
 log "Manifest: ${MANIFEST}"

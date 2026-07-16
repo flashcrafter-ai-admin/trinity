@@ -14,6 +14,30 @@ parse_target_commit() {
     return 64
 }
 
+assert_exact_clean_worktree() {
+    local worktree_path="$1"
+    local target_commit="$2"
+    local actual_commit actual_tree target_tree drift
+    actual_commit=$(git -C "$worktree_path" rev-parse HEAD)
+    if [[ "$actual_commit" != "$target_commit" ]]; then
+        log "Deployment worktree points to unexpected commit: $worktree_path"
+        return 73
+    fi
+    drift=$(git -C "$worktree_path" status --porcelain=v1 --untracked-files=all)
+    if [[ -n "$drift" ]] \
+        || ! git -C "$worktree_path" diff --quiet -- \
+        || ! git -C "$worktree_path" diff --cached --quiet --; then
+        log "Deployment worktree contains tracked or untracked drift: $worktree_path"
+        return 74
+    fi
+    actual_tree=$(git -C "$worktree_path" write-tree)
+    target_tree=$(git -C "$worktree_path" rev-parse "${target_commit}^{tree}")
+    if [[ "$actual_tree" != "$target_tree" ]]; then
+        log "Deployment worktree tree does not match requested commit: $worktree_path"
+        return 74
+    fi
+}
+
 main() {
     local target_commit
     if ! target_commit=$(parse_target_commit "${SSH_ORIGINAL_COMMAND:-}"); then
@@ -67,6 +91,7 @@ main() {
         log "Creating immutable deployment worktree: $deploy_dir"
         git -C "$TRINITY_PRIMARY_DIR" worktree add --detach "$deploy_dir" "$target_commit"
     fi
+    assert_exact_clean_worktree "$deploy_dir" "$target_commit"
 
     local compose_args=(-f docker-compose.prod.yml)
     if [[ -n "$compose_override" ]]; then

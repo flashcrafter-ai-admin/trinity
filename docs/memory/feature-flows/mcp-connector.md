@@ -32,23 +32,25 @@ the public repo and the entitlement gate was dropped front and back. Part B
 | POST | `/{name}/connector/key` | `OwnedAgentByName` | Mint/regenerate the scoped key — **secret returned once**; auto-enables; snippets embed the real key. Atomic delete-old + insert-new (single-active-key invariant) |
 | DELETE | `/{name}/connector/key` | `OwnedAgentByName` | Revoke all connector-scoped keys (idempotent) |
 | GET | `/{name}/connector/playbooks` | `AuthorizedAgentByName` (accepts a `scope='connector'` key) | Effective exposed playbooks the connector advertises |
-| POST | `/{name}/task` | `AuthorizedAgent` plus sealed-task contract | Execute only a synchronous signed operation for the connector's bound agent; ordinary connector task bodies are refused |
+| POST | `/{name}/task/sealed` | distinct `scope='sealed_executor'` key bound to one agent | Execute one exact synchronous signed operation; this principal cannot authenticate to MCP or any ordinary agent route |
 
 ## Key + policy
 
-- **Scoped key**: a row in the OSS `mcp_api_keys` table with `scope='connector'`,
+- **Connector key**: a row in the OSS `mcp_api_keys` table with `scope='connector'`,
   `agent_name` bound. Generated/hashed via `McpKeyOperations` so
   `validate_mcp_api_key` recognizes it. The OSS auth fence fences a connector key
-  to exactly `POST /{agent}/chat`, `POST /{agent}/task`, and
-  `GET /{agent}/connector/playbooks` — it cannot reach owner ops or any other
-  agent. The task route adds a body-aware fail-closed gate: it requires one
-  normalized signed operation grant, synchronous execution, `Bash` as the only
-  tool, bounded turns, an idempotency key, and no session, file, model, prompt,
-  timeout, result-injection, or caller-attribution overrides. The backend then
-  dispatches only to the agent's dedicated `/api/task/sealed` endpoint, which is
-  absent from legacy images and has no fallback to the ordinary task endpoint.
-  Sealed request keys and primitive types are checked before Pydantic
-  normalization, and execution stops before persistence if the required
+  to its documented chat/playbook connector surface; it cannot reach owner ops or
+  another agent.
+- **Sealed-executor key**: a separate row with `scope='sealed_executor'` and one
+  bound `agent_name`. It is rejected by the central MCP validation surface and may
+  reach only `POST /{agent}/task/sealed`. That route adds a body-aware fail-closed
+  gate: it requires one exact signed operation grant, synchronous execution,
+  `Bash` as the only tool, bounded turns, an idempotency key, and no session, file,
+  model, prompt, timeout, result-injection, or caller-attribution headers. The
+  backend dispatches only to the agent's dedicated internal `/api/task/sealed`
+  endpoint, which is absent from legacy images and has no fallback to the ordinary
+  task endpoint. Sealed request keys and primitive types are checked before
+  Pydantic normalization, and execution stops before persistence if the required
   idempotency claim cannot be established.
 - **Allow-list** (`enterprise_connectors.exposed_playbooks`, JSON array; NULL ⇒ all
   `user_invocable`): `resolve_exposed_playbooks` drops `user_invocable:false`

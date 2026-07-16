@@ -52,7 +52,7 @@ Only when `docker/base-image/Dockerfile` changes in the code you pulled — run 
 
 ## How do I back up my Trinity instance?
 
-Run `./scripts/deploy/backup-persistent-state.sh --project-name trinity`. It backs up PostgreSQL with `pg_dump` when a compose `postgres` service exists, archives SQLite files otherwise, archives backend `/data`, copies `.env`, and archives every `agent-*-workspace` volume. Use `--output-dir /srv/trinity-backups/persistent-state` or another durable host path in production. See [Backup and Restore](../guides/deploying/backup-and-restore.md).
+Run `./scripts/deploy/backup-persistent-state.sh --project-name trinity`. It verifies a PostgreSQL dump when a compose `postgres` service exists, takes and integrity-checks an online SQLite backup otherwise, verifies backend `/data`, requires a nonempty `.env`, and verifies every `agent-*-workspace` archive. Managed PostgreSQL requires a snapshot receipt bound to the active database URL digest. Use `--output-dir /srv/trinity-backups/persistent-state` or another durable host path in production. See [Backup and Restore](../guides/deploying/backup-and-restore.md).
 
 ## How often should I back up, and how long should I keep backups?
 

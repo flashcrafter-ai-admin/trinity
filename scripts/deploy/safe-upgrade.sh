@@ -16,12 +16,12 @@ PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 
 PROJECT_NAME="${COMPOSE_PROJECT_NAME:-trinity}"
 BACKUP_DIR="${PROJECT_ROOT}/backups/persistent-state"
-SKIP_BACKUP=0
 ALLOW_FRESH=0
 BUILD=1
 NO_CACHE=0
 DRY_RUN=0
 ENV_FILE=""
+EXTERNAL_DB_SNAPSHOT_RECEIPT=""
 COMPOSE_FILES=()
 TARGET_SERVICES=()
 
@@ -33,8 +33,9 @@ Options:
   --project-name NAME       Docker Compose project name (default: trinity)
   -f, --compose-file FILE   Compose file to use. Repeatable.
   --env-file FILE           Compose env file
+  --external-db-snapshot-receipt FILE
+                            Bound receipt for an already-completed managed PostgreSQL snapshot
   --backup-dir DIR          Persistent-state backup parent directory
-  --skip-backup             Do not run backup-persistent-state.sh first
   --allow-fresh             Allow no existing containers/volumes (first install)
   --no-build                Skip docker compose build
   --no-cache                Build platform services with --no-cache
@@ -62,13 +63,13 @@ while [[ $# -gt 0 ]]; do
       ENV_FILE="${2:?--env-file requires a value}"
       shift 2
       ;;
+    --external-db-snapshot-receipt)
+      EXTERNAL_DB_SNAPSHOT_RECEIPT="${2:?--external-db-snapshot-receipt requires a value}"
+      shift 2
+      ;;
     --backup-dir)
       BACKUP_DIR="${2:?--backup-dir requires a value}"
       shift 2
-      ;;
-    --skip-backup)
-      SKIP_BACKUP=1
-      shift
       ;;
     --allow-fresh)
       ALLOW_FRESH=1
@@ -160,8 +161,12 @@ docker info >/dev/null 2>&1 || die "Docker is not running"
 
 existing_containers="$(docker ps -a --filter "label=com.docker.compose.project=${PROJECT_NAME}" --format '{{.Names}}' || true)"
 existing_volumes="$(docker volume ls --format '{{.Name}}' | grep -E "^${PROJECT_NAME}_" || true)"
+FRESH_INSTALL=0
 if [[ -z "${existing_containers}${existing_volumes}" && ${ALLOW_FRESH} -eq 0 ]]; then
   die "No existing containers or volumes for compose project ${PROJECT_NAME}. Use --allow-fresh only for first install."
+fi
+if [[ -z "${existing_containers}${existing_volumes}" ]]; then
+  FRESH_INSTALL=1
 fi
 
 COMPOSE_SERVICES="$(docker compose "${COMPOSE_ARGS[@]}" config --services)"
@@ -186,18 +191,46 @@ log "Compose project: ${PROJECT_NAME}"
 log "Compose files: ${COMPOSE_FILES[*]}"
 log "Target services: ${TARGET_SERVICES[*]}"
 
-if [[ ${SKIP_BACKUP} -eq 0 ]]; then
+if [[ ${FRESH_INSTALL} -eq 0 ]]; then
+  BACKUP_RESULT_FILE="$(mktemp)"
   BACKUP_CMD=(
     "${SCRIPT_DIR}/backup-persistent-state.sh"
     --project-name "${PROJECT_NAME}"
     --output-dir "${BACKUP_DIR}"
+    --result-file "${BACKUP_RESULT_FILE}"
   )
   if [[ -n "${ENV_FILE}" ]]; then
     BACKUP_CMD+=(--env-file "${ENV_FILE}")
   fi
+  if [[ -n "${EXTERNAL_DB_SNAPSHOT_RECEIPT}" ]]; then
+    BACKUP_CMD+=(--external-db-snapshot-receipt "${EXTERNAL_DB_SNAPSHOT_RECEIPT}")
+  fi
   run "${BACKUP_CMD[@]}"
-else
-  log "Skipping backup because --skip-backup was set"
+  if [[ ${DRY_RUN} -eq 0 ]]; then
+    [[ -s "${BACKUP_RESULT_FILE}" ]] || die "Backup did not return a completed bundle path"
+    COMPLETED_BACKUP="$(cat "${BACKUP_RESULT_FILE}")"
+    rm -f "${BACKUP_RESULT_FILE}"
+    case "${COMPLETED_BACKUP}" in
+      "${BACKUP_DIR%/}/"*) ;;
+      *) die "Backup result escaped the configured backup directory" ;;
+    esac
+    BACKUP_MANIFEST="${COMPLETED_BACKUP}/manifest.txt"
+    [[ -f "${BACKUP_MANIFEST}" ]] || die "Backup manifest is missing"
+    grep -qx 'backup_complete=yes' "${BACKUP_MANIFEST}" \
+      || die "Backup manifest is not complete"
+    grep -qx 'backend_data_verified=yes' "${BACKUP_MANIFEST}" \
+      || die "Backup did not verify backend data"
+    if ! grep -qx 'postgres_dump_verified=yes' "${BACKUP_MANIFEST}" \
+      && ! grep -qx 'sqlite_backup_verified=yes' "${BACKUP_MANIFEST}" \
+      && ! grep -qx 'external_postgres_snapshot_verified=yes' "${BACKUP_MANIFEST}"; then
+      die "Backup did not verify an authoritative database artifact"
+    fi
+    [[ -s "${COMPLETED_BACKUP}/env.backup" ]] \
+      || die "Backup did not preserve a nonempty environment file"
+    log "Verified persistent-state backup: ${COMPLETED_BACKUP}"
+  fi
+elif [[ ${FRESH_INSTALL} -eq 1 ]]; then
+  log "First install has no persistent state to back up"
 fi
 
 if [[ ${BUILD} -eq 1 ]]; then
@@ -239,11 +272,11 @@ if [[ -n "${backend_container}" ]]; then
   log "Backend container health: ${backend_status}"
 fi
 
-if curl -fsS http://127.0.0.1:8000/api/version >/tmp/trinity-safe-upgrade-version.json 2>/dev/null; then
-  log "Running version: $(tr -d '\n' </tmp/trinity-safe-upgrade-version.json)"
-  rm -f /tmp/trinity-safe-upgrade-version.json
-else
-  log "Version endpoint was not reachable; backend health still passed"
-fi
+VERSION_RESULT="$(mktemp)"
+curl -fsS http://127.0.0.1:8000/api/version >"${VERSION_RESULT}" \
+  || die "Version endpoint was not reachable"
+[[ -s "${VERSION_RESULT}" ]] || die "Version endpoint returned an empty response"
+log "Running version: $(tr -d '\n' <"${VERSION_RESULT}")"
+rm -f "${VERSION_RESULT}"
 
 log "Safe upgrade complete"

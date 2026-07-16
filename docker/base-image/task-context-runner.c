@@ -16,6 +16,9 @@
 #define CONTEXT_ROOT "/run/trinity-task-context"
 #define MAX_GRANT_BYTES 32768
 #define CONTEXT_VERIFIER "/opt/flashcrafter/bin/fc-operation-broker"
+#define OPERATION_UID 1001
+#define OPERATION_GID 1001
+#define OPERATION_HOME "/var/empty"
 
 static volatile sig_atomic_t child_pid = -1;
 
@@ -83,6 +86,30 @@ static void write_all(int fd, const char *buffer, size_t length) {
     if (count <= 0) fail("write");
     offset += (size_t)count;
   }
+}
+
+static char *copy_optional_environment(const char *name) {
+  const char *value = getenv(name);
+  if (value == NULL || value[0] == '\0') return NULL;
+  size_t length = strlen(value);
+  if (length > 65536) {
+    fputs("sealed runtime environment value is too large\n", stderr);
+    _exit(126);
+  }
+  char *copy = malloc(length + 1);
+  if (copy == NULL) fail("malloc environment");
+  memcpy(copy, value, length + 1);
+  return copy;
+}
+
+static void set_optional_environment(const char *name, const char *value) {
+  if (value != NULL && setenv(name, value, 1) != 0) fail("setenv optional");
+}
+
+static void wipe_free(char *value) {
+  if (value == NULL) return;
+  memset(value, 0, strlen(value));
+  free(value);
 }
 
 static void verify_grant(const char *grant, size_t length) {
@@ -222,6 +249,21 @@ int main(int argc, char **argv) {
   size_t grant_length = read_grant(grant);
   verify_grant(grant, grant_length);
 
+  char *claude_oauth = copy_optional_environment("CLAUDE_CODE_OAUTH_TOKEN");
+  char *anthropic_api =
+      claude_oauth == NULL ? copy_optional_environment("ANTHROPIC_API_KEY") : NULL;
+  char *anthropic_auth =
+      claude_oauth == NULL && anthropic_api == NULL
+          ? copy_optional_environment("ANTHROPIC_AUTH_TOKEN")
+          : NULL;
+  char *execution_tag = copy_optional_environment("TRINITY_EXECUTION_ID");
+  char *http_proxy = copy_optional_environment("HTTP_PROXY");
+  char *https_proxy = copy_optional_environment("HTTPS_PROXY");
+  char *no_proxy = copy_optional_environment("NO_PROXY");
+  char *ssl_cert_file = copy_optional_environment("SSL_CERT_FILE");
+  char *ssl_cert_dir = copy_optional_environment("SSL_CERT_DIR");
+  char *node_ca = copy_optional_environment("NODE_EXTRA_CA_CERTS");
+
   int ready[2];
   int release[2];
   if (pipe2(ready, O_CLOEXEC) != 0 || pipe2(release, O_CLOEXEC) != 0) fail("pipe2 child");
@@ -241,12 +283,42 @@ int main(int argc, char **argv) {
     signal(SIGINT, SIG_DFL);
     signal(SIGTERM, SIG_DFL);
     signal(SIGHUP, SIG_DFL);
+    if (clearenv() != 0) fail("clearenv");
+    if (setenv("HOME", OPERATION_HOME, 1) != 0 ||
+        setenv("USER", "fc-operation", 1) != 0 ||
+        setenv("LOGNAME", "fc-operation", 1) != 0 ||
+        setenv("SHELL", "/bin/false", 1) != 0 ||
+        setenv("TMPDIR", "/tmp", 1) != 0 ||
+        setenv("LANG", "C.UTF-8", 1) != 0 ||
+        setenv("PATH", "/opt/flashcrafter/bin:/usr/local/bin:/usr/bin:/bin", 1) != 0)
+      fail("setenv sealed runtime");
+    set_optional_environment("CLAUDE_CODE_OAUTH_TOKEN", claude_oauth);
+    set_optional_environment("ANTHROPIC_API_KEY", anthropic_api);
+    set_optional_environment("ANTHROPIC_AUTH_TOKEN", anthropic_auth);
+    set_optional_environment("TRINITY_EXECUTION_ID", execution_tag);
+    set_optional_environment("HTTP_PROXY", http_proxy);
+    set_optional_environment("HTTPS_PROXY", https_proxy);
+    set_optional_environment("NO_PROXY", no_proxy);
+    set_optional_environment("SSL_CERT_FILE", ssl_cert_file);
+    set_optional_environment("SSL_CERT_DIR", ssl_cert_dir);
+    set_optional_environment("NODE_EXTRA_CA_CERTS", node_ca);
     if (setgroups(0, NULL) != 0) fail("setgroups");
-    if (setresgid(1000, 1000, 1000) != 0) fail("setresgid");
-    if (setresuid(1000, 1000, 1000) != 0) fail("setresuid");
+    if (setresgid(OPERATION_GID, OPERATION_GID, OPERATION_GID) != 0) fail("setresgid");
+    if (setresuid(OPERATION_UID, OPERATION_UID, OPERATION_UID) != 0) fail("setresuid");
     execv(argv[1], &argv[1]);
     fail("execv");
   }
+
+  wipe_free(claude_oauth);
+  wipe_free(anthropic_api);
+  wipe_free(anthropic_auth);
+  wipe_free(execution_tag);
+  wipe_free(http_proxy);
+  wipe_free(https_proxy);
+  wipe_free(no_proxy);
+  wipe_free(ssl_cert_file);
+  wipe_free(ssl_cert_dir);
+  wipe_free(node_ca);
 
   close(ready[1]);
   close(release[0]);

@@ -32,4 +32,30 @@ grep -q 'StrictHostKeyChecking=yes' "$ROOT/.github/workflows/deploy-dev.yml"
 grep -q 'deploy \$GITHUB_SHA' "$ROOT/.github/workflows/deploy-dev.yml"
 ! grep -q 'git stash' "$ROOT/.github/workflows/deploy-dev.yml"
 
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+git -C "$tmp" init -q
+git -C "$tmp" config user.email test@example.com
+git -C "$tmp" config user.name test
+printf 'governed\n' > "$tmp/tracked.txt"
+git -C "$tmp" add tracked.txt
+git -C "$tmp" commit -qm governed
+commit=$(git -C "$tmp" rev-parse HEAD)
+assert_exact_clean_worktree "$tmp" "$commit"
+
+printf 'dirty\n' >> "$tmp/tracked.txt"
+if assert_exact_clean_worktree "$tmp" "$commit" >/dev/null 2>&1; then
+    echo "tracked source drift was accepted" >&2
+    exit 1
+fi
+git -C "$tmp" restore tracked.txt
+
+printf 'untracked\n' > "$tmp/untracked.txt"
+if assert_exact_clean_worktree "$tmp" "$commit" >/dev/null 2>&1; then
+    echo "untracked source drift was accepted" >&2
+    exit 1
+fi
+rm "$tmp/untracked.txt"
+assert_exact_clean_worktree "$tmp" "$commit"
+
 echo "github-actions-safe-deploy: OK"

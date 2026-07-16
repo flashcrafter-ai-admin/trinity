@@ -158,6 +158,7 @@ def test_sealed_endpoint_parses_before_runtime_lookup(monkeypatch):
     from routers import chat
 
     raw = MagicMock()
+    raw.headers = {}
     raw.body = lambda: None
     user = User(
         id=1,
@@ -187,6 +188,30 @@ def test_sealed_endpoint_parses_before_runtime_lookup(monkeypatch):
         )
     assert failure.value.status_code == 403
     assert "secret" not in str(failure.value)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["x-source-agent", "x-via-mcp", "x-mcp-key-id", "x-mcp-key-name"],
+)
+def test_sealed_endpoint_rejects_caller_attribution_before_body_parse(name):
+    from routers.chat import _reject_sealed_attribution_headers
+
+    request = _stream_request([_wire()], [(name.encode(), b"")])
+    with pytest.raises(HTTPException) as failure:
+        _reject_sealed_attribution_headers(request)
+    assert failure.value.status_code == 403
+    assert failure.value.detail == "Sealed task contract rejected"
+
+
+def test_sealed_endpoint_accepts_only_non_attribution_transport_headers():
+    from routers.chat import _reject_sealed_attribution_headers
+
+    request = _stream_request(
+        [_wire()],
+        [(b"content-type", b"application/json"), (b"idempotency-key", b"dispatch-1")],
+    )
+    _reject_sealed_attribution_headers(request)
 
 
 def _stream_request(chunks: list[bytes], headers: list[tuple[bytes, bytes]] | None = None):

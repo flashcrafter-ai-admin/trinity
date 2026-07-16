@@ -8,8 +8,8 @@ Trinity upgrades must preserve the operator's work before changing code or conta
 
 | State | Location | Backup action |
 |---|---|---|
-| Platform database, SQLite | `/data/trinity.db` plus WAL/SHM files | Archive from backend `/data` |
-| Platform database, PostgreSQL | Bundled `postgres` service or external DB from `DATABASE_URL` | `pg_dump -Fc` for bundled service; managed snapshot/operator dump for external DB |
+| Platform database, SQLite | `/data/trinity.db` | SQLite online backup API, `PRAGMA integrity_check`, then verified archive |
+| Platform database, PostgreSQL | Bundled `postgres` service or external DB from `DATABASE_URL` | Verified `pg_dump -Fc` for bundled service; digest-bound managed snapshot receipt for external DB |
 | Credential encryption key and secrets | `.env` on host | Copy into chmod 600 `env.backup` |
 | Skills/library runtime cache | backend `/data` | Archive `backend-data.tgz` |
 | Agent runtime work | `agent-*-workspace` volumes mounted at `/home/developer` | Archive each volume to `agent-workspaces/*.tgz` |
@@ -36,7 +36,9 @@ flowchart TD
 - A routine upgrade never runs `docker volume rm`.
 - A routine upgrade does not silently change the compose project name, because that creates a second set of compose volumes.
 - Agent containers are not removed as part of a platform upgrade. If the agent base image changes, recreate only after a persistent-state backup exists.
-- External PostgreSQL requires a managed snapshot or operator-provided dump; a backup bundle without the DB is incomplete unless explicitly allowed.
+- External PostgreSQL requires a nonempty managed-snapshot receipt bound to the active `DATABASE_URL` digest; a backup bundle without that evidence is incomplete and cannot authorize an upgrade.
+- The upgrade path has no backup-bypass option. Only an explicitly confirmed first install with no existing project containers or volumes may proceed without a backup.
+- A completed bundle must contain a nonempty environment backup, verified backend data, and exactly one authoritative database artifact or bound external snapshot receipt before any image build starts.
 - Automated deploy credentials are least-privilege: Tailscale access is tag-scoped to a dedicated OpenSSH port, SSH host identity is pinned, and the deploy key is restricted to `deploy <40-character SHA>`.
 - Concurrent deploys serialize through a host lock and are never cancelled mid-upgrade.
 

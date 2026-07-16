@@ -40,7 +40,9 @@ For a running instance, prefer the bundled backup script:
 ./scripts/deploy/backup-persistent-state.sh --project-name trinity
 ```
 
-It discovers the running compose project, writes a PostgreSQL dump when the project includes a `postgres` service, falls back to SQLite file archival when no PostgreSQL database is active, archives backend `/data`, archives every `agent-*-workspace` volume, and copies `.env` when present.
+It discovers the running compose project, verifies a PostgreSQL dump when the project includes a `postgres` service, uses SQLite's online backup API and an integrity check when no PostgreSQL database is active, archives backend `/data`, verifies every `agent-*-workspace` archive, and requires a nonempty `.env` backup.
+
+For managed PostgreSQL, first create the provider snapshot and supply a JSON receipt bound to the active database URL digest with `--external-db-snapshot-receipt`. The script rejects an external database without that receipt; `safe-upgrade.sh` will not build until the receipt or an in-bundle database backup is verified.
 
 Use a durable host path for production backups:
 
@@ -55,20 +57,15 @@ The bundle contains secrets if `.env` is present. Keep it outside git and offloa
 
 ### Legacy SQLite-Only Backup
 
-Run this on the host with services running — it does not require stopping anything:
+Prefer `backup-persistent-state.sh`. If a standalone SQLite-only snapshot is unavoidable, use SQLite's online backup command rather than copying a live database file:
 
 ```bash
 # Backup (run on the host, with services running)
-docker run --rm \
-  -v trinity_trinity-data:/data \
-  -v ~/backups:/backup \
-  alpine cp /data/trinity.db /backup/trinity-$(date +%Y%m%d-%H%M%S).db
+sqlite3 /path/to/trinity.db ".backup '/path/to/backups/trinity-$(date +%Y%m%d-%H%M%S).db'"
+sqlite3 /path/to/backups/trinity-YYYYMMDD-HHMMSS.db "PRAGMA integrity_check;"
 ```
 
-> **Production note:** On a server using `docker-compose.prod.yml`, the database lives at `${TRINITY_DATA_PATH}/trinity.db` (a bind-mount directory), not in the named volume. Adjust accordingly:
-> ```bash
-> cp /srv/trinity-data/trinity.db ~/backups/trinity-$(date +%Y%m%d-%H%M%S).db
-> ```
+The integrity command must return exactly `ok`. A raw `cp` or `tar` of a live SQLite database is not accepted as upgrade evidence because it may race WAL state.
 
 The volume name prefix `trinity_` comes from the Docker Compose project name (the directory name). If you cloned Trinity into a differently-named directory, the prefix will differ — check with `docker volume ls | grep trinity`.
 

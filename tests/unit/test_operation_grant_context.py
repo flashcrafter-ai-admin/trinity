@@ -1,5 +1,7 @@
 """Sealed operation grants stay outside model-visible task surfaces."""
 
+import hashlib
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -213,7 +215,44 @@ def test_hardened_profile_requires_exact_root_owned_runtime_boundaries(monkeypat
         '"managedBashHook":true,"strictMcp":true}'
     )
     profile.chmod(0o444)
-    monkeypatch.setattr(sealed_runtime, "_REQUIRED_BOUNDARIES", ((profile, 0o444, False),))
+    source = tmp_path / "source.json"
+    source.write_text(json.dumps({"revision": "a" * 40}))
+    source.chmod(0o444)
+    artifact = tmp_path / "operation-monitor"
+    artifact.write_text("reviewed monitor\n")
+    artifact.chmod(0o555)
+    contract = tmp_path / "artifact-contract.json"
+    contract.write_text(
+        json.dumps(
+            {
+                "schemaVersion": "trinity-sealed-artifact-contract/1",
+                "sourceRevision": "a" * 40,
+                "artifacts": [
+                    {
+                        "path": str(artifact),
+                        "sha256": hashlib.sha256(artifact.read_bytes()).hexdigest(),
+                        "mode": "0555",
+                        "uid": 0,
+                        "gid": 0,
+                    }
+                ],
+            }
+        )
+    )
+    contract.chmod(0o444)
+    monkeypatch.setattr(
+        sealed_runtime,
+        "_REQUIRED_BOUNDARIES",
+        ((profile, 0o444, False), (contract, 0o444, False)),
+    )
+    monkeypatch.setattr(sealed_runtime, "_REQUIRED_ARTIFACT_PATHS", frozenset({str(artifact)}))
+    monkeypatch.setattr(sealed_runtime, "_SOURCE_IDENTITY_PATH", source)
+    monkeypatch.setattr(
+        sealed_runtime,
+        "_boundary_valid",
+        lambda path, expected_mode, _require_root: path.is_file()
+        and (path.stat().st_mode & 0o777) == expected_mode,
+    )
     monkeypatch.setattr(sealed_runtime.os, "getuid", lambda: 1000)
     monkeypatch.setattr(sealed_runtime.os, "geteuid", lambda: 1000)
     monkeypatch.setattr(sealed_runtime.os, "getgid", lambda: 1000)
@@ -221,13 +260,59 @@ def test_hardened_profile_requires_exact_root_owned_runtime_boundaries(monkeypat
     monkeypatch.setattr(sealed_runtime.os, "getgroups", lambda: [])
     monkeypatch.setattr(sealed_runtime, "_effective_capabilities", lambda: 0)
     monkeypatch.setattr(sealed_runtime, "_sudo_authorized", lambda: False)
+    monkeypatch.setattr(sealed_runtime, "_operation_identity_valid", lambda: True)
 
-    assert sealed_runtime.sealed_runtime_eligibility(profile_path=profile).eligible is True
+    assert sealed_runtime.sealed_runtime_eligibility(
+        profile_path=profile, artifact_contract_path=contract
+    ).eligible is True
+
+    artifact.chmod(0o755)
+    artifact.write_text("tampered monitor\n")
+    artifact.chmod(0o555)
+    result = sealed_runtime.sealed_runtime_eligibility(
+        profile_path=profile, artifact_contract_path=contract
+    )
+    assert result.eligible is False
+    assert result.reason == "artifact-contract"
+    artifact.chmod(0o755)
+    artifact.write_text("reviewed monitor\n")
+    artifact.chmod(0o555)
 
     profile.chmod(0o644)
-    result = sealed_runtime.sealed_runtime_eligibility(profile_path=profile)
+    result = sealed_runtime.sealed_runtime_eligibility(
+        profile_path=profile, artifact_contract_path=contract
+    )
     assert result.eligible is False
     assert result.reason == "boundary"
+
+
+def test_hardened_runtime_rejects_any_sudo_binary(monkeypatch, tmp_path):
+    from agent_server.services import sealed_runtime
+
+    sudo = tmp_path / "sudo"
+    sudo.write_text("not executable but still authority drift")
+    monkeypatch.setattr(sealed_runtime, "_SUDO_PATHS", (sudo,))
+    assert sealed_runtime._sudo_authorized() is True
+
+
+def test_operation_identity_requires_exact_nologin_uid_and_gid(monkeypatch):
+    from agent_server.services import sealed_runtime
+
+    valid = SimpleNamespace(
+        pw_name="fc-operation",
+        pw_uid=1001,
+        pw_gid=1001,
+        pw_shell="/usr/sbin/nologin",
+    )
+    monkeypatch.setattr(sealed_runtime.pwd, "getpwuid", lambda _uid: valid)
+    assert sealed_runtime._operation_identity_valid() is True
+
+    monkeypatch.setattr(
+        sealed_runtime.pwd,
+        "getpwuid",
+        lambda _uid: SimpleNamespace(**{**valid.__dict__, "pw_gid": 1000}),
+    )
+    assert sealed_runtime._operation_identity_valid() is False
 
 
 def test_sealed_route_is_distinct_from_legacy_task_route():
@@ -248,7 +333,11 @@ def test_native_runner_is_fixed_to_claude_and_root_context_paths():
     assert '"/proc/%ld/stat"' in source
     assert "PR_SET_PDEATHSIG" in source
     assert "O_NOFOLLOW" in source
-    assert "setresuid(1000, 1000, 1000)" in source
+    assert "clearenv()" in source
+    assert "setresgid(OPERATION_GID, OPERATION_GID, OPERATION_GID)" in source
+    assert "setresuid(OPERATION_UID, OPERATION_UID, OPERATION_UID)" in source
+    assert '#define OPERATION_UID 1001' in source
+    assert 'set_optional_environment("CLAUDE_CODE_OAUTH_TOKEN"' in source
 
 
 def test_public_request_masks_and_excludes_operation_grant():

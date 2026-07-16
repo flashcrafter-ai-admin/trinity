@@ -1082,6 +1082,7 @@ def _install_fake_codex(
     returncode=0,
     extra_raw_lines=(),
     wait_exc=None,
+    captured_popen=None,
 ):
     """Wire codex_runtime so _execute_codex runs its real body against a fake
     subprocess. Returns the registry so the caller can assert register/unregister.
@@ -1110,6 +1111,8 @@ def _install_fake_codex(
 
     class _FakePopen:
         def __init__(self, cmd, **kwargs):
+            if captured_popen is not None:
+                captured_popen.append({"cmd": cmd, **kwargs})
             self.cmd = cmd
             self.pid = 4242
             self.returncode = returncode
@@ -1178,6 +1181,44 @@ async def test_execute_codex_body_happy_path(tmp_path, monkeypatch):
     assert not (tmp_path / "codex" / "exec_body_1-last.txt").exists()
     assert registry.registered == ["exec_body_1"]
     assert registry.unregistered == ["exec_body_1"]
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_subscription_wins_and_scrubs_stray_api_keys(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-metered-openai")
+    monkeypatch.setenv("CODEX_API_KEY", "sk-metered-codex")
+    (tmp_path / "auth.json").write_text(
+        json.dumps(
+            {
+                "auth_mode": "chatgpt",
+                "OPENAI_API_KEY": None,
+                "tokens": {"access_token": "access", "refresh_token": "refresh"},
+            }
+        )
+    )
+    captured = []
+    _install_fake_codex(
+        monkeypatch,
+        result_text="subscription response",
+        stdout_events=[{"type": "thread.started", "thread_id": "thr_subscription"}],
+        captured_popen=captured,
+    )
+
+    await CodexRuntime()._execute_codex(
+        prompt="subscription only",
+        model="gpt-5.1-codex",
+        system_prompt=None,
+        resume_thread_id=None,
+        timeout_seconds=30,
+        allowed_tools=None,
+        execution_id="exec_subscription",
+        concurrent_reader=True,
+    )
+
+    assert len(captured) == 1
+    assert "OPENAI_API_KEY" not in captured[0]["env"]
+    assert "CODEX_API_KEY" not in captured[0]["env"]
 
 
 @pytest.mark.asyncio
