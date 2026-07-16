@@ -33,7 +33,7 @@ git_no_replace() {
         PATH=/usr/local/bin:/usr/bin:/bin \
         GIT_CONFIG_GLOBAL=/dev/null \
         GIT_CONFIG_NOSYSTEM=1 \
-        GIT_CONFIG_COUNT=7 \
+        GIT_CONFIG_COUNT=8 \
         GIT_CONFIG_KEY_0=core.fsmonitor \
         GIT_CONFIG_VALUE_0=false \
         GIT_CONFIG_KEY_1=core.untrackedcache \
@@ -47,7 +47,9 @@ git_no_replace() {
         GIT_CONFIG_KEY_5=core.hooksPath \
         GIT_CONFIG_VALUE_5=/dev/null \
         GIT_CONFIG_KEY_6=credential.helper \
-        GIT_CONFIG_VALUE_6='!gh auth git-credential' \
+        GIT_CONFIG_VALUE_6= \
+        GIT_CONFIG_KEY_7=credential.helper \
+        GIT_CONFIG_VALUE_7='!gh auth git-credential' \
         GIT_LITERAL_PATHSPECS=1 \
         GIT_NO_REPLACE_OBJECTS=1 \
         GIT_WORK_TREE="$worktree_path" \

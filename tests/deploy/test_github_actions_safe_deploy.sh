@@ -35,7 +35,8 @@ grep -q 'TRINITY_EXPECTED_SOURCE_REVISION="$target_commit"' "$SCRIPT"
 [[ "$(grep -c 'assert_governed_source' "$ROOT/scripts/deploy/safe-upgrade.sh")" -ge 5 ]]
 grep -q '.git_commit == $commit' "$ROOT/scripts/deploy/safe-upgrade.sh"
 grep -q 'GIT_CONFIG_GLOBAL=/dev/null' "$SCRIPT"
-grep -q "GIT_CONFIG_VALUE_6='!gh auth git-credential'" "$SCRIPT"
+grep -q 'GIT_CONFIG_VALUE_6=' "$SCRIPT"
+grep -q "GIT_CONFIG_VALUE_7='!gh auth git-credential'" "$SCRIPT"
 
 tmp=$(mktemp -d)
 configured_worktree=$(mktemp -d)
@@ -103,6 +104,24 @@ fi
 git -C "$tmp" config --unset core.worktree
 git -C "$tmp" restore tracked.txt
 assert_exact_clean_worktree "$tmp" "$commit"
+
+credential_helper_marker="$tmp/local-credential-helper-ran"
+git -C "$tmp" config credential.helper \
+    "!f() { printf local > '$credential_helper_marker'; return 1; }; f"
+set +e
+printf 'protocol=https\nhost=github.com\n\n' \
+    | git_no_replace -C "$tmp" credential fill >/dev/null 2>&1
+credential_fill_status=$?
+set -e
+if [[ -e "$credential_helper_marker" ]]; then
+    echo "repository-local credential helper executed" >&2
+    exit 1
+fi
+if [[ "$credential_fill_status" -ne 0 && "$credential_fill_status" -ne 128 ]]; then
+    echo "unexpected governed credential fill status: $credential_fill_status" >&2
+    exit 1
+fi
+git -C "$tmp" config --unset credential.helper
 
 replacement=$(printf 'replacement commit\n' \
     | git -C "$tmp" -c user.name=test -c user.email=test@example.com \
