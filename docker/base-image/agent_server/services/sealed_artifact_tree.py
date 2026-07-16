@@ -83,13 +83,15 @@ def operation_executable_paths(
     paths: set[Path] = set()
     for operation in operations.values():
         commands = operation.get("commands") if isinstance(operation, dict) else None
-        if not isinstance(commands, list) or not commands:
+        if not isinstance(commands, list):
             raise ValueError("operation contract command closure is incomplete")
         for command in commands:
             executable = command.get("executable") if isinstance(command, dict) else None
             if not isinstance(executable, str) or not executable.startswith("/"):
                 raise ValueError("operation contract executable is invalid")
             paths.add(Path(executable))
+    if not paths:
+        raise ValueError("operation contract has no executable operations")
     return tuple(sorted(paths, key=str))
 
 
@@ -144,6 +146,8 @@ def _entry(path: Path) -> dict[str, object]:
     if stat.S_ISDIR(metadata.st_mode):
         return {**common, "kind": "directory"}
     if stat.S_ISLNK(metadata.st_mode):
+        if metadata.st_nlink != 1:
+            raise ValueError(f"packaged runtime symlink has multiple links: {path}")
         return {**common, "kind": "symlink", "target": os.readlink(path)}
     raise ValueError(f"unsupported packaged runtime node: {path}")
 

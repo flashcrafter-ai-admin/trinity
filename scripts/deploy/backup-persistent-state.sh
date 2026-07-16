@@ -163,13 +163,22 @@ agent_container_inventory() {
 
 compose_named_volume_inventory() {
   local container
-  while IFS= read -r container; do
-    [[ -n "${container}" ]] || continue
-    docker inspect "${container}" \
-      --format '{{range .Mounts}}{{if eq .Type "volume"}}{{println .Name}}{{end}}{{end}}'
-  done < <(docker ps -a \
-    --filter "label=com.docker.compose.project=${PROJECT_NAME}" \
-    --format '{{.Names}}') | sed '/^$/d' | sort -u
+  {
+    # Compose labels survive container removal, so detached project volumes must
+    # be discovered independently from the extant container mount graph.
+    docker volume ls \
+      --filter "label=com.docker.compose.project=${PROJECT_NAME}" \
+      --format '{{.Name}}'
+    docker volume ls --format '{{.Name}}' \
+      | awk -v prefix="${PROJECT_NAME}_" 'index($0, prefix) == 1'
+    while IFS= read -r container; do
+      [[ -n "${container}" ]] || continue
+      docker inspect "${container}" \
+        --format '{{range .Mounts}}{{if eq .Type "volume"}}{{println .Name}}{{end}}{{end}}'
+    done < <(docker ps -a \
+      --filter "label=com.docker.compose.project=${PROJECT_NAME}" \
+      --format '{{.Names}}')
+  } | sed '/^$/d' | sort -u
 }
 
 assert_agent_inventory_unchanged() {
@@ -284,6 +293,11 @@ capture_postgres_inventory() {
   docker exec -i "${container}" sh -ec \
     'export PGPASSWORD="$POSTGRES_PASSWORD"; exec psql -X -v ON_ERROR_STOP=1 -U "$1" -d "$2" -Atq' \
     sh "${user}" "${database}" > "${output}" <<'SQL'
+SET TIME ZONE 'UTC';
+SET bytea_output = 'hex';
+SET DateStyle = 'ISO, YMD';
+SET IntervalStyle = 'iso_8601';
+SET extra_float_digits = 3;
 SELECT 'column:' || encode(convert_to(jsonb_build_array(n.nspname, c.relname,
   a.attname, a.attnum::text, pg_catalog.format_type(a.atttypid, a.atttypmod),
   a.attnotnull::text, coalesce(pg_get_expr(d.adbin, d.adrelid), ''))::text, 'UTF8'), 'hex')
@@ -311,6 +325,18 @@ WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname !~ '^pg
 ORDER BY n.nspname, c.relname, i.relname;
 SELECT format('SELECT %L || E''\t'' || count(*)::text FROM %I.%I;',
   'rows:' || encode(convert_to(n.nspname || '.' || c.relname, 'UTF8'), 'hex'),
+  n.nspname, c.relname)
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r','p') AND n.nspname NOT IN ('pg_catalog','information_schema')
+  AND n.nspname !~ '^pg_toast'
+ORDER BY n.nspname, c.relname;
+\gexec
+SELECT format(
+  'SELECT %L || E''\t'' || encode(convert_to(row_json, ''UTF8''), ''hex'') '
+  'FROM (SELECT to_jsonb(source_row)::text AS row_json FROM %I.%I AS source_row) AS canonical_rows '
+  'ORDER BY row_json COLLATE "C";',
+  'data:' || encode(convert_to(n.nspname || '.' || c.relname, 'UTF8'), 'hex'),
   n.nspname, c.relname)
 FROM pg_catalog.pg_class c
 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
@@ -355,7 +381,7 @@ verify_postgres_dump_restore() {
   capture_postgres_inventory "${POSTGRES_VERIFY_CONTAINER}" postgres trinity_restore \
     "${RUN_DIR}/postgres-restore-catalog.txt"
   cmp -s "${source_catalog}" "${RUN_DIR}/postgres-restore-catalog.txt" \
-    || die "Restored PostgreSQL catalog differs from the paused source"
+    || die "Restored PostgreSQL schema or row content differs from the paused source"
   docker rm -f "${POSTGRES_VERIFY_CONTAINER}" >/dev/null
   POSTGRES_VERIFY_CONTAINER=""
 }
@@ -712,6 +738,8 @@ if [[ "${DATABASE_SOURCE}" == bundled-postgres ]]; then
     || die "Bundled PostgreSQL identity does not match the authoritative DATABASE_URL"
   capture_postgres_inventory "${POSTGRES_CONTAINER}" "${POSTGRES_USER}" "${POSTGRES_DB}" \
     "${RUN_DIR}/postgres-source-catalog.txt"
+  grep '^data:' "${RUN_DIR}/postgres-source-catalog.txt" \
+    > "${RUN_DIR}/postgres-source-data.txt" || true
   log "Creating PostgreSQL custom-format dump from ${POSTGRES_CONTAINER}"
   docker exec "${POSTGRES_CONTAINER}" sh -ec \
     'export PGPASSWORD="$POSTGRES_PASSWORD"; exec pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' \
@@ -722,6 +750,7 @@ if [[ "${DATABASE_SOURCE}" == bundled-postgres ]]; then
   log "Verified postgres.dump by restoring it into a fresh PostgreSQL instance"
   echo "postgres_dump_sha256=sha256:$(sha256_file "${RUN_DIR}/postgres.dump")" >> "${MANIFEST}"
   echo "postgres_catalog_sha256=sha256:$(sha256_file "${RUN_DIR}/postgres-source-catalog.txt")" >> "${MANIFEST}"
+  echo "postgres_content_fingerprint_sha256=sha256:$(sha256_file "${RUN_DIR}/postgres-source-data.txt")" >> "${MANIFEST}"
   echo "postgres_dump_verified=yes" >> "${MANIFEST}"
   echo "postgres_restore_verified=yes" >> "${MANIFEST}"
 elif [[ "${DATABASE_SOURCE}" == external-postgres ]]; then

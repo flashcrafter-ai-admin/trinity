@@ -34,7 +34,7 @@ For production with a host env file or override compose file, pass the same inpu
   -f /path/to/host-override.yml
 ```
 
-The wrapper runs `scripts/deploy/backup-persistent-state.sh`, rebuilds platform services, starts the selected services without rebuilding, waits for backend health, and authenticates from inside the backend before requiring `/api/version` to match the full and short deployed commit. The governed SSH path freezes source, compose inputs, and `.env` before build.
+The wrapper resolves and freezes an exact clean Git commit, runs `scripts/deploy/backup-persistent-state.sh`, rebuilds platform services, starts the selected services without rebuilding, and waits for every selected service to become healthy or pass its explicit endpoint probe. It then authenticates from inside the backend before requiring `/api/version` to match the full and short deployed commit. The governed SSH path freezes source, compose inputs, and `.env` before build.
 
 ## Backup-Only Path
 

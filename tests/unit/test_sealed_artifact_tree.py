@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 import sysconfig
 
@@ -70,6 +71,34 @@ def test_operation_contract_closes_every_declared_executable(tmp_path: Path):
     external = runtime_external_paths(contract)
     assert first in external
     assert second in external
+
+
+def test_operation_contract_allows_metadata_only_operations_beside_executable_ones(
+    tmp_path: Path,
+):
+    contract = tmp_path / "operation-contract.json"
+    executable = tmp_path / "readonly"
+    executable.write_text("readonly\n")
+    contract.write_text(
+        json.dumps(
+            {
+                "operations": {
+                    "metadata-only": {"commands": []},
+                    "verify": {"commands": [{"executable": str(executable)}]},
+                }
+            }
+        )
+    )
+
+    assert operation_executable_paths(contract) == (executable,)
+
+
+def test_operation_contract_rejects_a_tree_with_no_executable_commands(tmp_path: Path):
+    contract = tmp_path / "operation-contract.json"
+    contract.write_text(json.dumps({"operations": {"metadata-only": {"commands": []}}}))
+
+    with pytest.raises(ValueError, match="has no executable operations"):
+        operation_executable_paths(contract)
 
 
 def test_python_runtime_closure_includes_import_roots_not_the_install_prefix():
@@ -167,6 +196,24 @@ def test_manifest_allows_only_the_exact_declared_dynamic_projection(tmp_path: Pa
     projection.unlink()
     projection.symlink_to("/ephemeral/other.env")
     with pytest.raises(ValueError, match="unavailable"):
+        build_manifest(
+            (app,),
+            (),
+            require_root_owned=False,
+            dynamic_symlinks={projection: "/ephemeral/agent.env"},
+        )
+
+
+def test_manifest_rejects_a_hardlinked_dynamic_projection(tmp_path: Path):
+    app = tmp_path / "app"
+    outside = tmp_path / "outside"
+    app.mkdir()
+    outside.mkdir()
+    projection = app / ".env"
+    projection.symlink_to("/ephemeral/agent.env")
+    os.link(projection, outside / "alias", follow_symlinks=False)
+
+    with pytest.raises(ValueError, match="symlink has multiple links"):
         build_manifest(
             (app,),
             (),

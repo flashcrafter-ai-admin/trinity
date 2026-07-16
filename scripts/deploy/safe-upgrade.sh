@@ -373,19 +373,15 @@ validate_compose_build_inputs() {
     || die "Compose build inputs are not closed over the exact release source"
 }
 
-if git -C "${PROJECT_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  if [[ -n "${EXPECTED_SOURCE_REVISION}" ]]; then
-    export GIT_COMMIT="${EXPECTED_SOURCE_REVISION}"
-    export GIT_COMMIT_SUBJECT="$(git -C "${PROJECT_ROOT}" log -1 --format=%s "${EXPECTED_SOURCE_REVISION}")"
-    export GIT_COMMIT_TIMESTAMP="$(git -C "${PROJECT_ROOT}" log -1 --format=%cI "${EXPECTED_SOURCE_REVISION}")"
-    export GIT_BRANCH="detached-${EXPECTED_SOURCE_REVISION:0:8}"
-  else
-    export GIT_COMMIT="${GIT_COMMIT:-$(git -C "${PROJECT_ROOT}" rev-parse HEAD)}"
-    export GIT_COMMIT_SUBJECT="${GIT_COMMIT_SUBJECT:-$(git -C "${PROJECT_ROOT}" log -1 --pretty=%s)}"
-    export GIT_COMMIT_TIMESTAMP="${GIT_COMMIT_TIMESTAMP:-$(git -C "${PROJECT_ROOT}" log -1 --pretty=%cI)}"
-    export GIT_BRANCH="${GIT_BRANCH:-$(git -C "${PROJECT_ROOT}" symbolic-ref --short -q HEAD || git -C "${PROJECT_ROOT}" name-rev --name-only --no-undefined HEAD 2>/dev/null || git -C "${PROJECT_ROOT}" rev-parse --short HEAD)}"
-  fi
+git -C "${PROJECT_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+  || die "Safe upgrade requires a governed Git worktree"
+if [[ -z "${EXPECTED_SOURCE_REVISION}" ]]; then
+  EXPECTED_SOURCE_REVISION="$(git -C "${PROJECT_ROOT}" rev-parse HEAD)"
 fi
+export GIT_COMMIT="${EXPECTED_SOURCE_REVISION}"
+export GIT_COMMIT_SUBJECT="$(git -C "${PROJECT_ROOT}" log -1 --format=%s "${EXPECTED_SOURCE_REVISION}")"
+export GIT_COMMIT_TIMESTAMP="$(git -C "${PROJECT_ROOT}" log -1 --format=%cI "${EXPECTED_SOURCE_REVISION}")"
+export GIT_BRANCH="detached-${EXPECTED_SOURCE_REVISION:0:8}"
 export BUILD_DATE="${BUILD_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 DOCKER_COMMAND="$(command -v docker || true)"
 [[ -n "${DOCKER_COMMAND}" ]] || die "docker is required"
@@ -438,12 +434,7 @@ if [[ -n "${ENV_FILE}" ]]; then
 fi
 COMPOSE_PROCESS_ENV+=("TRINITY_DATA_PATH=${RUNTIME_DATA_PATH}")
 
-if [[ -n "${EXPECTED_SOURCE_REVISION}" ]]; then
-  prepare_immutable_release_inputs
-else
-  BUILD_COMPOSE_FILES=("${COMPOSE_FILES[@]}")
-  RUNTIME_COMPOSE_FILES=("${COMPOSE_FILES[@]}")
-fi
+prepare_immutable_release_inputs
 RUNTIME_PROJECT_ROOT="${IMMUTABLE_BUILD_SOURCE_ROOT:-${PROJECT_ROOT}}"
 
 COMPOSE_ARGS=(-p "${PROJECT_NAME}")
@@ -464,10 +455,8 @@ for compose_file in "${BUILD_COMPOSE_FILES[@]}"; do
   BUILD_COMPOSE_ARGS+=(-f "${compose_file}")
 done
 
-if [[ -n "${EXPECTED_SOURCE_REVISION}" ]]; then
-  validate_compose_build_inputs "${IMMUTABLE_BUILD_SOURCE_ROOT}" "${BUILD_COMPOSE_ARGS[@]}"
-  assert_immutable_release_inputs
-fi
+validate_compose_build_inputs "${IMMUTABLE_BUILD_SOURCE_ROOT}" "${BUILD_COMPOSE_ARGS[@]}"
+assert_immutable_release_inputs
 
 docker info >/dev/null 2>&1 || die "Docker is not running"
 
@@ -573,6 +562,7 @@ if [[ ${FRESH_INSTALL} -eq 0 ]]; then
     if grep -qx 'database_source=bundled-postgres' "${BACKUP_MANIFEST}"; then
       grep -qx 'postgres_dump_verified=yes' "${BACKUP_MANIFEST}" \
         && grep -qx 'postgres_restore_verified=yes' "${BACKUP_MANIFEST}" \
+        && grep -Eq '^postgres_content_fingerprint_sha256=sha256:[0-9a-f]{64}$' "${BACKUP_MANIFEST}" \
         || die "Backup did not prove a fresh PostgreSQL restore"
     elif grep -qx 'database_source=external-postgres' "${BACKUP_MANIFEST}"; then
       grep -qx 'external_postgres_snapshot_verified=yes' "${BACKUP_MANIFEST}" \
@@ -622,14 +612,17 @@ if [[ ${DRY_RUN} -eq 1 ]]; then
   exit 0
 fi
 
-log "Waiting for backend health"
-for _ in $(seq 1 60); do
-  if curl -fsS http://127.0.0.1:8000/health >/dev/null 2>&1; then
-    break
-  fi
-  sleep 2
-done
-curl -fsS http://127.0.0.1:8000/health >/dev/null || die "Backend health check failed"
+READINESS_IMPLEMENTATION="${RUNTIME_PROJECT_ROOT}/scripts/deploy/verify-compose-readiness.sh"
+[[ -x "${READINESS_IMPLEMENTATION}" ]] \
+  || die "Exact release source has no executable Compose readiness verifier"
+log "Waiting for every selected service to become ready"
+env -i \
+  PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  HOME=/var/empty \
+  LANG=C.UTF-8 \
+  TRINITY_READINESS_TIMEOUT_SECONDS="${TRINITY_READINESS_TIMEOUT_SECONDS:-180}" \
+  "${READINESS_IMPLEMENTATION}" --project-name "${PROJECT_NAME}" -- "${TARGET_SERVICES[@]}" \
+  || die "Selected Compose services did not become ready"
 
 backend_container="$(service_container backend || true)"
 [[ -n "${backend_container}" ]] || die "Running backend container was not found"

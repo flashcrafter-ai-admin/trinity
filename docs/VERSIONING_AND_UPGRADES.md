@@ -83,8 +83,9 @@ trinity-agent-base:dev        # Development builds
 ./scripts/deploy/safe-upgrade.sh --project-name trinity
 ```
 
-For production, pass the original `--env-file` and Compose files. The wrapper
-backs up first, builds from an exact byte-verified Git object, and activates with
+The wrapper resolves the current exact `HEAD`, rejects tracked, untracked,
+ignored, or hidden-index drift, and builds only from a byte-verified Git archive.
+For production, pass the original `--env-file` and Compose files. Activation uses
 `--no-build` without removing volumes or the agent network.
 
 **Downtime**: ~30 seconds (container restart)

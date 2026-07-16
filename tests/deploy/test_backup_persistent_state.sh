@@ -55,7 +55,11 @@ case "${1:-}" in
     ;;
   volume)
     [[ "${2:-}" == ls ]] || exit 2
-    printf '%s\n' "${FAKE_AGENT_VOLUMES:-}"
+    if [[ "$joined" == *"label=com.docker.compose.project=trinity"* ]]; then
+      printf '%s\n' "${FAKE_COMPOSE_VOLUMES:-}"
+    else
+      printf '%s\n' "${FAKE_AGENT_VOLUMES:-}"
+    fi
     ;;
   inspect)
     container=${2:-${!#}}
@@ -104,6 +108,8 @@ case "${1:-}" in
     ;;
   rm) exit 0 ;;
   exec)
+    container=${2:-}
+    [[ "$container" != -* ]] || container=${3:-}
     if [[ "$joined" == *" pg_isready "* || "$joined" == *" createdb "* ]]; then
       exit 0
     elif [[ "$joined" == *" pg_dump "* ]]; then
@@ -111,7 +117,12 @@ case "${1:-}" in
     elif [[ "$joined" == *" pg_restore "* ]]; then
       cat >/dev/null
     elif [[ "$joined" == *" psql "* ]]; then
-      printf 'public.jobs\n'
+      if [[ "$container" == trinity-backup-restore-* \
+        && "${FAKE_POSTGRES_RESTORE_DRIFT:-0}" == 1 ]]; then
+        printf 'rows:7075626c69632e6a6f6273\t1\ndata:7075626c69632e6a6f6273\t7b226964223a327d\n'
+      else
+        printf 'rows:7075626c69632e6a6f6273\t1\ndata:7075626c69632e6a6f6273\t7b226964223a317d\n'
+      fi
     else
       cat >/dev/null || true
     fi
@@ -193,10 +204,12 @@ run_backup() {
     FAKE_AGENT_CONTAINERS="${FAKE_AGENT_CONTAINERS:-}" \
     FAKE_AGENT_VOLUMES="${FAKE_AGENT_VOLUMES:-}" \
     FAKE_AGENT_WORKSPACE_MOUNT="${FAKE_AGENT_WORKSPACE_MOUNT:-}" \
+    FAKE_COMPOSE_VOLUMES="${FAKE_COMPOSE_VOLUMES:-}" \
     FAKE_DATABASE_URL="${FAKE_DATABASE_URL:-}" \
     FAKE_DOCKER_LOG="${FAKE_DOCKER_LOG:-}" \
     FAKE_DOCKER_STATE="$FAKE_DOCKER_STATE" \
     FAKE_POSTGRES="${FAKE_POSTGRES:-0}" \
+    FAKE_POSTGRES_RESTORE_DRIFT="${FAKE_POSTGRES_RESTORE_DRIFT:-0}" \
     FAKE_SQLITE_INTEGRITY_FAIL="${FAKE_SQLITE_INTEGRITY_FAIL:-0}" \
     PATH="$TMP/bin:$PATH" "$SCRIPT" \
     --project-name trinity \
@@ -227,6 +240,13 @@ test -s "$bundle/platform-volumes/trinity-logs.tgz"
 grep -qx 'agent_inventory_stable=yes' "$bundle/manifest.txt"
 grep -qx 'artifact_inventory_verified=yes' "$bundle/manifest.txt"
 grep -qx 'backup_complete=yes' "$bundle/manifest.txt"
+
+detached_result="$TMP/detached-result"
+FAKE_COMPOSE_VOLUMES='trinity-detached' run_backup "$TMP/detached-backups" \
+  "$detached_result" >/dev/null
+detached_bundle=$(cat "$detached_result")
+grep -qx 'platform_volume_archives=4' "$detached_bundle/manifest.txt"
+test -s "$detached_bundle/platform-volumes/trinity-detached.tgz"
 
 agent_result="$TMP/agent-result"
 FAKE_AGENT_VOLUMES='agent-paid-media-workspace' PATH="$TMP/bin:$PATH" "$SCRIPT" \
@@ -314,7 +334,18 @@ postgres_bundle=$(cat "$postgres_result")
 grep -qx 'database_source=bundled-postgres' "$postgres_bundle/manifest.txt"
 grep -qx 'postgres_dump_verified=yes' "$postgres_bundle/manifest.txt"
 grep -qx 'postgres_restore_verified=yes' "$postgres_bundle/manifest.txt"
+grep -Eq '^postgres_content_fingerprint_sha256=sha256:[0-9a-f]{64}$' \
+  "$postgres_bundle/manifest.txt"
 grep -q 'pg_restore.*trinity_restore' "$TMP/postgres-docker.log"
+
+if FAKE_POSTGRES=1 FAKE_POSTGRES_RESTORE_DRIFT=1 \
+  FAKE_DATABASE_URL='postgresql://trinity:fixture-postgres@postgres:5432/trinity' \
+  PATH="$TMP/bin:$PATH" "$SCRIPT" --project-name trinity \
+  --output-dir "$TMP/postgres-drift" --env-file "$TMP/trinity.env" \
+  --result-file "$TMP/postgres-drift-result" >/dev/null 2>&1; then
+  echo 'PostgreSQL restore with changed row values was accepted' >&2
+  exit 1
+fi
 
 if "$UPGRADE_SCRIPT" --skip-backup --dry-run >/dev/null 2>&1; then
   echo 'safe upgrade still permits bypassing its backup gate' >&2
@@ -323,6 +354,7 @@ fi
 grep -q "external_postgres_snapshot_verified=yes" "$UPGRADE_SCRIPT"
 grep -q "external_postgres_provider_verified=yes" "$UPGRADE_SCRIPT"
 grep -q "postgres_restore_verified=yes" "$UPGRADE_SCRIPT"
+grep -q "postgres_content_fingerprint_sha256" "$UPGRADE_SCRIPT"
 grep -q "environment_semantics_verified=yes" "$UPGRADE_SCRIPT"
 grep -q "agent_workspace_archives_verified=yes" "$UPGRADE_SCRIPT"
 grep -q "platform_volume_archives_verified=yes" "$UPGRADE_SCRIPT"
@@ -330,16 +362,8 @@ grep -q "platform_volume_inventory_stable=yes" "$UPGRADE_SCRIPT"
 grep -q "Authenticated version endpoint verification failed" "$UPGRADE_SCRIPT"
 grep -q 'docker exec -i.*backend_container' "$UPGRADE_SCRIPT"
 grep -q 'http://127.0.0.1:8000/token' "$UPGRADE_SCRIPT"
+grep -q 'verify-compose-readiness.sh' "$UPGRADE_SCRIPT"
 ! grep -q 'api/version.*|| true' "$UPGRADE_SCRIPT"
-
-printf 'services: {}\n' > "$TMP/compose.yml"
-upgrade_plan=$(FAKE_AGENT_VOLUMES='agent-paid-media-workspace' PATH="$TMP/bin:$PATH" \
-  "$UPGRADE_SCRIPT" --allow-fresh --dry-run -f "$TMP/compose.yml")
-printf '%s\n' "$upgrade_plan" | grep -q 'backup-persistent-state.sh'
-if printf '%s\n' "$upgrade_plan" | grep -q 'First install has no persistent state'; then
-  echo 'existing agent workspace was classified as a fresh install' >&2
-  exit 1
-fi
 
 governed="$TMP/governed"
 mkdir -p "$governed/scripts/deploy"
@@ -348,10 +372,12 @@ cp "$ROOT/scripts/deploy/backup-persistent-state.sh" "$governed/scripts/deploy/b
 cp "$ROOT/scripts/deploy/github-actions-safe-deploy.sh" "$governed/scripts/deploy/github-actions-safe-deploy.sh"
 cp "$ROOT/scripts/deploy/validate-compose-build-inputs.py" "$governed/scripts/deploy/validate-compose-build-inputs.py"
 cp "$ROOT/scripts/deploy/verify-exact-git-tree.py" "$governed/scripts/deploy/verify-exact-git-tree.py"
+cp "$ROOT/scripts/deploy/verify-compose-readiness.sh" "$governed/scripts/deploy/verify-compose-readiness.sh"
 chmod 755 "$governed/scripts/deploy/"*.sh
 chmod 755 "$governed/scripts/deploy/"*.py
 printf 'FROM scratch\n' > "$governed/Dockerfile"
 printf 'services:\n  backend:\n    build:\n      context: .\n' > "$governed/docker-compose.yml"
+printf 'ignored.local\n' > "$governed/.gitignore"
 git -C "$governed" init -q
 git -C "$governed" config user.email test@example.com
 git -C "$governed" config user.name test
@@ -367,6 +393,36 @@ printf '%s\n' "$governed_plan" | grep -q "Prepared exact-commit build source $go
 printf '%s\n' "$governed_plan" | grep -q 'trinity-release-inputs.*source.*build'
 printf '%s\n' "$governed_plan" | grep -q -- '--env-file .*trinity-release-inputs.*config/runtime.env'
 printf '%s\n' "$governed_plan" | grep -q 'up --no-build -d backend'
+
+default_governed_plan=$(FAKE_AGENT_VOLUMES='agent-paid-media-workspace' \
+  PATH="$TMP/bin:$PATH" "$governed/scripts/deploy/safe-upgrade.sh" \
+  --allow-fresh --dry-run --env-file "$TMP/trinity.env" \
+  -f "$governed/docker-compose.yml")
+printf '%s\n' "$default_governed_plan" \
+  | grep -q "Prepared exact-commit build source $governed_commit"
+printf '%s\n' "$default_governed_plan" | grep -q 'backup-persistent-state.sh'
+if printf '%s\n' "$default_governed_plan" | grep -q 'First install has no persistent state'; then
+  echo 'existing agent workspace was classified as a fresh install' >&2
+  exit 1
+fi
+
+printf 'ignored drift\n' > "$governed/ignored.local"
+if FAKE_AGENT_VOLUMES='agent-paid-media-workspace' PATH="$TMP/bin:$PATH" \
+  "$governed/scripts/deploy/safe-upgrade.sh" --allow-fresh --dry-run \
+  --env-file "$TMP/trinity.env" -f "$governed/docker-compose.yml" >/dev/null 2>&1; then
+  echo 'default exact-source upgrade accepted ignored drift' >&2
+  exit 1
+fi
+rm -f "$governed/ignored.local"
+
+git -C "$governed" update-index --skip-worktree Dockerfile
+if FAKE_AGENT_VOLUMES='agent-paid-media-workspace' PATH="$TMP/bin:$PATH" \
+  "$governed/scripts/deploy/safe-upgrade.sh" --allow-fresh --dry-run \
+  --env-file "$TMP/trinity.env" -f "$governed/docker-compose.yml" >/dev/null 2>&1; then
+  echo 'default exact-source upgrade accepted a hidden index flag' >&2
+  exit 1
+fi
+git -C "$governed" update-index --no-skip-worktree Dockerfile
 
 tar_options_plan=$(TAR_OPTIONS='--exclude=Dockerfile' \
   TRINITY_EXPECTED_SOURCE_REVISION="$governed_commit" GIT_COMMIT="$governed_commit" \
