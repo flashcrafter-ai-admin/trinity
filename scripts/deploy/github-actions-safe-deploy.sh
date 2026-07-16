@@ -10,30 +10,35 @@ git_no_replace() {
         log "Governed Git invocation requires an existing explicit worktree"
         return 64
     fi
-    local worktree_path
+    local worktree_path trusted_home
     worktree_path=$(cd "$2" && pwd -P)
+    if [[ -x /usr/bin/getent ]]; then
+        trusted_home=$(/usr/bin/getent passwd "$(/usr/bin/id -u)" | /usr/bin/cut -d: -f6)
+    elif /usr/bin/id -P >/dev/null 2>&1; then
+        trusted_home=$(/usr/bin/id -P | /usr/bin/awk -F: '{print $9}')
+    else
+        log "Governed Git invocation cannot resolve the account home"
+        return 64
+    fi
+    if [[ -z "$trusted_home" || "$trusted_home" != /* || ! -d "$trusted_home" ]]; then
+        log "Governed Git invocation resolved an invalid account home"
+        return 64
+    fi
+    trusted_home=$(cd "$trusted_home" && pwd -P)
     shift 2
-    env \
-        -u GIT_DIR \
-        -u GIT_WORK_TREE \
-        -u GIT_INDEX_FILE \
-        -u GIT_OBJECT_DIRECTORY \
-        -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
-        -u GIT_COMMON_DIR \
-        -u GIT_NAMESPACE \
-        -u GIT_REPLACE_REF_BASE \
-        -u GIT_GRAFT_FILE \
-        -u GIT_SHALLOW_FILE \
-        -u GIT_CONFIG \
-        -u GIT_CONFIG_COUNT \
-        -u GIT_CONFIG_PARAMETERS \
-        -u GIT_CONFIG_GLOBAL \
-        -u GIT_CONFIG_SYSTEM \
-        -u GIT_EXEC_PATH \
+    /usr/bin/env -i \
+        HOME="$trusted_home" \
         PATH=/usr/local/bin:/usr/bin:/bin \
+        LC_ALL=C \
+        TMPDIR=/tmp \
+        GH_PROMPT_DISABLED=1 \
+        GIT_ALLOW_PROTOCOL=https \
+        GIT_TERMINAL_PROMPT=0 \
+        GIT_PAGER=cat \
+        PAGER=cat \
         GIT_CONFIG_GLOBAL=/dev/null \
         GIT_CONFIG_NOSYSTEM=1 \
-        GIT_CONFIG_COUNT=8 \
+        GIT_CONFIG_COUNT=12 \
         GIT_CONFIG_KEY_0=core.fsmonitor \
         GIT_CONFIG_VALUE_0=false \
         GIT_CONFIG_KEY_1=core.untrackedcache \
@@ -46,10 +51,18 @@ git_no_replace() {
         GIT_CONFIG_VALUE_4=false \
         GIT_CONFIG_KEY_5=core.hooksPath \
         GIT_CONFIG_VALUE_5=/dev/null \
-        GIT_CONFIG_KEY_6=credential.helper \
-        GIT_CONFIG_VALUE_6= \
-        GIT_CONFIG_KEY_7=credential.helper \
-        GIT_CONFIG_VALUE_7='!gh auth git-credential' \
+        GIT_CONFIG_KEY_6=core.askPass \
+        GIT_CONFIG_VALUE_6=/bin/false \
+        GIT_CONFIG_KEY_7=core.pager \
+        GIT_CONFIG_VALUE_7=cat \
+        GIT_CONFIG_KEY_8=protocol.allow \
+        GIT_CONFIG_VALUE_8=never \
+        GIT_CONFIG_KEY_9=protocol.https.allow \
+        GIT_CONFIG_VALUE_9=always \
+        GIT_CONFIG_KEY_10=credential.helper \
+        GIT_CONFIG_VALUE_10= \
+        GIT_CONFIG_KEY_11=credential.helper \
+        GIT_CONFIG_VALUE_11='!gh auth git-credential' \
         GIT_LITERAL_PATHSPECS=1 \
         GIT_NO_REPLACE_OBJECTS=1 \
         GIT_WORK_TREE="$worktree_path" \
@@ -97,8 +110,10 @@ assert_exact_clean_worktree() {
     index_flags=$(git_no_replace -C "$worktree_path" ls-files -v | sed -n '/^[a-zS] /p')
     if [[ -n "$drift" ]] \
         || [[ -n "$index_flags" ]] \
-        || ! git_no_replace -C "$worktree_path" diff --quiet -- \
-        || ! git_no_replace -C "$worktree_path" diff --cached --quiet --; then
+        || ! git_no_replace -C "$worktree_path" diff \
+            --no-ext-diff --no-textconv --quiet -- \
+        || ! git_no_replace -C "$worktree_path" diff \
+            --no-ext-diff --no-textconv --cached --quiet --; then
         log "Deployment worktree contains tracked, untracked, ignored, or index-hidden drift: $worktree_path"
         return 74
     fi

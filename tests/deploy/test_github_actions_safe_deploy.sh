@@ -34,9 +34,13 @@ grep -q 'deploy \$GITHUB_SHA' "$ROOT/.github/workflows/deploy-dev.yml"
 grep -q 'TRINITY_EXPECTED_SOURCE_REVISION="$target_commit"' "$SCRIPT"
 [[ "$(grep -c 'assert_governed_source' "$ROOT/scripts/deploy/safe-upgrade.sh")" -ge 5 ]]
 grep -q '.git_commit == $commit' "$ROOT/scripts/deploy/safe-upgrade.sh"
+grep -q '/usr/bin/env -i' "$SCRIPT"
 grep -q 'GIT_CONFIG_GLOBAL=/dev/null' "$SCRIPT"
-grep -q 'GIT_CONFIG_VALUE_6=' "$SCRIPT"
-grep -q "GIT_CONFIG_VALUE_7='!gh auth git-credential'" "$SCRIPT"
+grep -q 'GIT_ALLOW_PROTOCOL=https' "$SCRIPT"
+grep -q 'GIT_TERMINAL_PROMPT=0' "$SCRIPT"
+grep -q 'GIT_CONFIG_VALUE_10=' "$SCRIPT"
+grep -q "GIT_CONFIG_VALUE_11='!gh auth git-credential'" "$SCRIPT"
+grep -q -- '--no-ext-diff --no-textconv --quiet' "$SCRIPT"
 
 tmp=$(mktemp -d)
 configured_worktree=$(mktemp -d)
@@ -106,15 +110,32 @@ git -C "$tmp" restore tracked.txt
 assert_exact_clean_worktree "$tmp" "$commit"
 
 credential_helper_marker="$tmp/local-credential-helper-ran"
+askpass_marker="$tmp/caller-askpass-ran"
+askpass_helper="$tmp/caller-askpass"
+printf '#!/bin/sh\nprintf local > %q\nprintf probe-value\\n\n' \
+    "$askpass_marker" > "$askpass_helper"
+chmod 700 "$askpass_helper"
 git -C "$tmp" config credential.helper \
     "!f() { printf local > '$credential_helper_marker'; return 1; }; f"
+git -C "$tmp" config core.askPass "$askpass_helper"
 set +e
 printf 'protocol=https\nhost=github.com\n\n' \
-    | git_no_replace -C "$tmp" credential fill >/dev/null 2>&1
+    | HOME="$configured_worktree" \
+        GH_CONFIG_DIR="$configured_worktree" \
+        GH_TOKEN=caller-controlled-token \
+        GITHUB_TOKEN=caller-controlled-token \
+        GIT_ASKPASS="$askpass_helper" \
+        SSH_ASKPASS="$askpass_helper" \
+        GIT_SSH_COMMAND="$askpass_helper" \
+        git_no_replace -C "$tmp" credential fill >/dev/null 2>&1
 credential_fill_status=$?
 set -e
 if [[ -e "$credential_helper_marker" ]]; then
     echo "repository-local credential helper executed" >&2
+    exit 1
+fi
+if [[ -e "$askpass_marker" ]]; then
+    echo "caller or repository-local askpass executed" >&2
     exit 1
 fi
 if [[ "$credential_fill_status" -ne 0 && "$credential_fill_status" -ne 128 ]]; then
@@ -122,6 +143,25 @@ if [[ "$credential_fill_status" -ne 0 && "$credential_fill_status" -ne 128 ]]; t
     exit 1
 fi
 git -C "$tmp" config --unset credential.helper
+git -C "$tmp" config --unset core.askPass
+
+transport_marker="$tmp/local-transport-ran"
+transport_helper="$tmp/local-transport"
+printf '#!/bin/sh\nprintf local > %q\nexit 1\n' \
+    "$transport_marker" > "$transport_helper"
+chmod 700 "$transport_helper"
+git -C "$tmp" remote add hostile "ext::$transport_helper"
+git -C "$tmp" config protocol.ext.allow always
+if git_no_replace -C "$tmp" fetch hostile >/dev/null 2>&1; then
+    echo "repository-local ext transport was accepted" >&2
+    exit 1
+fi
+if [[ -e "$transport_marker" ]]; then
+    echo "repository-local ext transport executed" >&2
+    exit 1
+fi
+git -C "$tmp" remote remove hostile
+git -C "$tmp" config --unset protocol.ext.allow
 
 replacement=$(printf 'replacement commit\n' \
     | git -C "$tmp" -c user.name=test -c user.email=test@example.com \
