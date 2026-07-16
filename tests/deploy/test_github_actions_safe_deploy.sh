@@ -177,6 +177,18 @@ fi
 git -C "$tmp" config --unset filter.hostile.clean
 assert_exact_clean_worktree "$tmp" "$commit"
 
+git -C "$tmp" config tar.hostile.command "$transport_helper"
+if assert_no_git_replacement_refs "$tmp" >/dev/null 2>&1; then
+    echo "repository-local archive command was accepted" >&2
+    exit 1
+fi
+if [[ -e "$transport_marker" ]]; then
+    echo "repository-local archive command executed" >&2
+    exit 1
+fi
+git -C "$tmp" config --unset tar.hostile.command
+assert_exact_clean_worktree "$tmp" "$commit"
+
 replacement=$(printf 'replacement commit\n' \
     | git -C "$tmp" -c user.name=test -c user.email=test@example.com \
         commit-tree "${commit}^{tree}")

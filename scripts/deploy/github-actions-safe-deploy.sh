@@ -83,11 +83,13 @@ assert_no_executable_local_git_config() {
             alias.* | credential.* | filter.* | http.* | url.* | protocol.* \
                 | include.* | includeif.* | maintenance.* \
                 | core.alternaterefscommand | core.askpass | core.attributesfile \
-                | core.editor | core.fsmonitor | core.hookspath | core.pager \
+                | core.editor | core.excludesfile | core.fsmonitor | core.gitproxy \
+                | core.hookspath | core.pager \
                 | core.sshcommand | diff.*.command | diff.*.textconv \
                 | extensions.worktreeconfig | gc.recentobjectshook \
                 | merge.*.driver | remote.*.proxy | remote.*.receivepack \
-                | remote.*.uploadpack | remote.*.vcs | submodule.*.update)
+                | remote.*.uploadpack | remote.*.vcs | submodule.*.update \
+                | tar.*.command)
                 unsafe_keys+="$config_key"$'\n'
                 ;;
         esac
