@@ -38,7 +38,7 @@ git_no_replace() {
         PAGER=cat \
         GIT_CONFIG_GLOBAL=/dev/null \
         GIT_CONFIG_NOSYSTEM=1 \
-        GIT_CONFIG_COUNT=12 \
+        GIT_CONFIG_COUNT=14 \
         GIT_CONFIG_KEY_0=core.fsmonitor \
         GIT_CONFIG_VALUE_0=false \
         GIT_CONFIG_KEY_1=core.untrackedcache \
@@ -63,15 +63,45 @@ git_no_replace() {
         GIT_CONFIG_VALUE_10= \
         GIT_CONFIG_KEY_11=credential.helper \
         GIT_CONFIG_VALUE_11='!gh auth git-credential' \
+        GIT_CONFIG_KEY_12=gc.auto \
+        GIT_CONFIG_VALUE_12=0 \
+        GIT_CONFIG_KEY_13=maintenance.auto \
+        GIT_CONFIG_VALUE_13=false \
         GIT_LITERAL_PATHSPECS=1 \
         GIT_NO_REPLACE_OBJECTS=1 \
         GIT_WORK_TREE="$worktree_path" \
         git -C "$worktree_path" "$@"
 }
 
+assert_no_executable_local_git_config() {
+    local worktree_path="$1"
+    local config_key local_config_keys unsafe_keys=""
+    local_config_keys=$(git_no_replace -C "$worktree_path" \
+        config --local --no-includes --name-only --list) || return 74
+    while IFS= read -r config_key; do
+        case "$config_key" in
+            alias.* | credential.* | filter.* | http.* | url.* | protocol.* \
+                | include.* | includeif.* | maintenance.* \
+                | core.alternaterefscommand | core.askpass | core.attributesfile \
+                | core.editor | core.fsmonitor | core.hookspath | core.pager \
+                | core.sshcommand | diff.*.command | diff.*.textconv \
+                | extensions.worktreeconfig | gc.recentobjectshook \
+                | merge.*.driver | remote.*.proxy | remote.*.receivepack \
+                | remote.*.uploadpack | remote.*.vcs | submodule.*.update)
+                unsafe_keys+="$config_key"$'\n'
+                ;;
+        esac
+    done <<< "$local_config_keys"
+    if [[ -n "$unsafe_keys" ]]; then
+        log "Deployment repository contains executable or transport-altering local Git config: ${unsafe_keys%$'\n'}"
+        return 74
+    fi
+}
+
 assert_no_git_replacement_refs() {
     local worktree_path="$1"
     local replacement_refs worktree_redirect worktree_status=0
+    assert_no_executable_local_git_config "$worktree_path" || return $?
     worktree_redirect=$(git_no_replace -C "$worktree_path" \
         config --get-all core.worktree) || worktree_status=$?
     if [[ "$worktree_status" -gt 1 || -n "$worktree_redirect" ]]; then

@@ -109,9 +109,9 @@ git -C "$tmp" config --unset core.worktree
 git -C "$tmp" restore tracked.txt
 assert_exact_clean_worktree "$tmp" "$commit"
 
-credential_helper_marker="$tmp/local-credential-helper-ran"
-askpass_marker="$tmp/caller-askpass-ran"
-askpass_helper="$tmp/caller-askpass"
+credential_helper_marker="$configured_worktree/local-credential-helper-ran"
+askpass_marker="$configured_worktree/caller-askpass-ran"
+askpass_helper="$configured_worktree/caller-askpass"
 printf '#!/bin/sh\nprintf local > %q\nprintf probe-value\\n\n' \
     "$askpass_marker" > "$askpass_helper"
 chmod 700 "$askpass_helper"
@@ -145,8 +145,8 @@ fi
 git -C "$tmp" config --unset credential.helper
 git -C "$tmp" config --unset core.askPass
 
-transport_marker="$tmp/local-transport-ran"
-transport_helper="$tmp/local-transport"
+transport_marker="$configured_worktree/local-transport-ran"
+transport_helper="$configured_worktree/local-transport"
 printf '#!/bin/sh\nprintf local > %q\nexit 1\n' \
     "$transport_marker" > "$transport_helper"
 chmod 700 "$transport_helper"
@@ -162,6 +162,20 @@ if [[ -e "$transport_marker" ]]; then
 fi
 git -C "$tmp" remote remove hostile
 git -C "$tmp" config --unset protocol.ext.allow
+
+filter_marker="$configured_worktree/local-filter-ran"
+git -C "$tmp" config filter.hostile.clean \
+    "!f() { printf local > '$filter_marker'; cat; }; f"
+if assert_exact_clean_worktree "$tmp" "$commit" >/dev/null 2>&1; then
+    echo "repository-local filter command was accepted" >&2
+    exit 1
+fi
+if [[ -e "$filter_marker" ]]; then
+    echo "repository-local filter command executed" >&2
+    exit 1
+fi
+git -C "$tmp" config --unset filter.hostile.clean
+assert_exact_clean_worktree "$tmp" "$commit"
 
 replacement=$(printf 'replacement commit\n' \
     | git -C "$tmp" -c user.name=test -c user.email=test@example.com \
