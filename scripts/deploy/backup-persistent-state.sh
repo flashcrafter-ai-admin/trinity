@@ -12,6 +12,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd -P)"
+ARCHIVE_RESTORE_VERIFIER="${SCRIPT_DIR}/verify-archive-restore.sh"
 # shellcheck source=github-actions-safe-deploy.sh
 source "${SCRIPT_DIR}/github-actions-safe-deploy.sh"
 
@@ -263,14 +264,13 @@ verify_archive_against_volume() {
   docker run --rm \
     -v "${volume}:/source:ro" \
     -v "${archive_dir}:/backup:ro" \
+    -v "${ARCHIVE_RESTORE_VERIFIER}:/verify-archive-restore.sh:ro" \
     --tmpfs /restore:rw,nosuid,nodev \
     alpine:3.20 \
     sh -ec '
       mkdir -p /restore/tree
       tar -xzf "/backup/$1" -C /restore/tree
-      source_digest=$(cd /source && tar -cf - . | sha256sum | awk "{print \$1}")
-      restore_digest=$(cd /restore/tree && tar -cf - . | sha256sum | awk "{print \$1}")
-      test "$source_digest" = "$restore_digest"
+      sh /verify-archive-restore.sh /source /restore/tree
     ' sh "${archive_name}" \
     || die "Archive content does not exactly restore the live volume: ${volume}"
 }
@@ -545,6 +545,8 @@ PY
   } >> "${MANIFEST}"
 }
 
+[[ -f "${ARCHIVE_RESTORE_VERIFIER}" ]] \
+  || die "Archive restore verifier is missing"
 require_cmd docker
 docker info >/dev/null 2>&1 || die "Docker is not running"
 
@@ -879,14 +881,13 @@ if [[ ${INCLUDE_BACKEND_DATA} -eq 1 ]]; then
   docker run --rm \
     --volumes-from "${BACKEND_CONTAINER}:ro" \
     -v "${RUN_DIR}:/backup:ro" \
+    -v "${ARCHIVE_RESTORE_VERIFIER}:/verify-archive-restore.sh:ro" \
     --tmpfs /restore:rw,nosuid,nodev \
     alpine:3.20 \
     sh -ec '
       mkdir -p /restore/tree
       tar -xzf /backup/backend-data.tgz -C /restore/tree
-      source_digest=$(cd /data && tar -cf - . | sha256sum | awk "{print \$1}")
-      restore_digest=$(cd /restore/tree && tar -cf - . | sha256sum | awk "{print \$1}")
-      test "$source_digest" = "$restore_digest"
+      sh /verify-archive-restore.sh /data /restore/tree
     ' \
     || die "Backend data archive does not exactly restore the paused /data mount"
   echo "backend_data_verified=yes" >> "${MANIFEST}"

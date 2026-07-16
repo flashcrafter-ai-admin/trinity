@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)
 SCRIPT="$ROOT/scripts/deploy/backup-persistent-state.sh"
 UPGRADE_SCRIPT="$ROOT/scripts/deploy/safe-upgrade.sh"
+VERIFY_SCRIPT="$ROOT/scripts/deploy/verify-archive-restore.sh"
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 mkdir -p "$TMP/bin" "$TMP/backups"
@@ -176,8 +177,8 @@ case "${1:-}" in
       printf 'agent-workspace\n' > "$fixture/state"
       tar -czf "$backup/$archive" -C "$fixture" .
       rm -rf "$fixture"
-    elif [[ "$joined" == *"source_digest="* && "$joined" == *"restore_digest="* ]]; then
-      exit 0
+    elif [[ "$joined" == *"/verify-archive-restore.sh"* ]]; then
+      [[ "${FAKE_ARCHIVE_VERIFY_FAIL:-0}" == 0 ]]
     elif [[ "$joined" == *"tar -tzf"* ]]; then
       archive=$(printf '%s\n' "$joined" | sed -n 's#.* /backup/\([^ ]*\.tgz\).*#\1#p')
       [[ -n "$archive" ]] || archive=$(printf '%s\n' "$joined" | sed -n 's#.* /backup/\([^ ]*\.tar\.gz\).*#\1#p')
@@ -223,6 +224,7 @@ run_backup() {
     FAKE_AGENT_CONTAINERS="${FAKE_AGENT_CONTAINERS:-}" \
     FAKE_AGENT_VOLUMES="${FAKE_AGENT_VOLUMES:-}" \
     FAKE_AGENT_WORKSPACE_MOUNT="${FAKE_AGENT_WORKSPACE_MOUNT:-}" \
+    FAKE_ARCHIVE_VERIFY_FAIL="${FAKE_ARCHIVE_VERIFY_FAIL:-0}" \
     FAKE_COMPOSE_VOLUMES="${FAKE_COMPOSE_VOLUMES:-}" \
     FAKE_DATABASE_URL="${FAKE_DATABASE_URL:-}" \
     FAKE_DOCKER_LOG="${FAKE_DOCKER_LOG:-}" \
@@ -261,6 +263,13 @@ test -s "$bundle/platform-volumes/trinity-logs.tgz"
 grep -qx 'agent_inventory_stable=yes' "$bundle/manifest.txt"
 grep -qx 'artifact_inventory_verified=yes' "$bundle/manifest.txt"
 grep -qx 'backup_complete=yes' "$bundle/manifest.txt"
+
+if FAKE_ARCHIVE_VERIFY_FAIL=1 run_backup "$TMP/archive-drift" \
+  "$TMP/archive-drift-result" >/dev/null 2>&1; then
+  echo 'archive restore drift was accepted' >&2
+  exit 1
+fi
+test ! -e "$TMP/archive-drift-result"
 
 detached_result="$TMP/detached-result"
 FAKE_COMPOSE_VOLUMES='trinity-detached' run_backup "$TMP/detached-backups" \
@@ -410,6 +419,7 @@ governed="$TMP/governed"
 mkdir -p "$governed/scripts/deploy"
 cp "$ROOT/scripts/deploy/safe-upgrade.sh" "$governed/scripts/deploy/safe-upgrade.sh"
 cp "$ROOT/scripts/deploy/backup-persistent-state.sh" "$governed/scripts/deploy/backup-persistent-state.sh"
+cp "$VERIFY_SCRIPT" "$governed/scripts/deploy/verify-archive-restore.sh"
 cp "$ROOT/scripts/deploy/github-actions-safe-deploy.sh" "$governed/scripts/deploy/github-actions-safe-deploy.sh"
 cp "$ROOT/scripts/deploy/validate-compose-build-inputs.py" "$governed/scripts/deploy/validate-compose-build-inputs.py"
 cp "$ROOT/scripts/deploy/verify-exact-git-tree.py" "$governed/scripts/deploy/verify-exact-git-tree.py"
