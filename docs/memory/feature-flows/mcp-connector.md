@@ -32,14 +32,19 @@ the public repo and the entitlement gate was dropped front and back. Part B
 | POST | `/{name}/connector/key` | `OwnedAgentByName` | Mint/regenerate the scoped key — **secret returned once**; auto-enables; snippets embed the real key. Atomic delete-old + insert-new (single-active-key invariant) |
 | DELETE | `/{name}/connector/key` | `OwnedAgentByName` | Revoke all connector-scoped keys (idempotent) |
 | GET | `/{name}/connector/playbooks` | `AuthorizedAgentByName` (accepts a `scope='connector'` key) | Effective exposed playbooks the connector advertises |
+| POST | `/{name}/task` | `AuthorizedAgent` plus sealed-task contract | Execute only a synchronous signed operation for the connector's bound agent; ordinary connector task bodies are refused |
 
 ## Key + policy
 
 - **Scoped key**: a row in the OSS `mcp_api_keys` table with `scope='connector'`,
   `agent_name` bound. Generated/hashed via `McpKeyOperations` so
   `validate_mcp_api_key` recognizes it. The OSS auth fence fences a connector key
-  to exactly `POST /{agent}/chat` + `GET /{agent}/connector/playbooks` — it cannot
-  reach owner ops or any other agent.
+  to exactly `POST /{agent}/chat`, `POST /{agent}/task`, and
+  `GET /{agent}/connector/playbooks` — it cannot reach owner ops or any other
+  agent. The task route adds a body-aware fail-closed gate: it requires one
+  normalized signed operation grant, synchronous execution, `Bash` as the only
+  tool, bounded turns, an idempotency key, and no session, file, model, prompt,
+  timeout, result-injection, or caller-attribution overrides.
 - **Allow-list** (`enterprise_connectors.exposed_playbooks`, JSON array; NULL ⇒ all
   `user_invocable`): `resolve_exposed_playbooks` drops `user_invocable:false`
   unconditionally (even if explicitly listed); `automation:gated` is passed through

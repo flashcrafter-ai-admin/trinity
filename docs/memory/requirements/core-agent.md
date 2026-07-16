@@ -156,6 +156,7 @@
 - **Status**: Implemented
 - **Description**: Synchronous Claude headless tasks may carry a signed `operation_grant` outside the model-visible message, command arguments, and environment.
 - **Runtime contract**: The request is rejected for async execution and for runtimes that do not advertise `sealed_operation_grant`. Claude runs through a fixed setuid-root context runner that validates the grant with the packaged operation broker, installs it under root-controlled `/run` storage for one task, and removes it after the child exits.
+- **Connector contract**: A connector-scoped key may submit `/task` only to its bound agent and only with the exact synchronous sealed-operation request shape. Missing or malformed grants, broader tools or task options, spoofable source headers, and missing idempotency are rejected before execution.
 - **Security contract**: The native runner accepts only the fixed Claude executable, permits one active context at a time, never exposes the grant to the model process, and fails closed when the verifier, ownership, mode, signature, or runtime binding is invalid.
 
 ---
