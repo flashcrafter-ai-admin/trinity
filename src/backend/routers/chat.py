@@ -1158,6 +1158,7 @@ async def _run_async_task_with_persistence(
             source_agent_name=x_source_agent,
             model=request.model,
             timeout_seconds=request.timeout_seconds,
+            max_turns=request.max_turns,
             resume_session_id=request.resume_session_id,
             allowed_tools=request.allowed_tools,
             system_prompt=request.system_prompt,
@@ -1452,6 +1453,11 @@ async def execute_parallel_task(
     idem = idempotency_service.begin(
         idempotency_service.make_agent_scope(name), idempotency_key
     )
+    if current_user.connector_agent and not idem.enabled:
+        raise HTTPException(
+            status_code=503,
+            detail="Connector task idempotency authority is unavailable",
+        )
     if idem.replay:
         await platform_audit_service.log(
             event_type=AuditEventType.EXECUTION,
@@ -1919,6 +1925,7 @@ async def execute_parallel_task(
         source_mcp_key_name=x_mcp_key_name,
         model=request.model,
         timeout_seconds=request.timeout_seconds,  # TIMEOUT-001: None = use agent's config
+        max_turns=request.max_turns,
         resume_session_id=request.resume_session_id,
         allowed_tools=request.allowed_tools,
         system_prompt=request.system_prompt,

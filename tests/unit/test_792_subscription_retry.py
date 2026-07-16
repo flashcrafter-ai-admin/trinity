@@ -87,7 +87,14 @@ def _await(coro):
         loop.close()
 
 
-def _run(*, responses, switch_result, timeout_seconds=300):
+def _run(
+    *,
+    responses,
+    switch_result,
+    timeout_seconds=300,
+    operation_grant=None,
+    max_turns=None,
+):
     """Drive execute_task. `responses` is the agent_post_with_retry side_effect
     (one per HTTP attempt); `switch_result` is what handle_subscription_failure
     returns. Returns (result, ctx) where ctx exposes the mocks + recorded
@@ -114,9 +121,13 @@ def _run(*, responses, switch_result, timeout_seconds=300):
     )
 
     timeouts: list[float] = []
+    endpoints: list[str] = []
+    payloads: list[dict] = []
 
     async def _agent_post(agent_name, endpoint, payload, **kwargs):
         timeouts.append(kwargs.get("timeout"))
+        endpoints.append(endpoint)
+        payloads.append(dict(payload))
         if not responses:
             raise AssertionError("agent_post_with_retry called more times than responses provided")
         return responses.pop(0)
@@ -145,9 +156,18 @@ def _run(*, responses, switch_result, timeout_seconds=300):
             execution_id="exec-792",
             timeout_seconds=timeout_seconds,
             model="sonnet",
+            operation_grant=operation_grant,
+            max_turns=max_turns,
         ))
 
-    ctx = MagicMock(db=mock_db, switch=mock_switch, audit=mock_audit, timeouts=timeouts)
+    ctx = MagicMock(
+        db=mock_db,
+        switch=mock_switch,
+        audit=mock_audit,
+        timeouts=timeouts,
+        endpoints=endpoints,
+        payloads=payloads,
+    )
     ctx.agent_call_count = len(timeouts)
     return result, ctx
 
@@ -266,6 +286,28 @@ def test_678_interplay_both_retries_fire():
     ctx.switch.assert_awaited_once()
     kwargs = _success_update_kwargs(ctx.db)
     assert kwargs["retry_count"] == 2  # both inline retries counted
+
+
+def test_sealed_retries_never_fall_back_and_preserve_turn_cap():
+    """Every retry stays on the endpoint that old images do not implement."""
+    grant = f"{'a' * 96}.{'b' * 96}"
+    result, ctx = _run(
+        responses=[
+            _resp_reader_race_502(cost=0.01),
+            _resp_429(cost=0.02),
+            _resp_200(cost=0.05),
+        ],
+        switch_result={"switched": True, "new_subscription": "sub-b"},
+        operation_grant=grant,
+        max_turns=12,
+    )
+
+    from services.task_execution_service import TaskExecutionStatus
+
+    assert result.status == TaskExecutionStatus.SUCCESS
+    assert ctx.endpoints == ["/api/task/sealed"] * 3
+    assert all(payload["operation_grant"] == grant for payload in ctx.payloads)
+    assert all(payload["max_turns"] == 12 for payload in ctx.payloads)
 
 
 def test_retry_timeout_bounded():

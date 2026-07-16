@@ -643,6 +643,7 @@ def _enforce_connector_task_request(
         or "\r" in operation_grant
         or "\n" in operation_grant
         or not grant_framing_valid
+        or request.operation_wire_exact is not True
         or request.allowed_tools != ["Bash"]
         or request.async_mode is not False
         or not isinstance(request.max_turns, int)

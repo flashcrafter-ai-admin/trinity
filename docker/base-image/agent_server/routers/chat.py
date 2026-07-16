@@ -106,6 +106,40 @@ async def chat(request: ChatRequest):
 
 @router.post("/api/task")
 async def execute_task(request: ParallelTaskRequest):
+    """Execute an ordinary stateless task on the backwards-compatible route."""
+    if getattr(request, "operation_grant", None) is not None:
+        raise HTTPException(
+            status_code=422,
+            detail="operation grants require the sealed task endpoint",
+        )
+    return await _execute_task(request, operation_grant=None)
+
+
+@router.post("/api/task/sealed")
+async def execute_sealed_task(request: ParallelTaskRequest):
+    """Execute a signed task only through the operation-grant-aware runtime."""
+    sealed_grant = request.operation_grant
+    operation_grant = sealed_grant.get_secret_value() if sealed_grant else ""
+    if not operation_grant:
+        raise HTTPException(
+            status_code=422,
+            detail="sealed task execution requires an operation grant",
+        )
+    if request.async_result:
+        raise HTTPException(status_code=422, detail="operation grants require synchronous tasks")
+    if (
+        request.allowed_tools != ["Bash"]
+        or not isinstance(request.max_turns, int)
+        or not 1 <= request.max_turns <= 32
+        or request.resume_session_id is not None
+        or request.persist_session is not False
+        or request.images is not None
+    ):
+        raise HTTPException(status_code=422, detail="invalid sealed task contract")
+    return await _execute_task(request, operation_grant=operation_grant)
+
+
+async def _execute_task(request: ParallelTaskRequest, *, operation_grant: str | None):
     """
     Execute a stateless task in parallel mode (no conversation context).
 
@@ -126,11 +160,6 @@ async def execute_task(request: ParallelTaskRequest):
         logger.info(f"[Task] Resuming session {request.resume_session_id}: {request.message[:50]}...")
     else:
         logger.info(f"[Task] Executing parallel task: {request.message[:50]}...")
-
-    sealed_grant = getattr(request, "operation_grant", None)
-    operation_grant = sealed_grant.get_secret_value() if sealed_grant else None
-    if operation_grant and request.async_result:
-        raise HTTPException(status_code=422, detail="operation grants require synchronous tasks")
 
     # #1083 fire-and-forget: when the backend requests async AND this is the
     # Claude runtime, accept with 202 and run the turn in a detached task that

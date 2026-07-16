@@ -69,9 +69,25 @@ def test_stdin_prefixes_grant_once_before_the_model_prompt():
 
 
 @pytest.mark.asyncio
-async def test_async_task_rejects_sealed_grant_before_dispatch():
+async def test_legacy_task_endpoint_rejects_sealed_grant():
+    with pytest.raises(HTTPException, match="sealed task endpoint") as failure:
+        await chat.execute_task(ParallelTaskRequest(message="run", operation_grant=_grant()))
+
+    assert failure.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_sealed_task_endpoint_requires_grant():
+    with pytest.raises(HTTPException, match="requires an operation grant") as failure:
+        await chat.execute_sealed_task(ParallelTaskRequest(message="run"))
+
+    assert failure.value.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_async_sealed_task_rejected_before_dispatch():
     with pytest.raises(HTTPException, match="require synchronous tasks") as failure:
-        await chat.execute_task(
+        await chat.execute_sealed_task(
             ParallelTaskRequest(message="run", operation_grant=_grant(), async_result=True)
         )
 
@@ -87,9 +103,22 @@ async def test_unsupported_runtime_rejects_sealed_grant_before_execution(monkeyp
     monkeypatch.setattr(chat, "get_runtime", lambda: runtime)
 
     with pytest.raises(HTTPException, match="does not support sealed operation grants") as failure:
-        await chat.execute_task(ParallelTaskRequest(message="run", operation_grant=_grant()))
+        await chat.execute_sealed_task(
+            ParallelTaskRequest(
+                message="run",
+                operation_grant=_grant(),
+                allowed_tools=["Bash"],
+                max_turns=2,
+            )
+        )
 
     assert failure.value.status_code == 422
+
+
+def test_sealed_route_is_distinct_from_legacy_task_route():
+    paths = {route.path for route in chat.router.routes}
+    assert "/api/task" in paths
+    assert "/api/task/sealed" in paths
 
 
 def test_native_runner_is_fixed_to_claude_and_root_context_paths():
@@ -117,3 +146,4 @@ def test_public_request_masks_and_excludes_operation_grant():
     assert request.operation_grant.get_secret_value() == grant
     assert grant not in repr(request)
     assert "operation_grant" not in request.model_dump()
+    assert "operation_wire_exact" not in request.model_dump()

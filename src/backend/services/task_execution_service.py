@@ -882,6 +882,7 @@ class TaskExecutionService:
         source_mcp_key_name: Optional[str] = None,
         model: Optional[str] = None,
         timeout_seconds: Optional[int] = None,
+        max_turns: Optional[int] = None,
         resume_session_id: Optional[str] = None,
         persist_session: bool = False,
         allowed_tools: Optional[list] = None,
@@ -1201,6 +1202,7 @@ class TaskExecutionService:
                 "allowed_tools": allowed_tools,
                 "system_prompt": effective_system_prompt,
                 "timeout_seconds": timeout_seconds,
+                "max_turns": max_turns,
                 "execution_id": execution_id,
                 "resume_session_id": resume_session_id,
                 "persist_session": persist_session,
@@ -1213,8 +1215,12 @@ class TaskExecutionService:
             if operation_grant:
                 payload["operation_grant"] = operation_grant
 
+            agent_task_endpoint = "/api/task/sealed" if operation_grant else "/api/task"
             effective_timeout = float(timeout_seconds or 600) + 10
-            logger.info(f"[TaskExecService] Calling agent {agent_name} /api/task (timeout={effective_timeout}s, tools={allowed_tools}, msg_len={len(message)})")
+            logger.info(
+                f"[TaskExecService] Calling agent {agent_name} {agent_task_endpoint} "
+                f"(timeout={effective_timeout}s, tools={allowed_tools}, msg_len={len(message)})"
+            )
 
             # #678 retry bookkeeping. Hoisted ABOVE the first agent call so the
             # except branches can read these without NameError when the first
@@ -1230,7 +1236,7 @@ class TaskExecutionService:
 
             response = await agent_post_with_retry(
                 agent_name,
-                "/api/task",
+                agent_task_endpoint,
                 payload,
                 max_retries=3,
                 retry_delay=1.0,
@@ -1315,7 +1321,7 @@ class TaskExecutionService:
                         start_time = datetime.utcnow()
                         response = await agent_post_with_retry(
                             agent_name,
-                            "/api/task",
+                            agent_task_endpoint,
                             retry_payload,
                             max_retries=3,
                             retry_delay=1.0,
@@ -1410,7 +1416,7 @@ class TaskExecutionService:
                         start_time = datetime.utcnow()
                         response = await agent_post_with_retry(
                             agent_name,
-                            "/api/task",
+                            agent_task_endpoint,
                             retry_payload,
                             max_retries=3,
                             retry_delay=1.0,

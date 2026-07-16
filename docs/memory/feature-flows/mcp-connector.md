@@ -44,7 +44,12 @@ the public repo and the entitlement gate was dropped front and back. Part B
   agent. The task route adds a body-aware fail-closed gate: it requires one
   normalized signed operation grant, synchronous execution, `Bash` as the only
   tool, bounded turns, an idempotency key, and no session, file, model, prompt,
-  timeout, result-injection, or caller-attribution overrides.
+  timeout, result-injection, or caller-attribution overrides. The backend then
+  dispatches only to the agent's dedicated `/api/task/sealed` endpoint, which is
+  absent from legacy images and has no fallback to the ordinary task endpoint.
+  Sealed request keys and primitive types are checked before Pydantic
+  normalization, and execution stops before persistence if the required
+  idempotency claim cannot be established.
 - **Allow-list** (`enterprise_connectors.exposed_playbooks`, JSON array; NULL ⇒ all
   `user_invocable`): `resolve_exposed_playbooks` drops `user_invocable:false`
   unconditionally (even if explicitly listed); `automation:gated` is passed through

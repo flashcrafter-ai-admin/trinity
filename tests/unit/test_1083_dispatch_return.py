@@ -43,7 +43,14 @@ def _resp(status_code, body=None):
     return r
 
 
-def _run(*, triggered_by, dispatch_async, agent_resp, operation_grant=None):
+def _run(
+    *,
+    triggered_by,
+    dispatch_async,
+    agent_resp,
+    operation_grant=None,
+    max_turns=None,
+):
     """Drive execute_task with config.DISPATCH_ASYNC=dispatch_async and a mocked
     agent response. Returns (result, mocks dict)."""
     import config
@@ -90,6 +97,7 @@ def _run(*, triggered_by, dispatch_async, agent_resp, operation_grant=None):
                 timeout_seconds=300,
                 model="sonnet",
                 operation_grant=operation_grant,
+                max_turns=max_turns,
             )
         )
     return result, {"db": mock_db, "capacity": mock_capacity, "post": post_mock}
@@ -100,8 +108,12 @@ def _payload_of(post_mock):
     return post_mock.await_args.args[2]
 
 
+def _endpoint_of(post_mock):
+    return post_mock.await_args.args[1]
+
+
 class TestAsyncDispatchReturn:
-    def test_sealed_grant_forces_sync_and_reaches_agent_payload(self):
+    def test_sealed_grant_uses_sealed_only_endpoint_and_preserves_turn_cap(self):
         grant = f"{'a' * 96}.{'b' * 96}"
         _, mocks = _run(
             triggered_by="schedule",
@@ -116,11 +128,33 @@ class TestAsyncDispatchReturn:
                 },
             ),
             operation_grant=grant,
+            max_turns=12,
         )
 
         payload = _payload_of(mocks["post"])
+        assert _endpoint_of(mocks["post"]) == "/api/task/sealed"
         assert payload["async_result"] is False
         assert payload["operation_grant"] == grant
+        assert payload["max_turns"] == 12
+
+    def test_unsealed_task_keeps_legacy_endpoint(self):
+        _, mocks = _run(
+            triggered_by="manual",
+            dispatch_async=False,
+            agent_resp=_resp(
+                200,
+                {
+                    "response": "done",
+                    "session_id": "s1",
+                    "metadata": {"cost_usd": 0.0, "context_window": 200000},
+                    "execution_log": [],
+                },
+            ),
+            max_turns=7,
+        )
+
+        assert _endpoint_of(mocks["post"]) == "/api/task"
+        assert _payload_of(mocks["post"])["max_turns"] == 7
 
     def test_schedule_202_returns_running_no_slot_release(self):
         from services.task_execution_service import TaskExecutionStatus

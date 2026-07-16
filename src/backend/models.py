@@ -216,6 +216,36 @@ class ParallelTaskRequest(BaseModel):
     # runner. Excluding it prevents backlog/model serialization if a caller ever
     # attempts to combine it with an asynchronous task.
     operation_grant: Optional[SecretStr] = Field(default=None, exclude=True, repr=False)
+    operation_wire_exact: bool = Field(default=False, exclude=True, repr=False)
+
+    @model_validator(mode="before")
+    @classmethod
+    def fail_closed_non_exact_sealed_wire(cls, value):
+        """Classify sealed wire input before Pydantic can coerce or drop fields."""
+        if not isinstance(value, dict) or value.get("operation_grant") is None:
+            return value
+        expected_keys = {
+            "allowed_tools",
+            "async_mode",
+            "max_turns",
+            "message",
+            "operation_grant",
+        }
+        exact = (
+            set(value) == expected_keys
+            and type(value.get("message")) is str
+            and value.get("allowed_tools") == ["Bash"]
+            and type(value.get("max_turns")) is int
+            and type(value.get("async_mode")) is bool
+            and value.get("async_mode") is False
+            and type(value.get("operation_grant")) is str
+        )
+        # Do not raise a request-validation error containing the raw secret.
+        # The connector gate consumes this excluded marker and returns its
+        # generic 403; ordinary task callers retain their existing semantics.
+        normalized = dict(value)
+        normalized["operation_wire_exact"] = exact
+        return normalized
 
 
 # ============================================================================

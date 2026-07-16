@@ -13,8 +13,10 @@ import asyncio
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import HTTPException
 
 _BACKEND_STR = str(Path(__file__).resolve().parent.parent.parent / "src" / "backend")
 while _BACKEND_STR in sys.path:
@@ -185,7 +187,9 @@ class TestConnectorTaskContract:
 
     def test_accepts_exact_sync_sealed_task(self):
         """WHY: the production connector path needs one narrowly shaped signed task call."""
-        self._enforce(self._request())
+        request = self._request()
+        assert request.operation_wire_exact is True
+        self._enforce(request)
 
     def test_task_route_checks_connector_contract_before_container_lookup(self, monkeypatch):
         """WHY: the body gate precedes runtime state, idempotency, and execution."""
@@ -227,6 +231,120 @@ class TestConnectorTaskContract:
                 idempotency_key="dispatch:task:attempt:1",
             ))
         assert exc.value.status_code == 404
+
+    def test_valid_connector_task_threads_turn_cap_to_execution_service(self, monkeypatch):
+        """WHY: validating a cap is insufficient unless the agent receives it."""
+        from models import TaskExecutionStatus
+        from routers import chat
+
+        container = SimpleNamespace(status="running")
+        decision = SimpleNamespace(
+            enabled=True,
+            replay=False,
+            in_flight=False,
+            execution_id=None,
+            snapshot=None,
+        )
+        db = MagicMock()
+        db.get_agent_subscription_id.return_value = None
+        db.get_max_parallel_tasks.return_value = 3
+        db.get_execution_timeout.return_value = 900
+        db.create_task_execution.return_value = SimpleNamespace(id="exec-sealed")
+        capacity = MagicMock()
+        capacity.acquire = AsyncMock(return_value=SimpleNamespace(state="admitted"))
+        service = MagicMock()
+        service.execute_task = AsyncMock(
+            return_value=SimpleNamespace(
+                status=TaskExecutionStatus.SUCCESS,
+                response="done",
+                error=None,
+                raw_response={"response": "done"},
+            )
+        )
+
+        monkeypatch.setattr(chat, "get_agent_container", lambda _name: container)
+        monkeypatch.setattr(chat, "db", db)
+        monkeypatch.setattr(chat, "get_capacity_manager", lambda: capacity)
+        monkeypatch.setattr(chat, "dispatch_breaker_active", lambda _name: False)
+        monkeypatch.setattr(chat, "get_task_execution_service", lambda: service)
+        monkeypatch.setattr(chat.idempotency_service, "begin", lambda *_a: decision)
+        monkeypatch.setattr(chat.idempotency_service, "attach_execution", lambda *_a: None)
+        monkeypatch.setattr(chat.idempotency_service, "complete", lambda *_a: None)
+
+        response = asyncio.run(
+            chat.execute_parallel_task(
+                request=self._request(max_turns=12),
+                name="agent-1",
+                current_user=_user(connector_agent="agent-1"),
+                x_source_agent=None,
+                x_via_mcp=None,
+                x_mcp_key_id=None,
+                x_mcp_key_name=None,
+                idempotency_key="dispatch:task:attempt:1",
+            )
+        )
+
+        assert response["task_execution_id"] == "exec-sealed"
+        kwargs = service.execute_task.await_args.kwargs
+        assert kwargs["max_turns"] == 12
+        assert kwargs["allowed_tools"] == ["Bash"]
+        assert kwargs["operation_grant"] == self._grant()
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"shadow_override": "discarded-by-default-pydantic"},
+            {"async_mode": 0},
+            {"max_turns": "12"},
+            {"operation_wire_exact": True},
+        ],
+    )
+    def test_rejects_non_exact_sealed_wire_before_normalization(self, overrides):
+        request = self._request(**overrides)
+        assert request.operation_grant is not None
+        assert request.operation_wire_exact is False
+        with pytest.raises(HTTPException) as exc:
+            self._enforce(request)
+        assert exc.value.status_code == 403
+        assert self._grant() not in str(exc.value)
+
+    def test_connector_task_fails_closed_when_idempotency_claim_is_unavailable(self, monkeypatch):
+        """WHY: a sealed operation cannot run unless its replay claim exists."""
+        from routers import chat
+
+        container = SimpleNamespace(status="running")
+        disabled = SimpleNamespace(
+            enabled=False,
+            replay=False,
+            in_flight=False,
+            execution_id=None,
+            snapshot=None,
+        )
+        db = MagicMock()
+        db.get_agent_subscription_id.return_value = None
+        db.get_max_parallel_tasks.return_value = 3
+        db.get_execution_timeout.return_value = 900
+
+        monkeypatch.setattr(chat, "get_agent_container", lambda _name: container)
+        monkeypatch.setattr(chat, "db", db)
+        monkeypatch.setattr(chat.idempotency_service, "begin", lambda *_a: disabled)
+
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(
+                chat.execute_parallel_task(
+                    request=self._request(),
+                    name="agent-1",
+                    current_user=_user(connector_agent="agent-1"),
+                    x_source_agent=None,
+                    x_via_mcp=None,
+                    x_mcp_key_id=None,
+                    x_mcp_key_name=None,
+                    idempotency_key="dispatch:task:attempt:1",
+                )
+            )
+
+        assert exc.value.status_code == 503
+        db.create_task_execution.assert_not_called()
 
     def test_non_connector_preserves_existing_task_contract(self):
         """WHY: the connector hardening must not change ordinary user or agent task calls."""
