@@ -425,6 +425,12 @@ if [[ -n "${ENV_FILE}" ]]; then
   [[ -f "${ENV_FILE}" ]] || die "Environment file does not exist: ${ENV_FILE}"
 fi
 
+prepare_immutable_release_inputs
+RUNTIME_PROJECT_ROOT="${IMMUTABLE_BUILD_SOURCE_ROOT:-${PROJECT_ROOT}}"
+
+# Derive host-data authority only from the frozen env snapshot that Compose
+# receives. Reading the mutable source before freezing could split freshness
+# detection from the runtime configuration if the source changed in between.
 RUNTIME_DATA_PATH="${PROJECT_ROOT}/trinity-data"
 if [[ -n "${ENV_FILE}" ]]; then
   configured_data_path="$(sed -n 's/^TRINITY_DATA_PATH=//p' "${ENV_FILE}" | tail -n 1)"
@@ -433,9 +439,6 @@ if [[ -n "${ENV_FILE}" ]]; then
   fi
 fi
 COMPOSE_PROCESS_ENV+=("TRINITY_DATA_PATH=${RUNTIME_DATA_PATH}")
-
-prepare_immutable_release_inputs
-RUNTIME_PROJECT_ROOT="${IMMUTABLE_BUILD_SOURCE_ROOT:-${PROJECT_ROOT}}"
 
 COMPOSE_ARGS=(-p "${PROJECT_NAME}")
 COMPOSE_ARGS+=(--project-directory "${RUNTIME_PROJECT_ROOT}")

@@ -179,12 +179,20 @@ case "${1:-}" in
   compose)
     if [[ "$joined" == *" config --format json "* ]]; then
       project=""
+      env_file=""
       previous=""
       for argument in "$@"; do
         if [[ "$previous" == --project-directory ]]; then project=$argument; fi
+        if [[ "$previous" == --env-file ]]; then env_file=$argument; fi
         previous=$argument
       done
       [[ -n "$project" ]] || exit 2
+      if [[ -n "$env_file" && -n "${TRINITY_DATA_PATH:-}" ]]; then
+        {
+          printf 'process=%s\n' "$TRINITY_DATA_PATH"
+          printf 'frozen=%s\n' "$(sed -n 's/^TRINITY_DATA_PATH=//p' "$env_file" | tail -n 1)"
+        } > "$(dirname "$0")/compose-env-observation"
+      fi
       printf '{"services":{"backend":{"build":{"context":"%s","dockerfile":"Dockerfile"}}}}\n' "$project"
     elif [[ "$joined" == *" config --services "* ]]; then
       echo backend
@@ -405,6 +413,39 @@ if printf '%s\n' "$default_governed_plan" | grep -q 'First install has no persis
   echo 'existing agent workspace was classified as a fresh install' >&2
   exit 1
 fi
+
+runtime_a="$TMP/runtime-a.env"
+runtime_b="$TMP/runtime-b.env"
+canonical_tmp=$(cd "$TMP" && pwd -P)
+cp "$TMP/trinity.env" "$runtime_a"
+cp "$TMP/trinity.env" "$runtime_b"
+printf 'TRINITY_DATA_PATH=%s\n' "$canonical_tmp/data-a" >> "$runtime_a"
+printf 'TRINITY_DATA_PATH=%s\n' "$canonical_tmp/data-b" >> "$runtime_b"
+mkdir -p "$TMP/race-bin"
+cat > "$TMP/race-bin/sed" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${RACE_SOURCE_ENV:-}" == "${!#}" \
+  && " $* " == *" s/^TRINITY_DATA_PATH=//p "* \
+  && ! -e "${RACE_MARKER:-}" ]]; then
+  /usr/bin/sed "$@"
+  /bin/cp "${RACE_REPLACEMENT_ENV:?}" "${RACE_SOURCE_ENV}"
+  : > "${RACE_MARKER:?}"
+else
+  exec /usr/bin/sed "$@"
+fi
+EOF
+chmod 755 "$TMP/race-bin/sed"
+rm -f "$TMP/bin/compose-env-observation" "$TMP/pre-freeze-env-read"
+RACE_SOURCE_ENV="$runtime_a" RACE_REPLACEMENT_ENV="$runtime_b" \
+  RACE_MARKER="$TMP/pre-freeze-env-read" \
+  FAKE_AGENT_VOLUMES='agent-paid-media-workspace' \
+  PATH="$TMP/race-bin:$TMP/bin:$PATH" "$governed/scripts/deploy/safe-upgrade.sh" \
+  --allow-fresh --dry-run --no-build --env-file "$runtime_a" \
+  -f "$governed/docker-compose.yml" >/dev/null
+test ! -e "$TMP/pre-freeze-env-read"
+grep -Fqx "process=$canonical_tmp/data-a" "$TMP/bin/compose-env-observation"
+grep -Fqx "frozen=$canonical_tmp/data-a" "$TMP/bin/compose-env-observation"
 
 printf 'ignored drift\n' > "$governed/ignored.local"
 if FAKE_AGENT_VOLUMES='agent-paid-media-workspace' PATH="$TMP/bin:$PATH" \
