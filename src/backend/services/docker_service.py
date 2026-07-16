@@ -1,12 +1,15 @@
 """
 Docker service for managing agent containers.
 """
+import ipaddress
 import logging
+import os
 import time
 from typing import List, Optional
 import docker
 from models import AgentStatus
 from utils.helpers import parse_iso_timestamp, utc_now
+from services.platform_package_service import PLATFORM_PACKAGES_LABEL, parse_platform_package_label
 
 logger = logging.getLogger(__name__)
 
@@ -20,6 +23,27 @@ logger = logging.getLogger(__name__)
 # under a race is harmless.
 _SOCKET_WARN_THROTTLE_S = 60.0
 _last_socket_warn_monotonic: Optional[float] = None
+
+
+def get_agent_ssh_port_binding(port: int) -> tuple[str, int]:
+    """Return a fail-closed Docker host binding for an agent SSH port."""
+    configured_host = os.getenv("AGENT_SSH_BIND_HOST", "").strip()
+    if not configured_host:
+        return ("127.0.0.1", int(port))
+
+    try:
+        address = ipaddress.ip_address(configured_host)
+        if address.is_unspecified:
+            raise ValueError("wildcard interfaces are not allowed")
+    except ValueError as exc:
+        logger.warning(
+            "Invalid AGENT_SSH_BIND_HOST %r; binding agent SSH to loopback: %s",
+            configured_host,
+            exc,
+        )
+        return ("127.0.0.1", int(port))
+
+    return (str(address), int(port))
 
 
 # Initialize Docker client
@@ -116,6 +140,7 @@ def get_agent_status_from_container(container) -> AgentStatus:
         runtime=runtime,
         base_image_version=base_image_version,
         ephemeral=labels.get("trinity.ephemeral") == "true",  # trinity-enterprise#69
+        platform_packages=parse_platform_package_label(labels.get(PLATFORM_PACKAGES_LABEL)),
     )
 
 
@@ -214,6 +239,7 @@ def list_all_agents_fast() -> List[AgentStatus]:
                 runtime=labels.get("trinity.agent-runtime", "claude-code"),
                 base_image_version=labels.get("trinity.base-image-version"),  # Label only, no image lookup
                 ephemeral=labels.get("trinity.ephemeral") == "true",  # trinity-enterprise#69
+                platform_packages=parse_platform_package_label(labels.get(PLATFORM_PACKAGES_LABEL)),
             )
             agents.append(agent)
 

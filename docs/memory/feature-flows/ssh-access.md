@@ -9,6 +9,7 @@ As a platform admin, I want to generate temporary SSH credentials for agent cont
 ## Revision History
 | Date | Change |
 |------|--------|
+| 2026-07-12 | **Secure host binding**: Agent SSH ports bind to `127.0.0.1` by default. Operators must set `AGENT_SSH_BIND_HOST` to a valid private interface IP before recreating agents that need remote SSH access. Invalid values fail closed to loopback. |
 | 2026-04-18 | **SEC: Admin-only access**: Changed from owner/admin to admin-only. Uses `require_admin` dependency instead of `can_user_delete_agent` check. |
 | 2026-03-26 | **SEC: Removed server-side keypair generation (#175)**: Key auth now requires client-supplied `public_key`. Private keys never leave the client. Removed `generate_ssh_keypair()` and `cryptography` dependency. |
 | 2026-02-24 | **Async Docker Operations**: All SshService methods now async (DOCKER-001). Uses `container_exec_run` wrapper to prevent event loop blocking. |
@@ -713,6 +714,7 @@ security_opt=['apparmor:docker-default'],  # no-new-privileges removed for SSH s
 | `SSH_ACCESS_MAX_TTL_HOURS` | 24 | Maximum allowed TTL |
 | `SSH_ACCESS_CLEANUP_INTERVAL` | 900 | Background cleanup interval (seconds) |
 | `SSH_HOST` | (auto-detect) | Override host for SSH commands (highest priority) |
+| `AGENT_SSH_BIND_HOST` | `127.0.0.1` | Host interface IP used when publishing agent container SSH ports. Invalid or empty values fail closed to loopback. Recreate agents to apply changes. |
 | `FRONTEND_URL` | `http://localhost` | Used to auto-detect SSH host in production (e.g., `https://trinity.abilityai.dev` → `trinity.abilityai.dev`) |
 
 ---

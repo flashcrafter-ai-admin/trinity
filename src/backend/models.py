@@ -3,7 +3,15 @@ Pydantic models for the Trinity backend API.
 """
 import re
 
-from pydantic import BaseModel, EmailStr, Field, SecretStr, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    EmailStr,
+    Field,
+    SecretStr,
+    field_validator,
+    model_validator,
+)
 from typing import Dict, List, Literal, Optional
 from datetime import datetime
 from enum import Enum
@@ -143,6 +151,7 @@ class AgentStatus(BaseModel):
     runtime: Optional[str] = "claude-code"  # "claude-code" or "gemini-cli"
     base_image_version: Optional[str] = None  # Version of trinity-agent-base image
     ephemeral: Optional[bool] = False  # trinity-enterprise#69: ghost agent (budgeted, hard-discarded)
+    platform_packages: List[Dict[str, str]] = Field(default_factory=list)  # Resolved immutable package IDs/digests/destinations
 
     class Config:
         json_encoders = {
@@ -608,6 +617,16 @@ class VersioningInfo(BaseModel):
     previous_version: Optional[str] = None
     previous_version_stopped: bool = False
     new_version: str
+
+
+class PublishPlatformPackageRequest(BaseModel):
+    """Administrator request to publish an immutable platform package."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    package_id: str
+    sha256: str
+    archive: str
 
 
 class DeployLocalRequest(BaseModel):

@@ -159,6 +159,7 @@ def _reset():
     _mod.check_resource_limits_match = Mock(return_value=True)
     _mod.check_full_capabilities_match = Mock(return_value=True)
     _mod.check_guardrails_env_matches = Mock(return_value=True)
+    _mod.platform_package_mounts_match = Mock(return_value=True)
     # By default, public folder mount matches the file_sharing_enabled flag
     _mod.check_public_folder_mount_matches = Mock(return_value=True)
     # By default, no read-only mode

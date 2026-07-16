@@ -71,6 +71,10 @@ services:
       # agent container mount spec. noexec,nosuid stay fixed; only size tunes.
       # Existing agents pick up a change on recreate, not restart.
       - AGENT_TMP_SIZE=${AGENT_TMP_SIZE:-512m}
+      # Agent SSH host-port publication is loopback-only by default. Set an
+      # explicit private interface IP (for example a VPN address) when remote
+      # SSH is required; existing agents pick it up only on recreate.
+      - AGENT_SSH_BIND_HOST=${AGENT_SSH_BIND_HOST:-127.0.0.1}
       # Headless per-tool stall-watchdog ceiling (#1369) — seconds; scoped to
       # mcp__* tools. Threaded into agent containers by crud.py/lifecycle.py, so
       # it must reach the backend here or the .env lever is inert (#1039 class).
@@ -580,4 +584,3 @@ networks:
     ipam:
       config:
         - subnet: 172.28.0.0/16
-

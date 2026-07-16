@@ -47,7 +47,9 @@ def wait_for_agent_ready(monkeypatch):
     stubs = {
         "database": types.SimpleNamespace(db=None),
         "services.docker_service": types.SimpleNamespace(
-            docker_client=None, get_agent_container=lambda _n: None
+            docker_client=None,
+            get_agent_container=lambda _n: None,
+            get_agent_ssh_port_binding=lambda port: ("127.0.0.1", port),
         ),
         "services.docker_utils": types.SimpleNamespace(
             container_stop=None, container_remove=None, container_start=None,

@@ -10,9 +10,9 @@
 - **Status**: ✅ Implemented
 - **Description**: No in-memory registry; query Docker directly with container labels
 
-### 8.2 SQLite Data Persistence
+### 8.2 Database Persistence
 - **Status**: ✅ Implemented
-- **Description**: Users, ownership, API keys, chat sessions via bind mount
+- **Description**: Users, ownership, API keys, chat sessions, audit state, and encrypted credential metadata persist in SQLite (`/data/trinity.db`) or PostgreSQL when `DATABASE_URL` is set. Production upgrades must treat the active database backend as authoritative instead of assuming SQLite.
 
 ### 8.3 Redis for Secrets
 - **Status**: ✅ Implemented
@@ -118,6 +118,16 @@
 - **Status Levels**: healthy → degraded → unhealthy → critical → unknown
 - **Flow**: `docs/memory/feature-flows/agent-monitoring.md`
 
+### 12.8b Safe Upgrade Persistent-State Backup
+- **Status**: ✅ Implemented (2026-07-12)
+- **Description**: Running-instance upgrades use a guarded script path that backs up persistent state before rebuilding/recreating platform services.
+- **Key Features**:
+  - `scripts/deploy/backup-persistent-state.sh` discovers the compose project by Docker labels, writes a PostgreSQL custom-format dump for bundled PostgreSQL deployments, archives SQLite files when SQLite is active, archives backend `/data`, copies `.env` when present, and archives every `agent-*-workspace` volume.
+  - `scripts/deploy/safe-upgrade.sh` keeps the compose project name stable, runs the backup first, rebuilds platform services, starts only platform services, waits for backend health, and reports `/api/version`.
+  - `.github/workflows/deploy-dev.yml` connects with a tag-scoped Tailscale OAuth client and reaches a dedicated OpenSSH port with a pinned host key, then requests deployment of the exact pushed SHA. The deploy key is restricted to `scripts/deploy/github-actions-safe-deploy.sh`, which rejects arbitrary commands, serializes deploys, verifies the remote `dev` head, invokes `safe-upgrade.sh`, verifies runtime provenance, and prunes only superseded clean deployment worktrees.
+  - Routine upgrades do not remove agent containers, Docker volumes, or the agent network. Destructive operations such as `docker compose down -v` and `docker volume rm` are explicit reset operations, not upgrade steps.
+- **Flow**: `docs/memory/feature-flows/safe-upgrade-persistent-state.md`
+
 ### 12.8a Richer Agent `/health` Signal (#1020)
 - **Status**: ✅ Implemented (2026-06-02)
 - **GitHub Issue**: #1020
@@ -169,6 +179,40 @@
   - **Admin-configurable** via `GET/PUT /api/settings/ops/config` using new ops keys: `execution_log_retention_days` (default 30), `execution_row_retention_days` (default 90), `health_check_retention_days` (default 7). `0` disables that sweep.
   - **Backward-compatible**: existing `cleanup_old_records()` (agent_health_checks) is reused with added `chunk_size` parameter; previously orphaned (not invoked from any tick), now wired into the cleanup service.
 - **Constants**: Cleanup tick 300s, per-cycle row budget 5000, vacuum cron 04:30 UTC.
+
+---
+
+## Immutable Platform Packages (PKG-001)
+
+- **Status**: Implemented (2026-07-11)
+- **Description**: Administrators can publish immutable, content-addressed
+  platform packages for agents to consume as read-only files. Agent templates
+  select packages with only `package_id` and an exact lowercase SHA-256 digest.
+- **Template contract**: `platform_packages` is a list of exact objects with
+  only `package_id` and `sha256`. A missing key means no packages. Empty lists
+  are valid. Unknown fields, duplicate package IDs, missing or invalid digests,
+  and moving labels such as `latest` are rejected before container creation.
+- **Authority boundary**: Templates cannot name host paths, Docker volume
+  names, container destinations, mount modes, or archive sources. The backend
+  resolves a registered package to a Docker named volume and the fixed
+  destination `/opt/trinity/platform-packages/{package_id}`.
+- **Admin publish API**: `POST /api/admin/platform-packages` accepts only an
+  immutable `package_id`, declared SHA-256 digest, and a bounded base64 tar.gz
+  archive. It safely extracts regular files and directories, verifies the
+  archive digest, materializes a fresh Docker named volume, and writes
+  immutable registry metadata. Same-ID and same-digest retries are idempotent;
+  same-ID and different-digest attempts conflict. Pre-existing deterministic
+  package volumes without registry records are rejected as untrusted.
+- **Container lifecycle**: Create, deploy-local, start/readiness checks, and
+  recreation resolve selections against the registry and require the exact
+  digest. Package volumes are always mounted with Docker `RW=false`.
+- **Observability**: Agent status and deploy-local responses expose only the
+  resolved package IDs, SHA-256 digests, and fixed destinations. They never
+  expose host paths or Docker volume names.
+- **Security**: Package archives are bounded in encoded size and file count;
+  path traversal, links, devices, FIFOs, and sockets are rejected. Package
+  selections never reuse writable shared-folder plumbing.
+- **Flow**: `docs/memory/feature-flows/platform-packages.md`
 
 ---
 
