@@ -117,6 +117,17 @@ case "${1:-}" in
     elif [[ "$joined" == *" pg_restore "* ]]; then
       cat >/dev/null
     elif [[ "$joined" == *" psql "* ]]; then
+      query=$(cat)
+      if [[ -n "${FAKE_DOCKER_SQL_LOG:-}" ]]; then
+        printf '%s\n' "$query" >> "${FAKE_DOCKER_SQL_LOG}"
+      fi
+      printf 'function:7b226e616d65223a2261756469745f6c6f675f6e6f5f7570646174655f666e227d\n'
+      if [[ "$container" == trinity-backup-restore-* \
+        && "${FAKE_POSTGRES_SCHEMA_DRIFT:-0}" == 1 ]]; then
+        printf 'trigger:7b226e616d65223a2261756469745f6c6f675f6e6f5f7570646174655f6472696674227d\n'
+      else
+        printf 'trigger:7b226e616d65223a2261756469745f6c6f675f6e6f5f757064617465227d\n'
+      fi
       if [[ "$container" == trinity-backup-restore-* \
         && "${FAKE_POSTGRES_RESTORE_DRIFT:-0}" == 1 ]]; then
         printf 'rows:7075626c69632e6a6f6273\t1\ndata:7075626c69632e6a6f6273\t7b226964223a327d\n'
@@ -215,9 +226,11 @@ run_backup() {
     FAKE_COMPOSE_VOLUMES="${FAKE_COMPOSE_VOLUMES:-}" \
     FAKE_DATABASE_URL="${FAKE_DATABASE_URL:-}" \
     FAKE_DOCKER_LOG="${FAKE_DOCKER_LOG:-}" \
+    FAKE_DOCKER_SQL_LOG="${FAKE_DOCKER_SQL_LOG:-}" \
     FAKE_DOCKER_STATE="$FAKE_DOCKER_STATE" \
     FAKE_POSTGRES="${FAKE_POSTGRES:-0}" \
     FAKE_POSTGRES_RESTORE_DRIFT="${FAKE_POSTGRES_RESTORE_DRIFT:-0}" \
+    FAKE_POSTGRES_SCHEMA_DRIFT="${FAKE_POSTGRES_SCHEMA_DRIFT:-0}" \
     FAKE_SQLITE_INTEGRITY_FAIL="${FAKE_SQLITE_INTEGRITY_FAIL:-0}" \
     PATH="$TMP/bin:$PATH" "$SCRIPT" \
     --project-name trinity \
@@ -316,6 +329,13 @@ if FAKE_DATABASE_URL='postgresql://user:password@managed.example:5432/trinity' r
   exit 1
 fi
 
+if FAKE_POSTGRES=1 \
+  FAKE_DATABASE_URL='postgresql://trinity:fixture-postgres@postgres:5432/trinity?host=managed.example' \
+  run_backup "$TMP/query-authority" "$result" >/dev/null 2>&1; then
+  echo 'PostgreSQL query-level authority override was accepted as bundled' >&2
+  exit 1
+fi
+
 external_url='postgresql://user:password@managed.example:5432/trinity'
 if command -v sha256sum >/dev/null 2>&1; then
   external_digest="sha256:$(printf '%s' "$external_url" | sha256sum | awk '{print $1}')"
@@ -335,7 +355,8 @@ fi
 
 postgres_result="$TMP/postgres-result"
 FAKE_POSTGRES=1 FAKE_DATABASE_URL='postgresql://trinity:fixture-postgres@postgres:5432/trinity' \
-FAKE_DOCKER_LOG="$TMP/postgres-docker.log" PATH="$TMP/bin:$PATH" "$SCRIPT" \
+FAKE_DOCKER_LOG="$TMP/postgres-docker.log" FAKE_DOCKER_SQL_LOG="$TMP/postgres-sql.log" \
+PATH="$TMP/bin:$PATH" "$SCRIPT" \
   --project-name trinity --output-dir "$TMP/postgres" --env-file "$TMP/trinity.env" \
   --result-file "$postgres_result" >/dev/null
 postgres_bundle=$(cat "$postgres_result")
@@ -345,6 +366,8 @@ grep -qx 'postgres_restore_verified=yes' "$postgres_bundle/manifest.txt"
 grep -Eq '^postgres_content_fingerprint_sha256=sha256:[0-9a-f]{64}$' \
   "$postgres_bundle/manifest.txt"
 grep -q 'pg_restore.*trinity_restore' "$TMP/postgres-docker.log"
+grep -q 'pg_get_functiondef' "$TMP/postgres-sql.log"
+grep -q 'pg_get_triggerdef' "$TMP/postgres-sql.log"
 
 if FAKE_POSTGRES=1 FAKE_POSTGRES_RESTORE_DRIFT=1 \
   FAKE_DATABASE_URL='postgresql://trinity:fixture-postgres@postgres:5432/trinity' \
@@ -352,6 +375,15 @@ if FAKE_POSTGRES=1 FAKE_POSTGRES_RESTORE_DRIFT=1 \
   --output-dir "$TMP/postgres-drift" --env-file "$TMP/trinity.env" \
   --result-file "$TMP/postgres-drift-result" >/dev/null 2>&1; then
   echo 'PostgreSQL restore with changed row values was accepted' >&2
+  exit 1
+fi
+
+if FAKE_POSTGRES=1 FAKE_POSTGRES_SCHEMA_DRIFT=1 \
+  FAKE_DATABASE_URL='postgresql://trinity:fixture-postgres@postgres:5432/trinity' \
+  PATH="$TMP/bin:$PATH" "$SCRIPT" --project-name trinity \
+  --output-dir "$TMP/postgres-schema-drift" --env-file "$TMP/trinity.env" \
+  --result-file "$TMP/postgres-schema-drift-result" >/dev/null 2>&1; then
+  echo 'PostgreSQL restore with changed functions or triggers was accepted' >&2
   exit 1
 fi
 
@@ -414,6 +446,18 @@ if printf '%s\n' "$default_governed_plan" | grep -q 'First install has no persis
   exit 1
 fi
 
+replacement_commit=$(printf 'replacement commit\n' \
+  | git -C "$governed" -c user.name=test -c user.email=test@example.com \
+      commit-tree "${governed_commit}^{tree}")
+git -C "$governed" replace "$governed_commit" "$replacement_commit"
+if FAKE_AGENT_VOLUMES='agent-paid-media-workspace' PATH="$TMP/bin:$PATH" \
+  "$governed/scripts/deploy/safe-upgrade.sh" --allow-fresh --dry-run \
+  --env-file "$TMP/trinity.env" -f "$governed/docker-compose.yml" >/dev/null 2>&1; then
+  echo 'exact-source upgrade accepted a repository replacement ref' >&2
+  exit 1
+fi
+git -C "$governed" replace -d "$governed_commit" >/dev/null
+
 runtime_a="$TMP/runtime-a.env"
 runtime_b="$TMP/runtime-b.env"
 canonical_tmp=$(cd "$TMP" && pwd -P)
@@ -448,6 +492,15 @@ grep -Fqx "process=$canonical_tmp/data-a" "$TMP/bin/compose-env-observation"
 grep -Fqx "frozen=$canonical_tmp/data-a" "$TMP/bin/compose-env-observation"
 
 printf 'ignored drift\n' > "$governed/ignored.local"
+git clone -q "$governed" "$TMP/git-environment-decoy"
+if GIT_DIR="$TMP/git-environment-decoy/.git" \
+  GIT_WORK_TREE="$TMP/git-environment-decoy" \
+  FAKE_AGENT_VOLUMES='agent-paid-media-workspace' PATH="$TMP/bin:$PATH" \
+  "$governed/scripts/deploy/safe-upgrade.sh" --allow-fresh --dry-run \
+  --env-file "$TMP/trinity.env" -f "$governed/docker-compose.yml" >/dev/null 2>&1; then
+  echo 'exact-source upgrade accepted caller-supplied Git repository overrides' >&2
+  exit 1
+fi
 if FAKE_AGENT_VOLUMES='agent-paid-media-workspace' PATH="$TMP/bin:$PATH" \
   "$governed/scripts/deploy/safe-upgrade.sh" --allow-fresh --dry-run \
   --env-file "$TMP/trinity.env" -f "$governed/docker-compose.yml" >/dev/null 2>&1; then

@@ -289,7 +289,7 @@ prepare_immutable_release_inputs() {
   [[ -n "${EXPECTED_SOURCE_REVISION}" ]] || return 0
   command -v python3 >/dev/null 2>&1 || die "python3 is required for immutable release inputs"
   command -v tar >/dev/null 2>&1 || die "tar is required for immutable release inputs"
-  if git -C "${PROJECT_ROOT}" ls-tree -r "${EXPECTED_SOURCE_REVISION}" \
+  if git_no_replace -C "${PROJECT_ROOT}" ls-tree -r "${EXPECTED_SOURCE_REVISION}" \
     | awk '$1 == "160000" { found=1 } END { exit(found ? 0 : 1) }'; then
     die "Governed release source contains unsupported Git submodules"
   fi
@@ -307,6 +307,7 @@ prepare_immutable_release_inputs() {
     "LANG=C.UTF-8"
     "LC_ALL=C.UTF-8"
     "GIT_CONFIG_NOSYSTEM=1"
+    "GIT_NO_REPLACE_OBJECTS=1"
   )
   "${release_tool_environment[@]}" git -C "${PROJECT_ROOT}" archive --format=tar \
     --output="${archive}" "${EXPECTED_SOURCE_REVISION}"
@@ -373,14 +374,14 @@ validate_compose_build_inputs() {
     || die "Compose build inputs are not closed over the exact release source"
 }
 
-git -C "${PROJECT_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
+git_no_replace -C "${PROJECT_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1 \
   || die "Safe upgrade requires a governed Git worktree"
 if [[ -z "${EXPECTED_SOURCE_REVISION}" ]]; then
-  EXPECTED_SOURCE_REVISION="$(git -C "${PROJECT_ROOT}" rev-parse HEAD)"
+  EXPECTED_SOURCE_REVISION="$(git_no_replace -C "${PROJECT_ROOT}" rev-parse HEAD)"
 fi
 export GIT_COMMIT="${EXPECTED_SOURCE_REVISION}"
-export GIT_COMMIT_SUBJECT="$(git -C "${PROJECT_ROOT}" log -1 --format=%s "${EXPECTED_SOURCE_REVISION}")"
-export GIT_COMMIT_TIMESTAMP="$(git -C "${PROJECT_ROOT}" log -1 --format=%cI "${EXPECTED_SOURCE_REVISION}")"
+export GIT_COMMIT_SUBJECT="$(git_no_replace -C "${PROJECT_ROOT}" log -1 --format=%s "${EXPECTED_SOURCE_REVISION}")"
+export GIT_COMMIT_TIMESTAMP="$(git_no_replace -C "${PROJECT_ROOT}" log -1 --format=%cI "${EXPECTED_SOURCE_REVISION}")"
 export GIT_BRANCH="detached-${EXPECTED_SOURCE_REVISION:0:8}"
 export BUILD_DATE="${BUILD_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 DOCKER_COMMAND="$(command -v docker || true)"

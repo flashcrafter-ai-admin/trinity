@@ -5,6 +5,38 @@ log() {
     printf '[github-deploy] %s\n' "$*"
 }
 
+git_no_replace() {
+    env \
+        -u GIT_DIR \
+        -u GIT_WORK_TREE \
+        -u GIT_INDEX_FILE \
+        -u GIT_OBJECT_DIRECTORY \
+        -u GIT_ALTERNATE_OBJECT_DIRECTORIES \
+        -u GIT_COMMON_DIR \
+        -u GIT_NAMESPACE \
+        -u GIT_REPLACE_REF_BASE \
+        -u GIT_GRAFT_FILE \
+        -u GIT_SHALLOW_FILE \
+        -u GIT_CONFIG \
+        -u GIT_CONFIG_COUNT \
+        -u GIT_CONFIG_PARAMETERS \
+        -u GIT_CONFIG_GLOBAL \
+        -u GIT_CONFIG_SYSTEM \
+        -u GIT_EXEC_PATH \
+        GIT_NO_REPLACE_OBJECTS=1 git "$@"
+}
+
+assert_no_git_replacement_refs() {
+    local worktree_path="$1"
+    local replacement_refs
+    replacement_refs=$(git_no_replace -C "$worktree_path" \
+        for-each-ref --format='%(refname)' refs/replace)
+    if [[ -n "$replacement_refs" ]]; then
+        log "Deployment repository contains replacement refs: $worktree_path"
+        return 74
+    fi
+}
+
 parse_target_commit() {
     local command="${1:-}"
     if [[ "$command" =~ ^deploy[[:space:]]+([0-9a-f]{40})$ ]]; then
@@ -18,23 +50,24 @@ assert_exact_clean_worktree() {
     local worktree_path="$1"
     local target_commit="$2"
     local actual_commit actual_tree target_tree drift index_flags
-    actual_commit=$(git -C "$worktree_path" rev-parse HEAD)
+    assert_no_git_replacement_refs "$worktree_path" || return $?
+    actual_commit=$(git_no_replace -C "$worktree_path" rev-parse HEAD)
     if [[ "$actual_commit" != "$target_commit" ]]; then
         log "Deployment worktree points to unexpected commit: $worktree_path"
         return 73
     fi
-    drift=$(git -C "$worktree_path" status \
+    drift=$(git_no_replace -C "$worktree_path" status \
         --porcelain=v1 --untracked-files=all --ignored=matching)
-    index_flags=$(git -C "$worktree_path" ls-files -v | sed -n '/^[a-zS] /p')
+    index_flags=$(git_no_replace -C "$worktree_path" ls-files -v | sed -n '/^[a-zS] /p')
     if [[ -n "$drift" ]] \
         || [[ -n "$index_flags" ]] \
-        || ! git -C "$worktree_path" diff --quiet -- \
-        || ! git -C "$worktree_path" diff --cached --quiet --; then
+        || ! git_no_replace -C "$worktree_path" diff --quiet -- \
+        || ! git_no_replace -C "$worktree_path" diff --cached --quiet --; then
         log "Deployment worktree contains tracked, untracked, ignored, or index-hidden drift: $worktree_path"
         return 74
     fi
-    actual_tree=$(git -C "$worktree_path" write-tree)
-    target_tree=$(git -C "$worktree_path" rev-parse "${target_commit}^{tree}")
+    actual_tree=$(git_no_replace -C "$worktree_path" write-tree)
+    target_tree=$(git_no_replace -C "$worktree_path" rev-parse "${target_commit}^{tree}")
     if [[ "$actual_tree" != "$target_tree" ]]; then
         log "Deployment worktree tree does not match requested commit: $worktree_path"
         return 74
@@ -68,6 +101,7 @@ main() {
     test -d "$TRINITY_PRIMARY_DIR/.git"
     test -f "$env_file"
     test -w "$deploy_root"
+    assert_no_git_replacement_refs "$TRINITY_PRIMARY_DIR"
 
     mkdir -p "$(dirname "$lock_file")"
     exec 9>"$lock_file"
@@ -77,10 +111,10 @@ main() {
     fi
 
     log "Fetching $remote_name/dev"
-    git -C "$TRINITY_PRIMARY_DIR" fetch --prune "$remote_name" dev
+    git_no_replace -C "$TRINITY_PRIMARY_DIR" fetch --prune "$remote_name" dev
 
     local remote_commit
-    remote_commit=$(git -C "$TRINITY_PRIMARY_DIR" rev-parse "refs/remotes/$remote_name/dev")
+    remote_commit=$(git_no_replace -C "$TRINITY_PRIMARY_DIR" rev-parse "refs/remotes/$remote_name/dev")
     if [[ "$remote_commit" != "$target_commit" ]]; then
         log "Refusing stale deployment: requested $target_commit but $remote_name/dev is $remote_commit"
         exit 65
@@ -88,14 +122,14 @@ main() {
 
     if [[ -e "$deploy_dir" ]]; then
         local existing_commit
-        existing_commit=$(git -C "$deploy_dir" rev-parse HEAD)
+        existing_commit=$(git_no_replace -C "$deploy_dir" rev-parse HEAD)
         if [[ "$existing_commit" != "$target_commit" ]]; then
             log "Existing deployment path points to unexpected commit: $deploy_dir"
             exit 73
         fi
     else
         log "Creating immutable deployment worktree: $deploy_dir"
-        git -C "$TRINITY_PRIMARY_DIR" worktree add --detach "$deploy_dir" "$target_commit"
+        git_no_replace -C "$TRINITY_PRIMARY_DIR" worktree add --detach "$deploy_dir" "$target_commit"
     fi
     assert_exact_clean_worktree "$deploy_dir" "$target_commit"
 
@@ -145,12 +179,12 @@ main() {
             *) continue ;;
         esac
         [[ "$worktree_path" != "$deploy_dir" ]] || continue
-        if [[ -z "$(git -C "$worktree_path" status --porcelain)" ]]; then
-            git -C "$TRINITY_PRIMARY_DIR" worktree remove "$worktree_path"
+        if [[ -z "$(git_no_replace -C "$worktree_path" status --porcelain)" ]]; then
+            git_no_replace -C "$TRINITY_PRIMARY_DIR" worktree remove "$worktree_path"
         else
             log "Preserving dirty deployment worktree: $worktree_path"
         fi
-    done < <(git -C "$TRINITY_PRIMARY_DIR" worktree list --porcelain | sed -n 's/^worktree //p')
+    done < <(git_no_replace -C "$TRINITY_PRIMARY_DIR" worktree list --porcelain | sed -n 's/^worktree //p')
 
     log "Deployment verified: $target_commit"
 }

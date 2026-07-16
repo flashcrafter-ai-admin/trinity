@@ -9,6 +9,7 @@ from pathlib import Path
 import stat
 import subprocess
 import sys
+import tempfile
 
 
 def fail(message: str) -> None:
@@ -24,13 +25,15 @@ root = Path(sys.argv[3]).resolve(strict=True)
 if len(revision) != 40 or any(character not in "0123456789abcdef" for character in revision):
     fail("exact Git tree verification requires a full lowercase revision")
 
+tool_state = tempfile.TemporaryDirectory(prefix="trinity-exact-tree-verify-")
 environment = {
     "PATH": "/usr/local/bin:/usr/bin:/bin",
-    "HOME": str(root),
-    "TMPDIR": str(root),
+    "HOME": tool_state.name,
+    "TMPDIR": tool_state.name,
     "LANG": "C.UTF-8",
     "LC_ALL": "C.UTF-8",
     "GIT_CONFIG_NOSYSTEM": "1",
+    "GIT_NO_REPLACE_OBJECTS": "1",
 }
 
 

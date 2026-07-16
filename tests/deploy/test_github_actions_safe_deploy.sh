@@ -89,4 +89,13 @@ git -C "$tmp" update-index --no-skip-worktree tracked.txt
 git -C "$tmp" restore tracked.txt
 assert_exact_clean_worktree "$tmp" "$commit"
 
+replacement=$(printf 'replacement commit\n' \
+    | git -C "$tmp" -c user.name=test -c user.email=test@example.com \
+        commit-tree "${commit}^{tree}")
+git -C "$tmp" replace "$commit" "$replacement"
+if assert_exact_clean_worktree "$tmp" "$commit" >/dev/null 2>&1; then
+    echo "repository replacement ref was accepted" >&2
+    exit 1
+fi
+
 echo "github-actions-safe-deploy: OK"

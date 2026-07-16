@@ -323,6 +323,23 @@ JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
 JOIN pg_catalog.pg_class i ON i.oid = x.indexrelid
 WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname !~ '^pg_toast'
 ORDER BY n.nspname, c.relname, i.relname;
+SELECT 'function:' || encode(convert_to(jsonb_build_array(
+  n.nspname, p.proname, pg_get_function_identity_arguments(p.oid),
+  p.prokind, pg_get_functiondef(p.oid))::text, 'UTF8'), 'hex')
+FROM pg_catalog.pg_proc p
+JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+WHERE p.prokind IN ('f','p')
+  AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname !~ '^pg_toast'
+ORDER BY n.nspname, p.proname, pg_get_function_identity_arguments(p.oid);
+SELECT 'trigger:' || encode(convert_to(jsonb_build_array(
+  n.nspname, c.relname, t.tgname, t.tgenabled, pg_get_triggerdef(t.oid, true))::text,
+  'UTF8'), 'hex')
+FROM pg_catalog.pg_trigger t
+JOIN pg_catalog.pg_class c ON c.oid = t.tgrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE NOT t.tgisinternal
+  AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname !~ '^pg_toast'
+ORDER BY n.nspname, c.relname, t.tgname;
 SELECT format('SELECT %L || E''\t'' || count(*)::text FROM %I.%I;',
   'rows:' || encode(convert_to(n.nspname || '.' || c.relname, 'UTF8'), 'hex'),
   n.nspname, c.relname)
@@ -659,10 +676,20 @@ if [[ "${DATABASE_URL}" == postgresql://* || "${DATABASE_URL}" == postgres://* ]
     POSTGRES_IDENTITY+=("${field}")
   done < <(printf '%s' "${DATABASE_URL}" | python3 -c '
 import hashlib, sys
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qsl, unquote, urlsplit
 value = urlsplit(sys.stdin.read())
-if value.scheme not in {"postgres", "postgresql"} or not value.hostname:
+if value.scheme not in {"postgres", "postgresql"} or not value.hostname or value.fragment:
     raise SystemExit("PostgreSQL DATABASE_URL is invalid")
+try:
+    query = parse_qsl(value.query, keep_blank_values=True, strict_parsing=True)
+except ValueError as exc:
+    raise SystemExit("PostgreSQL DATABASE_URL query is invalid") from exc
+authority_options = {
+    "database", "dbname", "host", "hostaddr", "passfile", "password", "port",
+    "service", "servicefile", "user",
+}
+if any(key.lower() in authority_options for key, _value in query):
+    raise SystemExit("PostgreSQL DATABASE_URL query cannot override connection authority")
 username = unquote(value.username or "")
 password = unquote(value.password or "")
 database = unquote(value.path[1:] if value.path.startswith("/") else "")

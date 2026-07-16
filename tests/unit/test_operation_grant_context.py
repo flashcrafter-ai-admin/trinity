@@ -2,6 +2,9 @@
 
 import hashlib
 import json
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -393,6 +396,177 @@ def test_native_runner_is_fixed_to_reviewed_runtimes_and_root_context_paths():
     assert verifier_child.index("drop_to_operation_identity();") < verifier_child.index(
         "execl(CONTEXT_VERIFIER"
     )
+
+
+def test_codex_refresh_is_atomic_and_every_fatal_path_attempts_cleanup():
+    """WHY: rejected or interrupted refreshes must not truncate auth or strand task state."""
+    source = (
+        Path(__file__).parents[2] / "docker/base-image/task-context-runner.c"
+    ).read_text()
+
+    fail_body = source[source.index("static void fail(") : source.index("static void forward_signal")]
+    assert "cleanup_active_runtime();" in fail_body
+    assert fail_body.index("cleanup_active_runtime();") < fail_body.index("_exit(126);")
+    assert source.count("_exit(126);") == 2
+
+    atomic_replace = source[
+        source.index("static int atomic_replace_codex_auth(") : source.index(
+            "static int refresh_codex_auth(",
+            source.index("static int atomic_replace_codex_auth("),
+        )
+    ]
+    assert "ftruncate(" not in atomic_replace
+    assert "renameat(" in atomic_replace
+    assert "fsync(auth_source_directory_fd)" in atomic_replace
+    assert "unlinkat(auth_source_directory_fd, temporary_name, 0)" in atomic_replace
+    assert "source_projection_target_unchanged(" in atomic_replace
+
+    refresh = source[
+        source.index("static int refresh_codex_auth(") : source.index(
+            "static int remove_tree_node", source.index("static int refresh_codex_auth(")
+        )
+    ]
+    assert "validate_codex_auth(buffer, length) != 0" in refresh
+    assert "atomic_replace_codex_auth(" in refresh
+
+    assert "active_codex_task_home" in source
+    assert "active_context_pid" in source
+
+
+@pytest.mark.skipif(sys.platform != "linux", reason="native runner targets Linux")
+def test_codex_auth_atomic_replace_preserves_original_on_failure(tmp_path):
+    """WHY: a failed refresh must preserve auth bytes and remove its temporary file."""
+    gcc = shutil.which("gcc")
+    if gcc is None:
+        pytest.skip("gcc is required for the native runner harness")
+
+    runner = Path(__file__).parents[2] / "docker/base-image/task-context-runner.c"
+    include_path = str(runner).replace("\\", "\\\\").replace('"', '\\"')
+    harness = tmp_path / "task-context-atomic-refresh.c"
+    harness.write_text(
+        f'''#define _GNU_SOURCE
+#include <dirent.h>
+#define main trinity_task_context_main
+#include "{include_path}"
+#undef main
+
+static void harness_fail(const char *message) {{
+  perror(message);
+  exit(1);
+}}
+
+static void write_exact(int fd, const char *value, size_t length) {{
+  if (write_all_status(fd, value, length) != 0 || fsync(fd) != 0)
+    harness_fail("write fixture");
+}}
+
+int main(void) {{
+  char root[] = "/tmp/trinity-auth-refresh-XXXXXX";
+  if (mkdtemp(root) == NULL) harness_fail("mkdtemp");
+  char source_directory[512];
+  if (snprintf(source_directory, sizeof(source_directory), "%s/%s", root,
+               CODEX_SOURCE_DIRECTORY) >= (int)sizeof(source_directory))
+    harness_fail("source path");
+  if (mkdir(source_directory, 0700) != 0) harness_fail("mkdir source");
+
+  int parent_fd = open(root, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (parent_fd < 0) harness_fail("open parent");
+  int directory_fd = openat(parent_fd, CODEX_SOURCE_DIRECTORY,
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (directory_fd < 0) harness_fail("open source directory");
+  int fixture_fd = openat(directory_fd, "auth.json",
+                          O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+  if (fixture_fd < 0) harness_fail("create auth");
+  write_exact(fixture_fd, "original", 8);
+  if (close(fixture_fd) != 0) harness_fail("close fixture");
+
+  int source_fd = openat(directory_fd, "auth.json", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (source_fd < 0 || flock(source_fd, LOCK_EX) != 0) harness_fail("lock source");
+  struct stat directory_identity;
+  struct stat auth_identity;
+  if (fstat(directory_fd, &directory_identity) != 0 || fstat(source_fd, &auth_identity) != 0)
+    harness_fail("source identity");
+
+  if (atomic_replace_codex_auth(parent_fd, directory_fd, source_fd,
+                                &directory_identity, &auth_identity,
+                                "fresh", 5, getuid(), getgid()) != 0)
+    harness_fail("atomic replace");
+
+  int named_fd = openat(directory_fd, "auth.json", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (named_fd < 0) harness_fail("open replaced auth");
+  struct stat named_identity;
+  if (fstat(named_fd, &named_identity) != 0 ||
+      (named_identity.st_dev == auth_identity.st_dev &&
+       named_identity.st_ino == auth_identity.st_ino))
+    harness_fail("replacement identity");
+  char bytes[16] = {{0}};
+  if (read(named_fd, bytes, sizeof(bytes)) != 5 || memcmp(bytes, "fresh", 5) != 0)
+    harness_fail("replacement bytes");
+  memset(bytes, 0, sizeof(bytes));
+  if (lseek(source_fd, 0, SEEK_SET) != 0 || read(source_fd, bytes, sizeof(bytes)) != 8 ||
+      memcmp(bytes, "original", 8) != 0)
+    harness_fail("original bytes");
+  if (close(named_fd) != 0 || close(source_fd) != 0) harness_fail("close first source");
+
+  source_fd = openat(directory_fd, "auth.json", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (source_fd < 0 || flock(source_fd, LOCK_EX) != 0 ||
+      fstat(source_fd, &auth_identity) != 0)
+    harness_fail("reopen source");
+  if (atomic_replace_codex_auth(parent_fd, directory_fd, source_fd,
+                                &directory_identity, &auth_identity,
+                                "bad", 3, (uid_t)-1, getgid()) == 0) {{
+    fputs("invalid replacement ownership was accepted\\n", stderr);
+    return 1;
+  }}
+  if (close(source_fd) != 0) harness_fail("close stale source");
+
+  named_fd = openat(directory_fd, "auth.json", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  memset(bytes, 0, sizeof(bytes));
+  if (named_fd < 0 || read(named_fd, bytes, sizeof(bytes)) != 5 ||
+      memcmp(bytes, "fresh", 5) != 0)
+    harness_fail("preserved bytes");
+  if (close(named_fd) != 0) harness_fail("close preserved auth");
+
+  DIR *directory = fdopendir(dup(directory_fd));
+  if (directory == NULL) harness_fail("scan source directory");
+  struct dirent *entry;
+  while ((entry = readdir(directory)) != NULL) {{
+    if (strncmp(entry->d_name, ".auth.json.refresh-", 19) == 0) {{
+      fputs("temporary auth file was stranded\\n", stderr);
+      return 1;
+    }}
+  }}
+  if (closedir(directory) != 0) harness_fail("close source scan");
+
+  if (unlinkat(directory_fd, "auth.json", 0) != 0 || close(directory_fd) != 0 ||
+      close(parent_fd) != 0 || rmdir(source_directory) != 0 || rmdir(root) != 0)
+    harness_fail("cleanup fixture");
+  return 0;
+}}
+'''
+    )
+    binary = tmp_path / "task-context-atomic-refresh"
+    compile_result = subprocess.run(
+        [
+            gcc,
+            "-std=c11",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-fPIE",
+            "-pie",
+            str(harness),
+            "-o",
+            str(binary),
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert compile_result.returncode == 0, compile_result.stderr
+    run_result = subprocess.run([str(binary)], capture_output=True, text=True, check=False)
+    assert run_result.returncode == 0, run_result.stderr
 
 
 def test_public_request_masks_and_excludes_operation_grant():
