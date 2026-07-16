@@ -193,6 +193,10 @@ AGENT_REFS: List[AgentRef] = [
     # (else a future same-name agent could be reached by a leaked old snippet).
     AgentRef("mcp_api_keys",                 "agent_name",        Policy.CASCADE,
              extra_filter="scope = 'connector'"),
+    # Runtime-only sealed execution keys are also bound to one immutable agent
+    # identity and must never survive deletion/name reuse.
+    AgentRef("mcp_api_keys",                 "agent_name",        Policy.CASCADE,
+             extra_filter="scope = 'sealed_executor'"),
 ]
 
 

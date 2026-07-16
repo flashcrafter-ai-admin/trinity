@@ -166,6 +166,10 @@ class User(BaseModel):
     # key itself is minted by an entitled module (core-primitive + enterprise-
     # knob, same shape as users.suspended_at #995).
     connector_agent: Optional[str] = None
+    # A sealed-executor key is a non-human runtime principal bound to exactly
+    # one agent and the dedicated signed task route. It is not an MCP principal.
+    sealed_executor_agent: Optional[str] = None
+    sealed_executor_key_id: Optional[str] = None
 
 
 class Token(BaseModel):
@@ -970,6 +974,14 @@ class ConnectorKeySecret(BaseModel):
     key_prefix: str
     mcp_url: Optional[str] = None
     snippets: List[ConnectorClientSnippet] = Field(default_factory=list)
+
+
+class SealedExecutorKeySecret(BaseModel):
+    """One-time response for a non-MCP, agent-bound execution credential."""
+    agent_name: str
+    key_id: str
+    api_key: str
+    key_prefix: str
 
 
 class VoiceRepliesUpdate(BaseModel):

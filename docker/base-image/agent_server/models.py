@@ -1,7 +1,7 @@
 """
 Pydantic models for the agent server.
 """
-from pydantic import BaseModel, SecretStr
+from pydantic import BaseModel, Field, SecretStr, model_validator
 from typing import List, Optional, Dict, Any
 from datetime import datetime
 
@@ -237,11 +237,53 @@ class ParallelTaskRequest(BaseModel):
     # Signed task authorization delivered to the native root-owned context
     # runner. SecretStr prevents request repr/model dumps from exposing it.
     operation_grant: Optional[SecretStr] = None
+    operation_wire_exact: bool = Field(default=False, exclude=True, repr=False)
     # #1083 fire-and-forget: when true AND this agent runs the Claude runtime,
     # accept the turn with 202 and report the terminal via the backend's
     # result-callback endpoint. Ignored by non-Claude runtimes / old images
     # (they run synchronously and return 200 — the backend's non-202 fallback).
     async_result: Optional[bool] = False
+
+    @model_validator(mode="before")
+    @classmethod
+    def classify_exact_sealed_wire(cls, value):
+        """Classify the backend-to-agent sealed wire before coercion or field drops."""
+        if not isinstance(value, dict) or value.get("operation_grant") is None:
+            return value
+        expected_keys = {
+            "allowed_tools",
+            "async_result",
+            "execution_id",
+            "images",
+            "max_turns",
+            "message",
+            "model",
+            "operation_grant",
+            "persist_session",
+            "resume_session_id",
+            "system_prompt",
+            "timeout_seconds",
+        }
+        exact = (
+            set(value) == expected_keys
+            and type(value.get("message")) is str
+            and type(value.get("model")) is str
+            and value.get("allowed_tools") == ["Bash"]
+            and type(value.get("system_prompt")) is str
+            and type(value.get("timeout_seconds")) is int
+            and type(value.get("max_turns")) is int
+            and type(value.get("execution_id")) is str
+            and value.get("resume_session_id") is None
+            and type(value.get("persist_session")) is bool
+            and value.get("persist_session") is False
+            and value.get("images") is None
+            and type(value.get("operation_grant")) is str
+            and type(value.get("async_result")) is bool
+            and value.get("async_result") is False
+        )
+        normalized = dict(value)
+        normalized["operation_wire_exact"] = exact
+        return normalized
 
 
 class ParallelTaskResponse(BaseModel):

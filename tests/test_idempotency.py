@@ -16,9 +16,11 @@ import os
 import sqlite3
 import sys
 import types
+import contextlib
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from sqlalchemy.exc import IntegrityError
 
 # Add backend to path for direct imports.
 _backend_path = os.path.abspath(
@@ -155,6 +157,44 @@ class TestIdempotencyOps:
         res = idem_ops.claim("agent:a", "k1")
         assert res["state"] == "in_flight"
 
+    def test_conflict_without_surviving_row_fails_closed(self, monkeypatch):
+        """A lost insert race cannot fabricate a durable first-seen claim."""
+        import db.idempotency as idempotency_module
+
+        class MissingResult:
+            def mappings(self):
+                return self
+
+            def first(self):
+                return None
+
+        class Connection:
+            def __init__(self):
+                self.inserts = 0
+
+            def begin_nested(self):
+                return contextlib.nullcontext()
+
+            def execute(self, statement):
+                if getattr(statement, "is_insert", False):
+                    self.inserts += 1
+                    raise IntegrityError("insert", {}, Exception("duplicate"))
+                if getattr(statement, "is_select", False):
+                    return MissingResult()
+                return object()
+
+        connection = Connection()
+
+        class Engine:
+            def begin(self):
+                return contextlib.nullcontext(connection)
+
+        monkeypatch.setattr(idempotency_module, "get_engine", lambda: Engine())
+
+        with pytest.raises(RuntimeError, match="disappeared after conflicting insert"):
+            idempotency_module.IdempotencyOperations().claim("agent:a", "k1")
+        assert connection.inserts == 2
+
     def test_completed_claim_replays_snapshot(self, idem_ops):
         idem_ops.claim("agent:a", "k1")
         idem_ops.complete("agent:a", "k1", "exec-123", {"response": "hi", "n": 1})
@@ -190,6 +230,57 @@ class TestIdempotencyOps:
         res = idem_ops.claim("agent:b", "shared-key")
         assert res["state"] == "new"
 
+    def test_disappearing_conflict_is_reinserted_before_returning_new(self, monkeypatch):
+        """WHY: STATE_NEW is authority to dispatch, so it must always have a durable row."""
+        from sqlalchemy.exc import IntegrityError
+        import db.idempotency as module
+
+        class Result:
+            def mappings(self):
+                return self
+
+            def first(self):
+                return None
+
+        class Nested:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+        class Connection:
+            inserts = 0
+
+            def begin_nested(self):
+                return Nested()
+
+            def execute(self, statement):
+                if getattr(statement, "is_insert", False):
+                    self.inserts += 1
+                    if self.inserts == 1:
+                        raise IntegrityError("race", {}, Exception("conflict"))
+                return Result()
+
+        connection = Connection()
+
+        class Begin:
+            def __enter__(self):
+                return connection
+
+            def __exit__(self, *_args):
+                return False
+
+        class Engine:
+            def begin(self):
+                return Begin()
+
+        monkeypatch.setattr(module, "get_engine", lambda: Engine())
+        result = module.IdempotencyOperations().claim("agent:a", "race")
+
+        assert result["state"] == "new"
+        assert connection.inserts == 2
+
     def test_expired_row_is_reclaimed_as_new(self, idem_ops):
         # Seed a row older than the TTL directly.
         old = _iso(datetime.now(timezone.utc) - timedelta(hours=25))
@@ -219,9 +310,6 @@ class TestIdempotencyOps:
         assert removed == 1
         # fresh survives
         assert idem_ops.claim("agent:a", "fresh")["state"] == "in_flight"
-
-
-import contextlib
 
 
 @contextlib.contextmanager

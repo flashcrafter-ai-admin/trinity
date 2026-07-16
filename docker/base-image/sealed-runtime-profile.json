@@ -1,0 +1,8 @@
+{
+  "schemaVersion": "trinity-sealed-runtime/1",
+  "developerUid": 1000,
+  "operationUid": 1001,
+  "sudoAuthorized": false,
+  "managedBashHook": true,
+  "strictMcp": true
+}

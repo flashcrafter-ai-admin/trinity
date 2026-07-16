@@ -23,8 +23,16 @@ def conn_db(tmp_path, monkeypatch):
     monkeypatch.setattr(conn_mod, "DB_PATH", str(db_file))
 
     from db.engine import get_engine
-    from db.tables import metadata as oss_metadata, users, mcp_api_keys, enterprise_connectors
-    oss_metadata.create_all(get_engine(), tables=[users, mcp_api_keys, enterprise_connectors])
+    from db.tables import (
+        agent_ownership,
+        enterprise_connectors,
+        mcp_api_keys,
+        metadata as oss_metadata,
+        users,
+    )
+    oss_metadata.create_all(
+        get_engine(), tables=[users, agent_ownership, mcp_api_keys, enterprise_connectors]
+    )
 
     from sqlalchemy import insert
     with get_engine().begin() as conn:
@@ -32,6 +40,14 @@ def conn_db(tmp_path, monkeypatch):
             id=1, username="owner", role="creator", email="owner@example.com",
             created_at="2026-01-01T00:00:00Z", updated_at="2026-01-01T00:00:00Z",
         ))
+        conn.execute(
+            insert(agent_ownership).values(
+                id=1,
+                agent_name="agent-1",
+                owner_id=1,
+                created_at="2026-01-01T00:00:00Z",
+            )
+        )
     yield str(db_file)
 
 
@@ -154,3 +170,58 @@ class TestKey:
                 )
             ).scalar()
         assert n == 1
+
+
+class TestSealedExecutorKey:
+    def test_regenerate_validates_as_distinct_non_mcp_scope(self, conn_db):
+        from db.mcp_keys import McpKeyOperations
+        from db.sealed_executor import SealedExecutorKeyOperations
+
+        secret = SealedExecutorKeyOperations().regenerate_key("agent-1", user_id=1)
+        info = McpKeyOperations(None).validate_mcp_api_key(secret["api_key"])
+
+        assert secret["key_id"]
+        assert info is not None
+        assert info["scope"] == "sealed_executor"
+        assert info["agent_name"] == "agent-1"
+
+    def test_rotation_is_one_key_and_does_not_revoke_connector(self, conn_db):
+        from db.connector import ConnectorOperations
+        from db.engine import get_engine
+        from db.mcp_keys import McpKeyOperations
+        from db.sealed_executor import SealedExecutorKeyOperations
+        from db.tables import mcp_api_keys
+        from sqlalchemy import func, select
+
+        connector = ConnectorOperations().mint_key("agent-1", user_id=1)
+        sealed = SealedExecutorKeyOperations()
+        old = sealed.regenerate_key("agent-1", user_id=1)
+        new = sealed.regenerate_key("agent-1", user_id=1)
+        validator = McpKeyOperations(None)
+
+        assert validator.validate_mcp_api_key(old["api_key"]) is None
+        assert validator.validate_mcp_api_key(new["api_key"])["scope"] == "sealed_executor"
+        assert validator.validate_mcp_api_key(connector["api_key"])["scope"] == "connector"
+        with get_engine().connect() as conn:
+            count = conn.execute(
+                select(func.count()).select_from(mcp_api_keys).where(
+                    mcp_api_keys.c.agent_name == "agent-1",
+                    mcp_api_keys.c.scope == "sealed_executor",
+                )
+            ).scalar()
+        assert count == 1
+
+    def test_revoke_removes_only_sealed_executor_key(self, conn_db):
+        from db.connector import ConnectorOperations
+        from db.mcp_keys import McpKeyOperations
+        from db.sealed_executor import SealedExecutorKeyOperations
+
+        connector = ConnectorOperations().mint_key("agent-1", user_id=1)
+        sealed = SealedExecutorKeyOperations()
+        runtime = sealed.regenerate_key("agent-1", user_id=1)
+
+        assert sealed.revoke_key("agent-1") is True
+        validator = McpKeyOperations(None)
+        assert validator.validate_mcp_api_key(runtime["api_key"]) is None
+        assert validator.validate_mcp_api_key(connector["api_key"])["scope"] == "connector"
+        assert sealed.revoke_key("agent-1") is False

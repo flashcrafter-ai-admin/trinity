@@ -21,7 +21,29 @@ from sqlalchemy import select, insert, update, delete
 from .engine import get_engine
 from .tables import mcp_api_keys, users
 from db_models import McpApiKey, McpApiKeyCreate, McpApiKeyWithSecret
-from utils.helpers import utc_now_iso
+from utils.helpers import sanitize_agent_name, utc_now_iso
+
+
+_VALID_MCP_KEY_SCOPES = frozenset(
+    {"user", "agent", "system", "connector", "sealed_executor"}
+)
+_MCP_AUTHENTICATION_SCOPES = frozenset({"user", "agent", "system", "connector"})
+_BOUND_MCP_KEY_SCOPES = frozenset(
+    {"agent", "system", "connector", "sealed_executor"}
+)
+
+
+def _valid_bound_agent(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and value == sanitize_agent_name(value)
+    )
+
+
+def scope_can_authenticate_to_mcp(scope: object) -> bool:
+    """Keep runtime-only credentials out of every MCP-facing transport."""
+    return isinstance(scope, str) and scope in _MCP_AUTHENTICATION_SCOPES
 
 
 # Columns selected for the JOIN read paths: every mcp_api_keys column (the old
@@ -259,6 +281,13 @@ class McpKeyOperations:
             if not row["is_active"]:
                 return None
 
+            scope = row["scope"] or "user"
+            bound_agent = row["agent_name"]
+            if scope not in _VALID_MCP_KEY_SCOPES:
+                return None
+            if scope in _BOUND_MCP_KEY_SCOPES and not _valid_bound_agent(bound_agent):
+                return None
+
             # Update usage statistics. Skipped for high-frequency, low-value
             # callers (heartbeat — #307) so a 5s beat doesn't amplify the
             # counter or write to the DB ~12x/min/agent.
@@ -279,8 +308,8 @@ class McpKeyOperations:
                 "key_name": row["name"],
                 "user_id": row["username"],  # Return username for backward compat
                 "user_email": row["email"],
-                "agent_name": row["agent_name"],  # Agent name if scope is 'agent'
-                "scope": row["scope"] or "user"  # 'user' or 'agent'
+                "agent_name": bound_agent,
+                "scope": scope,
             }
 
     def get_mcp_api_key(self, key_id: str, username: str) -> Optional[McpApiKey]:

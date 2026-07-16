@@ -411,8 +411,16 @@ def _setup_headless_command(
         # tasks (the real telemetry-loss pain) get a recovery surface.
         # The retention sweep in session_cleanup_service.py reaps these
         # JSONLs after 24h so disk cost stays bounded.
-        effective_persist = persist_session or (timeout_seconds > _JSONL_PERSIST_THRESHOLD_S)
-        if persist_session is False and timeout_seconds > _JSONL_PERSIST_THRESHOLD_S:
+        effective_persist = persist_session or (
+            timeout_seconds > _JSONL_PERSIST_THRESHOLD_S
+        )
+        if operation_grant:
+            effective_persist = False
+        if (
+            not operation_grant
+            and persist_session is False
+            and timeout_seconds > _JSONL_PERSIST_THRESHOLD_S
+        ):
             logger.info(
                 f"event=jsonl_persistence_auto_enabled timeout_seconds={timeout_seconds} "
                 f"threshold={_JSONL_PERSIST_THRESHOLD_S}"
@@ -427,10 +435,15 @@ def _setup_headless_command(
         claude_session_uuid = str(uuid.uuid4())
         cmd.extend(["--session-id", claude_session_uuid])
 
-    # Add MCP config if .mcp.json exists (for agent-to-agent collaboration via Trinity MCP)
-    mcp_config_path = Path.home() / ".mcp.json"
-    if mcp_config_path.exists():
-        cmd.extend(["--mcp-config", str(mcp_config_path)])
+    # A sealed operation gets no collaboration surface. The root-owned leaf
+    # wrapper enforces this again, but placing it in the invocation contract
+    # prevents even a pre-wrapper configuration lookup from inheriting MCP.
+    if operation_grant:
+        cmd.extend(["--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}'])
+    else:
+        mcp_config_path = Path.home() / ".mcp.json"
+        if mcp_config_path.exists():
+            cmd.extend(["--mcp-config", str(mcp_config_path)])
 
     # Add model selection if specified
     if model:

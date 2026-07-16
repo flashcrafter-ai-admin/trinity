@@ -30,13 +30,15 @@ from services.capacity_manager import CircuitOpen, CapacityFull
 _CHAT = sys.modules[execute_parallel_task.__module__]
 
 
-def _user():
+def _user(*, sealed=False):
     u = MagicMock()
     u.id = 1
     u.email = "u@e.com"
     u.username = "u"
     u.agent_name = None
     u.connector_agent = None
+    u.sealed_executor_agent = "agent1" if sealed else None
+    u.sealed_executor_key_id = "sealed-key-1" if sealed else None
     return u
 
 
@@ -79,12 +81,17 @@ def _env(idem, acquire_exc):
 
 
 def _call(async_mode, operation_grant=None):
+    sealed = operation_grant is not None
     return asyncio.run(execute_parallel_task(
         request=ParallelTaskRequest(
-            message="hi", async_mode=async_mode, operation_grant=operation_grant
+            message="hi",
+            allowed_tools=["Bash"] if sealed else None,
+            max_turns=12 if sealed else None,
+            async_mode=async_mode,
+            operation_grant=operation_grant,
         ),
         name="agent1",
-        current_user=_user(),
+        current_user=_user(sealed=sealed),
         x_source_agent=None,
         x_via_mcp=None,
         x_mcp_key_id=None,

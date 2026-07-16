@@ -98,6 +98,7 @@ def _run(
                 model="sonnet",
                 operation_grant=operation_grant,
                 max_turns=max_turns,
+                allowed_tools=["Bash"] if operation_grant else None,
             )
         )
     return result, {"db": mock_db, "capacity": mock_capacity, "post": post_mock}
@@ -133,6 +134,30 @@ class TestAsyncDispatchReturn:
 
         payload = _payload_of(mocks["post"])
         assert _endpoint_of(mocks["post"]) == "/api/task/sealed"
+        assert set(payload) == {
+            "allowed_tools",
+            "async_result",
+            "execution_id",
+            "images",
+            "max_turns",
+            "message",
+            "model",
+            "operation_grant",
+            "persist_session",
+            "resume_session_id",
+            "system_prompt",
+            "timeout_seconds",
+        }
+        assert type(payload["message"]) is str
+        assert type(payload["model"]) is str
+        assert payload["allowed_tools"] == ["Bash"]
+        assert type(payload["system_prompt"]) is str
+        assert type(payload["timeout_seconds"]) is int
+        assert type(payload["max_turns"]) is int
+        assert type(payload["execution_id"]) is str
+        assert payload["resume_session_id"] is None
+        assert payload["persist_session"] is False
+        assert payload["images"] is None
         assert payload["async_result"] is False
         assert payload["operation_grant"] == grant
         assert payload["max_turns"] == 12

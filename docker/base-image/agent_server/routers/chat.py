@@ -17,6 +17,7 @@ from ..services.claude_code import get_execution_lock
 from ..services.runtime_adapter import get_runtime
 from ..services.process_registry import get_process_registry
 from ..services import result_callback
+from ..services.sealed_runtime import assert_sealed_runtime_eligible
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -125,17 +126,18 @@ async def execute_sealed_task(request: ParallelTaskRequest):
             status_code=422,
             detail="sealed task execution requires an operation grant",
         )
-    if request.async_result:
-        raise HTTPException(status_code=422, detail="operation grants require synchronous tasks")
+    if request.operation_wire_exact is not True:
+        raise HTTPException(status_code=422, detail="invalid sealed task contract")
     if (
         request.allowed_tools != ["Bash"]
-        or not isinstance(request.max_turns, int)
+        or type(request.max_turns) is not int
         or not 1 <= request.max_turns <= 32
         or request.resume_session_id is not None
         or request.persist_session is not False
         or request.images is not None
     ):
         raise HTTPException(status_code=422, detail="invalid sealed task contract")
+    assert_sealed_runtime_eligible()
     return await _execute_task(request, operation_grant=operation_grant)
 
 

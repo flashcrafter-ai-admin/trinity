@@ -33,6 +33,7 @@ import { createOperatorQueueTools } from "./tools/operator_queue.js";
 import { createConnectorTools } from "./tools/connector.js";
 import { createGitTools } from "./tools/git.js";
 import { withAudit } from "./audit.js";
+import { scopeCanAuthenticateToMcp } from "./auth-scopes.js";
 import type { McpAuthContext } from "./types.js";
 
 export interface ServerConfig {
@@ -170,6 +171,10 @@ export async function createServer(config: ServerConfig = {}) {
 
           if (result && result.valid) {
             const scope = result.scope || "user";
+            if (!scopeCanAuthenticateToMcp(scope)) {
+              console.log("MCP request rejected: Key scope is not an MCP principal");
+              throw new Error("Invalid API key");
+            }
             const scopeLabel = scope === "system" ? "SYSTEM (full access)" : scope;
             console.log(
               `MCP request authenticated: user=${result.user_id}, key=${result.key_name}, scope=${scopeLabel}, agent=${result.agent_name || "n/a"}`

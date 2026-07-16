@@ -58,53 +58,59 @@ class IdempotencyOperations:
                     )
                 )
             )
-            try:
-                # SAVEPOINT so a PK conflict rolls back ONLY this INSERT, not the
-                # whole transaction — PostgreSQL aborts the entire transaction on
-                # any error (InFailedSqlTransaction) and would reject the
-                # follow-up SELECT otherwise (#300). SQLite emulates savepoints.
-                with conn.begin_nested():
-                    conn.execute(
-                        insert(idempotency_keys).values(
-                            scope=scope,
-                            idempotency_key=key,
-                            execution_id=None,
-                            status=STATE_IN_FLIGHT,
-                            response_snapshot=None,
-                            created_at=now,
-                            updated_at=now,
+            for claim_attempt in range(2):
+                try:
+                    # SAVEPOINT so a PK conflict rolls back ONLY this INSERT, not the
+                    # whole transaction — PostgreSQL aborts the entire transaction on
+                    # any error (InFailedSqlTransaction) and would reject the
+                    # follow-up SELECT otherwise (#300). SQLite emulates savepoints.
+                    with conn.begin_nested():
+                        conn.execute(
+                            insert(idempotency_keys).values(
+                                scope=scope,
+                                idempotency_key=key,
+                                execution_id=None,
+                                status=STATE_IN_FLIGHT,
+                                response_snapshot=None,
+                                created_at=now,
+                                updated_at=now,
+                            )
                         )
-                    )
-                return {"state": STATE_NEW, "execution_id": None, "snapshot": None}
-            except IntegrityError:
-                # Lost the race / genuine duplicate — read the surviving row.
-                row = conn.execute(
-                    select(
-                        idempotency_keys.c.status,
-                        idempotency_keys.c.execution_id,
-                        idempotency_keys.c.response_snapshot,
-                    ).where(
-                        and_(
-                            idempotency_keys.c.scope == scope,
-                            idempotency_keys.c.idempotency_key == key,
-                        )
-                    )
-                ).mappings().first()
-                if row is None:
-                    # Extremely unlikely (row deleted between INSERT-fail and
-                    # SELECT). Treat as new so the caller doesn't wedge.
                     return {"state": STATE_NEW, "execution_id": None, "snapshot": None}
-                snapshot = None
-                if row["response_snapshot"]:
-                    try:
-                        snapshot = json.loads(row["response_snapshot"])
-                    except (ValueError, TypeError):
-                        snapshot = None
-                return {
-                    "state": row["status"],
-                    "execution_id": row["execution_id"],
-                    "snapshot": snapshot,
-                }
+                except IntegrityError:
+                    # Lost the race / genuine duplicate — read the surviving row.
+                    row = conn.execute(
+                        select(
+                            idempotency_keys.c.status,
+                            idempotency_keys.c.execution_id,
+                            idempotency_keys.c.response_snapshot,
+                        ).where(
+                            and_(
+                                idempotency_keys.c.scope == scope,
+                                idempotency_keys.c.idempotency_key == key,
+                            )
+                        )
+                    ).mappings().first()
+                    if row is None:
+                        # The winner may have released its row between our
+                        # conflict and read. Retry one INSERT; never authorize
+                        # STATE_NEW unless that retry creates the durable row.
+                        if claim_attempt == 0:
+                            continue
+                        raise RuntimeError(
+                            "idempotency claim disappeared after conflicting insert"
+                        )
+                    snapshot = None
+                    if row["response_snapshot"]:
+                        try:
+                            snapshot = json.loads(row["response_snapshot"])
+                        except (ValueError, TypeError):
+                            snapshot = None
+                    return {
+                        "state": row["status"],
+                        "execution_id": row["execution_id"],
+                        "snapshot": snapshot,
+                    }
 
     def attach_execution(self, scope: str, key: str, execution_id: str) -> None:
         """Record the execution_id for an in-flight claim (best-effort)."""

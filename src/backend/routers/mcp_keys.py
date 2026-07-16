@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request
 
 from models import User
 from database import db, McpApiKeyCreate, McpApiKey, McpApiKeyWithSecret
+from db.mcp_keys import scope_can_authenticate_to_mcp
 from dependencies import get_current_user
 from services.platform_audit_service import platform_audit_service, AuditEventType
 
@@ -195,8 +196,11 @@ async def validate_mcp_api_key_http_endpoint(request: Request):
         - user_id: Username of the key owner
         - user_email: Email of the key owner
         - key_name: Name of the API key
-        - agent_name: Agent name if scope is 'agent' (for agent-to-agent auth)
-        - scope: 'user' or 'agent'
+        - agent_name: Agent binding for scoped MCP principals
+        - scope: MCP-capable user, agent, system, or connector scope
+
+    Runtime-only scopes such as ``sealed_executor`` fail here even though their
+    credential remains valid on its dedicated REST endpoint.
     """
     auth_header = request.headers.get("Authorization")
     if not auth_header or not auth_header.startswith("Bearer "):
@@ -209,7 +213,9 @@ async def validate_mcp_api_key_http_endpoint(request: Request):
 
     result = db.validate_mcp_api_key(api_key)
 
-    if not result:
+    if not result or not scope_can_authenticate_to_mcp(
+        result.get("scope") or "user"
+    ):
         raise HTTPException(status_code=401, detail="Invalid or inactive API key")
 
     return {
@@ -219,5 +225,5 @@ async def validate_mcp_api_key_http_endpoint(request: Request):
         "user_email": result.get("user_email"),
         "key_name": result.get("key_name"),
         "agent_name": result.get("agent_name"),  # Agent-to-agent collaboration
-        "scope": result.get("scope", "user")  # 'user' or 'agent'
+        "scope": result.get("scope", "user")
     }

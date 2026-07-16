@@ -3,7 +3,7 @@ Agent chat and activity routes for the Trinity backend.
 
 Includes execution queue integration to prevent parallel execution on the same agent.
 """
-from fastapi import APIRouter, Depends, HTTPException, Header
+from fastapi import APIRouter, Depends, HTTPException, Header, Request
 from fastapi.responses import StreamingResponse, JSONResponse
 import httpx
 import json
@@ -15,10 +15,11 @@ from typing import NamedTuple, NoReturn, Optional
 
 from models import User, ChatMessageRequest, ModelChangeRequest, ParallelTaskRequest, ActivityType, ActivityState, TaskExecutionStatus, ExecutionSource, activity_state_for_terminal
 from dependencies import (
-    _enforce_connector_task_request,
+    _enforce_sealed_executor_task_request,
     get_current_user,
     get_authorized_agent,
     get_owned_agent,
+    parse_sealed_task_wire,
 )
 from services.agent_call_limiter import BackendAgentCallBudgetExhausted
 from services.agent_auth import agent_httpx_client
@@ -52,6 +53,8 @@ from utils.helpers import utc_now_iso
 from services.platform_audit_service import platform_audit_service, AuditEventType
 
 logger = logging.getLogger(__name__)
+
+_MAX_SEALED_TASK_BODY_BYTES = 65_536
 
 
 router = APIRouter(prefix="/api/agents", tags=["chat"])
@@ -1357,6 +1360,42 @@ async def _finalize_self_task(
             logger.warning(f"[Self-Task] WebSocket broadcast failed: {e}")
 
 
+async def _read_sealed_task_body(raw_request: Request) -> bytes:
+    declared_length = raw_request.headers.get("content-length")
+    if declared_length is not None:
+        if not declared_length.isascii() or not declared_length.isdecimal():
+            raise HTTPException(status_code=403, detail="Sealed task contract rejected")
+        if int(declared_length) > _MAX_SEALED_TASK_BODY_BYTES:
+            raise HTTPException(status_code=403, detail="Sealed task contract rejected")
+    body = bytearray()
+    async for chunk in raw_request.stream():
+        if len(body) + len(chunk) > _MAX_SEALED_TASK_BODY_BYTES:
+            raise HTTPException(status_code=403, detail="Sealed task contract rejected")
+        body.extend(chunk)
+    return bytes(body)
+
+
+@router.post("/{name}/task/sealed")
+async def execute_sealed_parallel_task(
+    raw_request: Request,
+    name: str,
+    current_user: User = Depends(get_current_user),
+    idempotency_key: Optional[str] = Header(None),
+):
+    """Parse and execute one exact signed task under a sealed-executor key."""
+    request = parse_sealed_task_wire(await _read_sealed_task_body(raw_request))
+    return await execute_parallel_task(
+        request=request,
+        name=name,
+        current_user=current_user,
+        x_source_agent=None,
+        x_via_mcp=None,
+        x_mcp_key_id=None,
+        x_mcp_key_name=None,
+        idempotency_key=idempotency_key,
+    )
+
+
 @router.post("/{name}/task")
 async def execute_parallel_task(
     request: ParallelTaskRequest,
@@ -1384,7 +1423,7 @@ async def execute_parallel_task(
     Note: Does NOT update conversation history or session state.
     Executions are saved to the database for history tracking.
     """
-    _enforce_connector_task_request(
+    _enforce_sealed_executor_task_request(
         current_user,
         request,
         idempotency_key=idempotency_key,
@@ -1393,6 +1432,16 @@ async def execute_parallel_task(
         x_mcp_key_id=x_mcp_key_id,
         x_mcp_key_name=x_mcp_key_name,
     )
+    if (
+        current_user.sealed_executor_agent
+        and current_user.sealed_executor_agent != name
+    ):
+        raise HTTPException(
+            status_code=403,
+            detail="Sealed-executor key is scoped to a different agent",
+        )
+    if current_user.sealed_executor_key_id:
+        x_mcp_key_id = current_user.sealed_executor_key_id
 
     container = get_agent_container(name)
     if not container:
@@ -1434,7 +1483,10 @@ async def execute_parallel_task(
     is_self_task = (x_source_agent is not None and x_source_agent == name)
 
     # Determine execution source for logging
-    if x_source_agent:
+    if current_user.sealed_executor_agent:
+        source = ExecutionSource.USER
+        triggered_by = "sealed_executor"
+    elif x_source_agent:
         source = ExecutionSource.AGENT
         triggered_by = "self_task" if is_self_task else "agent"
     elif x_via_mcp:
@@ -1453,10 +1505,10 @@ async def execute_parallel_task(
     idem = idempotency_service.begin(
         idempotency_service.make_agent_scope(name), idempotency_key
     )
-    if current_user.connector_agent and not idem.enabled:
+    if current_user.sealed_executor_agent and not idem.enabled:
         raise HTTPException(
             status_code=503,
-            detail="Connector task idempotency authority is unavailable",
+            detail="Sealed task idempotency authority is unavailable",
         )
     if idem.replay:
         await platform_audit_service.log(
@@ -1469,7 +1521,11 @@ async def execute_parallel_task(
             mcp_key_name=x_mcp_key_name,
             target_type="agent",
             target_id=name,
-            endpoint=f"/api/agents/{name}/task",
+            endpoint=(
+                f"/api/agents/{name}/task/sealed"
+                if current_user.sealed_executor_agent
+                else f"/api/agents/{name}/task"
+            ),
             details={
                 "idempotency_key": idempotency_key,
                 "execution_id": idem.execution_id,

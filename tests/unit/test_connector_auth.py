@@ -28,9 +28,21 @@ from db_harness import db_backend, seed_user, seed_agent  # noqa: E402,F401
 pytestmark = pytest.mark.unit
 
 
-def _user(connector_agent=None, role="creator"):
+def _user(
+    connector_agent=None,
+    sealed_executor_agent=None,
+    sealed_executor_key_id=None,
+    role="creator",
+):
     from models import User
-    return User(id=1, username="owner", role=role, connector_agent=connector_agent)
+    return User(
+        id=1,
+        username="owner",
+        role=role,
+        connector_agent=connector_agent,
+        sealed_executor_agent=sealed_executor_agent,
+        sealed_executor_key_id=sealed_executor_key_id,
+    )
 
 
 def _fake_request(method, path):
@@ -111,10 +123,11 @@ class TestCentralGuard:
         u = self._call(patched, _fake_request("GET", "/api/agents/agent-1/connector/playbooks"))
         assert u.connector_agent == "agent-1"
 
-    def test_allows_bound_agent_sealed_task_route(self, patched):
-        """WHY: a connector may reach the bound task handler, which separately requires a grant."""
-        u = self._call(patched, _fake_request("POST", "/api/agents/agent-1/task"))
-        assert u.connector_agent == "agent-1"
+    def test_blocks_bound_agent_task_route(self, patched):
+        """WHY: an end-user connector bearer must never enter executable task dispatch."""
+        with pytest.raises(HTTPException) as exc:
+            self._call(patched, _fake_request("POST", "/api/agents/agent-1/task"))
+        assert exc.value.status_code == 403
 
     def test_blocks_other_agent_chat(self, patched):
         from fastapi import HTTPException
@@ -143,9 +156,48 @@ class TestCentralGuard:
             self._call(patched, _fake_request("DELETE", "/api/agents/agent-1/chat"))
         assert exc.value.status_code == 403
 
+    @pytest.mark.parametrize(
+        ("scope", "agent_name"),
+        [
+            ("connector", None),
+            ("connector", ""),
+            ("connector", "Agent With Spaces"),
+            ("agent", None),
+            ("future-scope", "agent-1"),
+        ],
+    )
+    def test_rejects_unknown_or_unbound_scope_before_owner_resolution(
+        self, monkeypatch, scope, agent_name
+    ):
+        import dependencies as deps
 
-class TestConnectorTaskContract:
-    """A connector bearer alone never authorizes stateless task execution.
+        owner_lookup = MagicMock(return_value={
+            "id": 1,
+            "username": "owner",
+            "email": "owner@example.com",
+            "role": "admin",
+        })
+        monkeypatch.setattr(
+            deps.db,
+            "validate_mcp_api_key",
+            lambda *_a, **_k: {
+                "scope": scope,
+                "agent_name": agent_name,
+                "user_id": "owner",
+                "user_email": "owner@example.com",
+            },
+        )
+        monkeypatch.setattr(deps.db, "get_user_by_email", owner_lookup)
+
+        with pytest.raises(HTTPException) as exc:
+            self._call(deps, _fake_request("DELETE", "/api/agents/other"))
+
+        assert exc.value.status_code == 401
+        owner_lookup.assert_not_called()
+
+
+class TestSealedExecutorTaskContract:
+    """Only a sealed-executor bearer authorizes stateless operation execution.
 
     The backend pins the transport shape; the root-owned agent runtime verifies
     the grant signature and claims before exposing an operation command.
@@ -163,14 +215,14 @@ class TestConnectorTaskContract:
             "allowed_tools": ["Bash"],
             "max_turns": 12,
             "async_mode": False,
-            "operation_grant": TestConnectorTaskContract._grant(),
+            "operation_grant": TestSealedExecutorTaskContract._grant(),
         }
         values.update(overrides)
         return ParallelTaskRequest(**values)
 
     @staticmethod
     def _enforce(request, **overrides):
-        from dependencies import _enforce_connector_task_request
+        from dependencies import _enforce_sealed_executor_task_request
         arguments = {
             "idempotency_key": "dispatch:task:attempt:1",
             "x_source_agent": None,
@@ -179,32 +231,38 @@ class TestConnectorTaskContract:
             "x_mcp_key_name": None,
         }
         arguments.update(overrides)
-        _enforce_connector_task_request(
-            _user(connector_agent="agent-1"),
+        _enforce_sealed_executor_task_request(
+            _user(
+                sealed_executor_agent="agent-1",
+                sealed_executor_key_id="sealed-key-1",
+            ),
             request,
             **arguments,
         )
 
     def test_accepts_exact_sync_sealed_task(self):
-        """WHY: the production connector path needs one narrowly shaped signed task call."""
+        """WHY: the runtime principal gets one narrowly shaped signed task call."""
         request = self._request()
         assert request.operation_wire_exact is True
         self._enforce(request)
 
-    def test_task_route_checks_connector_contract_before_container_lookup(self, monkeypatch):
+    def test_task_route_checks_sealed_contract_before_container_lookup(self, monkeypatch):
         """WHY: the body gate precedes runtime state, idempotency, and execution."""
         from fastapi import HTTPException
         from routers import chat
 
         def unexpected_lookup(_name):
-            pytest.fail("connector contract did not fail before agent lookup")
+            pytest.fail("sealed contract did not fail before agent lookup")
 
         monkeypatch.setattr(chat, "get_agent_container", unexpected_lookup)
         with pytest.raises(HTTPException) as exc:
             asyncio.run(chat.execute_parallel_task(
                 request=self._request(operation_grant=None),
                 name="agent-1",
-                current_user=_user(connector_agent="agent-1"),
+                current_user=_user(
+                    sealed_executor_agent="agent-1",
+                    sealed_executor_key_id="sealed-key-1",
+                ),
                 x_source_agent=None,
                 x_via_mcp=None,
                 x_mcp_key_id=None,
@@ -214,7 +272,7 @@ class TestConnectorTaskContract:
         assert exc.value.status_code == 403
 
     def test_task_route_accepts_contract_before_normal_agent_lookup(self, monkeypatch):
-        """WHY: a valid sealed connector request must enter the existing task path unchanged."""
+        """WHY: a valid sealed request must enter the existing task path unchanged."""
         from fastapi import HTTPException
         from routers import chat
 
@@ -223,7 +281,10 @@ class TestConnectorTaskContract:
             asyncio.run(chat.execute_parallel_task(
                 request=self._request(),
                 name="agent-1",
-                current_user=_user(connector_agent="agent-1"),
+                current_user=_user(
+                    sealed_executor_agent="agent-1",
+                    sealed_executor_key_id="sealed-key-1",
+                ),
                 x_source_agent=None,
                 x_via_mcp=None,
                 x_mcp_key_id=None,
@@ -232,7 +293,7 @@ class TestConnectorTaskContract:
             ))
         assert exc.value.status_code == 404
 
-    def test_valid_connector_task_threads_turn_cap_to_execution_service(self, monkeypatch):
+    def test_valid_sealed_task_threads_turn_cap_to_execution_service(self, monkeypatch):
         """WHY: validating a cap is insufficient unless the agent receives it."""
         from models import TaskExecutionStatus
         from routers import chat
@@ -275,7 +336,10 @@ class TestConnectorTaskContract:
             chat.execute_parallel_task(
                 request=self._request(max_turns=12),
                 name="agent-1",
-                current_user=_user(connector_agent="agent-1"),
+                current_user=_user(
+                    sealed_executor_agent="agent-1",
+                    sealed_executor_key_id="sealed-key-1",
+                ),
                 x_source_agent=None,
                 x_via_mcp=None,
                 x_mcp_key_id=None,
@@ -308,7 +372,7 @@ class TestConnectorTaskContract:
         assert exc.value.status_code == 403
         assert self._grant() not in str(exc.value)
 
-    def test_connector_task_fails_closed_when_idempotency_claim_is_unavailable(self, monkeypatch):
+    def test_sealed_task_fails_closed_when_idempotency_claim_is_unavailable(self, monkeypatch):
         """WHY: a sealed operation cannot run unless its replay claim exists."""
         from routers import chat
 
@@ -334,7 +398,10 @@ class TestConnectorTaskContract:
                 chat.execute_parallel_task(
                     request=self._request(),
                     name="agent-1",
-                    current_user=_user(connector_agent="agent-1"),
+                    current_user=_user(
+                        sealed_executor_agent="agent-1",
+                        sealed_executor_key_id="sealed-key-1",
+                    ),
                     x_source_agent=None,
                     x_via_mcp=None,
                     x_mcp_key_id=None,
@@ -346,10 +413,10 @@ class TestConnectorTaskContract:
         assert exc.value.status_code == 503
         db.create_task_execution.assert_not_called()
 
-    def test_non_connector_preserves_existing_task_contract(self):
-        """WHY: the connector hardening must not change ordinary user or agent task calls."""
-        from dependencies import _enforce_connector_task_request
-        _enforce_connector_task_request(
+    def test_non_sealed_principal_preserves_existing_task_contract(self):
+        """WHY: sealed execution must not change ordinary user or agent task calls."""
+        from dependencies import _enforce_sealed_executor_task_request
+        _enforce_sealed_executor_task_request(
             _user(),
             self._request(operation_grant=None, allowed_tools=None, max_turns=None),
             idempotency_key=None,
@@ -430,6 +497,16 @@ class TestKeyCleanup:
         conn_refs = [r for r in AGENT_REFS
                      if r.table == "mcp_api_keys" and (r.extra_filter or "").find("connector") >= 0]
         assert len(conn_refs) == 1, "expected exactly one scope='connector' mcp_api_keys cleanup ref"
+
+    def test_sealed_executor_key_in_agent_refs(self):
+        from db.agent_cleanup import AGENT_REFS
+        refs = [
+            ref
+            for ref in AGENT_REFS
+            if ref.table == "mcp_api_keys"
+            and "sealed_executor" in (ref.extra_filter or "")
+        ]
+        assert len(refs) == 1
 
     def test_cascade_delete_removes_connector_key(self, db_backend, monkeypatch):
         # Evict cached db modules so they bind to the harness backend.

@@ -1,15 +1,17 @@
 """
 FastAPI dependencies for the Trinity backend.
 """
+import json
 import logging
 import re
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Annotated
+from typing import Annotated, NoReturn, Optional
 from fastapi import Depends, HTTPException, status, Request, Path
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
+from pydantic import ValidationError
 from models import ParallelTaskRequest, User
 from config import SECRET_KEY, ALGORITHM
 from database import db
@@ -64,6 +66,21 @@ def is_token_revoked(jti: Optional[str]) -> bool:
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="token")
+_VALID_MCP_KEY_SCOPES = frozenset(
+    {"user", "agent", "system", "connector", "sealed_executor"}
+)
+_BOUND_MCP_KEY_SCOPES = frozenset(
+    {"agent", "system", "connector", "sealed_executor"}
+)
+_MCP_AGENT_BINDING_RE = re.compile(r"[a-z0-9][a-z0-9_.-]*")
+
+
+def _valid_mcp_agent_binding(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and bool(value)
+        and _MCP_AGENT_BINDING_RE.fullmatch(value) is not None
+    )
 
 
 def hash_password(password: str) -> str:
@@ -316,6 +333,18 @@ async def get_current_user(request: Request, token: str = Depends(oauth2_scheme)
     # Try MCP API key authentication
     mcp_key_info = db.validate_mcp_api_key(token)
     if mcp_key_info:  # validate_mcp_api_key returns dict if valid, None if invalid
+        scope = mcp_key_info.get("scope") or "user"
+        bound_agent = mcp_key_info.get("agent_name")
+        if scope not in _VALID_MCP_KEY_SCOPES:
+            raise credentials_exception
+        if scope in _BOUND_MCP_KEY_SCOPES and not _valid_mcp_agent_binding(bound_agent):
+            raise credentials_exception
+        sealed_executor_key_id = mcp_key_info.get("key_id")
+        if scope == "sealed_executor" and (
+            not isinstance(sealed_executor_key_id, str) or not sealed_executor_key_id
+        ):
+            raise credentials_exception
+
         user_email = mcp_key_info.get("user_email")
         user_id = mcp_key_info.get("user_id")  # This is actually username, not DB id
 
@@ -324,24 +353,19 @@ async def get_current_user(request: Request, token: str = Depends(oauth2_scheme)
         user = db.get_user_by_email(user_email) if user_email else db.get_user_by_username(user_id)
         if user and not user.get("suspended_at"):  # #995 — suspended users blocked here too
             # For agent-scoped keys, include the agent_name
-            scope = mcp_key_info.get("scope")
-            agent_name = mcp_key_info.get("agent_name") if scope == "agent" else None
+            agent_name = bound_agent if scope == "agent" else None
             # Connector-scoped keys: consumption-only principal fenced to one
             # agent (see _enforce_connector_scope). The key is minted by an
             # entitled module; core only recognizes + enforces the scope.
-            connector_agent = mcp_key_info.get("agent_name") if scope == "connector" else None
+            connector_agent = bound_agent if scope == "connector" else None
             if connector_agent:
                 # Central containment (ent#46): a connector key may reach ONLY
-                # its bound agent's chat, sealed task execution, and connector
-                # playbook list. Enforced here
-                # at the single auth entry point — NOT only in the agent path-
-                # deps — so the many endpoints that do inline access checks (and
-                # resolve this principal to the owner) can't be reached by a
-                # leaked connector snippet. The task handler applies a second,
-                # body-aware gate before it touches the runtime container.
+                # its bound agent's chat and connector playbook list. Enforced
+                # here at the single auth entry point so endpoints with inline
+                # owner checks cannot be reached by a leaked connector snippet.
+                # Signed tasks use the distinct sealed-executor principal below.
                 allowed = {
                     ("POST", f"/api/agents/{connector_agent}/chat"),
-                    ("POST", f"/api/agents/{connector_agent}/task"),
                     ("GET", f"/api/agents/{connector_agent}/connector/playbooks"),
                 }
                 if (request.method.upper(), request.url.path) not in allowed:
@@ -349,9 +373,22 @@ async def get_current_user(request: Request, token: str = Depends(oauth2_scheme)
                         status_code=status.HTTP_403_FORBIDDEN,
                         detail=(
                             "Connector keys may only consume their bound agent through "
-                            "the approved chat, sealed-task, and playbook routes"
+                            "the approved chat and playbook routes"
                         ),
                     )
+            sealed_executor_agent = (
+                bound_agent if scope == "sealed_executor" else None
+            )
+            if sealed_executor_agent and (
+                request.method.upper(), request.url.path
+            ) != ("POST", f"/api/agents/{sealed_executor_agent}/task/sealed"):
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=(
+                        "Sealed-executor keys may only execute signed tasks "
+                        "for their bound agent"
+                    ),
+                )
             # trinity-enterprise#69: ephemeral ("ghost") agent containment.
             # An agent-scoped key resolves to the OWNER user on REST — for a
             # ghost running an arbitrary/untrusted workspace that breadth is a
@@ -370,6 +407,10 @@ async def get_current_user(request: Request, token: str = Depends(oauth2_scheme)
                 role=user["role"],
                 agent_name=agent_name,
                 connector_agent=connector_agent,
+                sealed_executor_agent=sealed_executor_agent,
+                sealed_executor_key_id=(
+                    sealed_executor_key_id if sealed_executor_agent else None
+                ),
             )
 
     # Both JWT and MCP key failed
@@ -481,10 +522,10 @@ def _reject_connector_principal(current_user: User) -> None:
     Edition-agnostic enforcement primitive (the key is minted by an entitled
     module).
     """
-    if current_user.connector_agent:
+    if current_user.connector_agent or current_user.sealed_executor_agent:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Connector keys are consumption-only and cannot perform this operation",
+            detail="Scoped runtime keys cannot perform this operation",
         )
 
 
@@ -594,6 +635,11 @@ def _enforce_connector_scope(current_user: User, agent_name: str, *, owner_op: b
     No-op for ordinary (non-connector) principals. Edition-agnostic — the key
     is minted by an entitled module; core recognizes + enforces the scope.
     """
+    if current_user.sealed_executor_agent:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Sealed-executor keys cannot use ordinary agent routes",
+        )
     if not current_user.connector_agent:
         return
     if owner_op:
@@ -608,7 +654,51 @@ def _enforce_connector_scope(current_user: User, agent_name: str, *, owner_op: b
         )
 
 
-def _enforce_connector_task_request(
+def _reject_sealed_task_wire() -> NoReturn:
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Sealed task contract rejected",
+    )
+
+
+def _unique_json_object(pairs):
+    value = {}
+    for key, item in pairs:
+        if key in value:
+            raise ValueError("duplicate JSON key")
+        value[key] = item
+    return value
+
+
+def parse_sealed_task_wire(raw_body: bytes) -> ParallelTaskRequest:
+    """Parse the public signed-task body before Pydantic can coerce or discard."""
+    if not isinstance(raw_body, bytes) or not 1 <= len(raw_body) <= 65_536:
+        _reject_sealed_task_wire()
+    try:
+        decoded = raw_body.decode("utf-8")
+        value = json.loads(decoded, object_pairs_hook=_unique_json_object)
+        if not isinstance(value, dict):
+            _reject_sealed_task_wire()
+        request = ParallelTaskRequest.model_validate(value)
+    except (UnicodeDecodeError, ValueError, TypeError, ValidationError):
+        _reject_sealed_task_wire()
+
+    sealed_grant = request.operation_grant
+    operation_grant = sealed_grant.get_secret_value() if sealed_grant else ""
+    if (
+        request.operation_wire_exact is not True
+        or type(request.max_turns) is not int
+        or not 1 <= request.max_turns <= 32
+        or len(operation_grant) < 64
+        or len(operation_grant) > 32_768
+        or re.fullmatch(r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", operation_grant)
+        is None
+    ):
+        _reject_sealed_task_wire()
+    return request
+
+
+def _enforce_sealed_executor_task_request(
     current_user: User,
     request: ParallelTaskRequest,
     *,
@@ -618,9 +708,13 @@ def _enforce_connector_task_request(
     x_mcp_key_id: Optional[str],
     x_mcp_key_name: Optional[str],
 ) -> None:
-    """Permit only the stateless, sealed task shape used by a lane connector."""
-    if not current_user.connector_agent:
+    """Permit only the stateless task shape of a bound sealed executor."""
+    if not current_user.sealed_executor_agent:
+        if request.operation_grant is not None:
+            _reject_sealed_task_wire()
         return
+    if not current_user.sealed_executor_key_id:
+        _reject_sealed_task_wire()
 
     sealed_grant = request.operation_grant
     operation_grant = sealed_grant.get_secret_value() if sealed_grant else ""
@@ -646,7 +740,7 @@ def _enforce_connector_task_request(
         or request.operation_wire_exact is not True
         or request.allowed_tools != ["Bash"]
         or request.async_mode is not False
-        or not isinstance(request.max_turns, int)
+        or type(request.max_turns) is not int
         or not 1 <= request.max_turns <= 32
         or any(value is not None for value in forbidden_request_fields)
         or request.files is not None
@@ -665,7 +759,7 @@ def _enforce_connector_task_request(
     ):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Connector task execution requires one synchronous sealed operation contract",
+            detail="Sealed task contract rejected",
         )
 
 

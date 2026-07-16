@@ -158,6 +158,7 @@ def _run(
             model="sonnet",
             operation_grant=operation_grant,
             max_turns=max_turns,
+            allowed_tools=["Bash"] if operation_grant else None,
         ))
 
     ctx = MagicMock(

@@ -33,9 +33,11 @@ async def test_async_sealed_grant_rejected_before_idempotency_or_persistence(mon
         username="operator",
         agent_name=None,
         connector_agent=None,
+        sealed_executor_agent=None,
+        sealed_executor_key_id=None,
     )
 
-    with pytest.raises(HTTPException, match="require synchronous tasks") as failure:
+    with pytest.raises(HTTPException, match="Sealed task contract rejected") as failure:
         await chat.execute_parallel_task(
             request=request,
             name="agent-onboarding",
@@ -47,5 +49,5 @@ async def test_async_sealed_grant_rejected_before_idempotency_or_persistence(mon
             idempotency_key="must-not-persist",
         )
 
-    assert failure.value.status_code == 422
+    assert failure.value.status_code == 403
     assert begin_called is False

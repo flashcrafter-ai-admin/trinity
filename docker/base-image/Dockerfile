@@ -75,6 +75,11 @@ RUN gcc -std=c11 -O2 -Wall -Wextra -Werror -fPIE -pie \
     chmod 4555 /usr/local/bin/trinity-task-context && \
     rm /tmp/task-context-runner.c
 
+RUN mkdir -p /etc/trinity
+COPY ./sealed-runtime-profile.json /etc/trinity/sealed-runtime.json
+RUN chown root:root /etc/trinity/sealed-runtime.json && \
+    chmod 0444 /etc/trinity/sealed-runtime.json
+
 RUN useradd -m -s /bin/bash -u 1000 developer && \
     echo "developer:developer" | chpasswd && \
     usermod -aG sudo developer && \

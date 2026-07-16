@@ -114,6 +114,7 @@ from db.sessions import SessionOperations
 from db.activities import ActivityOperations
 from db.reports import ReportOperations
 from db.connector import ConnectorOperations
+from db.sealed_executor import SealedExecutorKeyOperations
 from db.permissions import PermissionOperations
 from db.shared_folders import SharedFolderOperations
 from db.agent_shared_files import AgentSharedFilesOperations
@@ -334,6 +335,7 @@ class DatabaseManager:
         self._activity_ops = ActivityOperations()
         self._report_ops = ReportOperations()
         self._connector_ops = ConnectorOperations()
+        self._sealed_executor_key_ops = SealedExecutorKeyOperations()
         self._permission_ops = PermissionOperations(self._user_ops, self._agent_ops)
         self._shared_folder_ops = SharedFolderOperations(self._permission_ops)
         self._agent_shared_files_ops = AgentSharedFilesOperations()
@@ -717,6 +719,12 @@ class DatabaseManager:
 
     def regenerate_connector_key(self, agent_name, user_id):
         return self._connector_ops.regenerate_key(agent_name, user_id)
+
+    def regenerate_sealed_executor_key(self, agent_name, user_id):
+        return self._sealed_executor_key_ops.regenerate_key(agent_name, user_id)
+
+    def revoke_sealed_executor_key(self, agent_name):
+        return self._sealed_executor_key_ops.revoke_key(agent_name)
 
     def get_tts_config(self, agent_name: str):
         return self._agent_ops.get_tts_config(agent_name)

@@ -155,6 +155,18 @@ def _usage_count(db_path: Path) -> int:
         conn.close()
 
 
+def _set_key_binding(db_path: Path, *, scope: str, agent_name: str | None) -> None:
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute(
+            "UPDATE mcp_api_keys SET scope = ?, agent_name = ? WHERE id = 'k1'",
+            (scope, agent_name),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def test_validate_default_bumps_usage_count(mcp_ops):
     """R1 regression: the default (no flag) path still increments usage_count."""
     ops, db_path = mcp_ops
@@ -193,3 +205,23 @@ def test_validate_track_usage_false_repeated_calls_stay_zero(mcp_ops):
 def test_validate_invalid_key_returns_none(mcp_ops):
     ops, _ = mcp_ops
     assert ops.validate_mcp_api_key("nope", track_usage=False) is None
+
+
+@pytest.mark.parametrize(
+    ("scope", "agent_name"),
+    [
+        ("connector", None),
+        ("connector", ""),
+        ("connector", "Agent With Spaces"),
+        ("agent", None),
+        ("future-scope", "my-agent"),
+    ],
+)
+def test_validate_rejects_unknown_or_unbound_execution_scope(
+    mcp_ops, scope, agent_name
+):
+    ops, db_path = mcp_ops
+    _set_key_binding(db_path, scope=scope, agent_name=agent_name)
+
+    assert ops.validate_mcp_api_key(_TEST_KEY) is None
+    assert _usage_count(db_path) == 0
