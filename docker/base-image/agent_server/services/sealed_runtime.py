@@ -13,6 +13,8 @@ import stat
 
 from fastapi import HTTPException
 
+from .sealed_artifact_tree import verify_manifest
+
 
 logger = logging.getLogger(__name__)
 
@@ -21,6 +23,7 @@ _DEFAULT_ARTIFACT_CONTRACT_PATH = Path(
     "/opt/flashcrafter/sealed-artifact-contract.json"
 )
 _SOURCE_IDENTITY_PATH = Path("/opt/flashcrafter/source.json")
+_PACKAGED_RUNTIME_TREE_PATH = Path("/opt/flashcrafter/packaged-runtime-tree.json")
 _EXPECTED_PROFILE = {
     "schemaVersion": "trinity-sealed-runtime/1",
     "developerUid": 1000,
@@ -45,6 +48,8 @@ _REQUIRED_ARTIFACT_PATHS = frozenset(
         "/etc/trinity/sealed-runtime.json",
         "/opt/flashcrafter/bin/claude-operation-runtime",
         "/opt/flashcrafter/bin/codex-operation-shell",
+        "/opt/flashcrafter/bin/entrypoint.sh",
+        "/opt/flashcrafter/bin/fc-operation-boundary-canary",
         "/opt/flashcrafter/bin/fc-operation-broker",
         "/opt/flashcrafter/bin/fc-operation-drop",
         "/opt/flashcrafter/bin/fc-operation-exec",
@@ -54,9 +59,14 @@ _REQUIRED_ARTIFACT_PATHS = frozenset(
         "/opt/flashcrafter/bin/operation-lib.ts",
         "/opt/flashcrafter/bin/operation-skill.ts",
         "/opt/flashcrafter/bin/operation-verify.ts",
+        "/opt/flashcrafter/bin/runtime-audit.sh",
+        "/opt/flashcrafter/bin/runtime-portability-audit.sh",
+        "/opt/flashcrafter/bin/verify-discovery.sh",
         "/opt/flashcrafter/operation-contract.json",
         "/opt/flashcrafter/operation-grant-public-key.der",
+        "/opt/flashcrafter/packaged-runtime-tree.json",
         "/opt/flashcrafter/source.json",
+        "/usr/local/bin/bun",
         "/usr/local/bin/claude",
         "/usr/local/bin/trinity-task-context",
     }
@@ -158,6 +168,7 @@ def _artifact_contract_valid(path: Path) -> bool:
         return False
 
     seen: set[str] = set()
+    ordered_paths: list[str] = []
     for artifact in artifacts:
         if not isinstance(artifact, dict) or set(artifact) != {
             "path",
@@ -183,6 +194,7 @@ def _artifact_contract_valid(path: Path) -> bool:
         ):
             return False
         seen.add(artifact_path)
+        ordered_paths.append(artifact_path)
         target = Path(artifact_path)
         expected_mode = int(mode, 8)
         if not _boundary_valid(target, expected_mode, True):
@@ -194,7 +206,9 @@ def _artifact_contract_valid(path: Path) -> bool:
         if actual_digest != digest:
             return False
 
-    if not _REQUIRED_ARTIFACT_PATHS.issubset(seen):
+    if seen != _REQUIRED_ARTIFACT_PATHS or ordered_paths != sorted(_REQUIRED_ARTIFACT_PATHS):
+        return False
+    if not verify_manifest(_PACKAGED_RUNTIME_TREE_PATH):
         return False
     try:
         source_identity = json.loads(_SOURCE_IDENTITY_PATH.read_text(encoding="utf-8"))

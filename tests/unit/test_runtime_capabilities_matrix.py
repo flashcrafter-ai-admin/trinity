@@ -46,7 +46,7 @@ def test_codex_matches_gemini_shape_for_resume_and_cost():
     assert caps.session_tab_resume is False   # MVP: Session tab stays Claude/Gemini
     assert caps.mcp_support is True
     assert caps.cost_reporting == "estimated"
-    assert caps.sealed_operation_grant is False
+    assert caps.sealed_operation_grant is True
 
 
 def test_capabilities_to_dict_is_serializable_for_callers():
@@ -59,5 +59,5 @@ def test_capabilities_to_dict_is_serializable_for_callers():
         "session_tab_resume": False,
         "mcp_support": True,
         "cost_reporting": "estimated",
-        "sealed_operation_grant": False,
+        "sealed_operation_grant": True,
     }

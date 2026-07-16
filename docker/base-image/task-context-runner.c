@@ -16,6 +16,9 @@
 #define CONTEXT_ROOT "/run/trinity-task-context"
 #define MAX_GRANT_BYTES 32768
 #define CONTEXT_VERIFIER "/opt/flashcrafter/bin/fc-operation-broker"
+#define CLAUDE_RUNTIME "/usr/local/bin/claude"
+#define CODEX_RUNTIME "/usr/local/bin/codex"
+#define CODEX_OPERATION_HOME "/home/developer/.codex-attestation"
 #define OPERATION_UID 1001
 #define OPERATION_GID 1001
 #define OPERATION_HOME "/var/empty"
@@ -112,6 +115,12 @@ static void wipe_free(char *value) {
   free(value);
 }
 
+static void drop_to_operation_identity(void) {
+  if (setgroups(0, NULL) != 0) fail("setgroups");
+  if (setresgid(OPERATION_GID, OPERATION_GID, OPERATION_GID) != 0) fail("setresgid");
+  if (setresuid(OPERATION_UID, OPERATION_UID, OPERATION_UID) != 0) fail("setresuid");
+}
+
 static void verify_grant(const char *grant, size_t length) {
   struct stat verifier;
   if (lstat(CONTEXT_VERIFIER, &verifier) != 0 || !S_ISREG(verifier.st_mode) ||
@@ -129,6 +138,7 @@ static void verify_grant(const char *grant, size_t length) {
     if (dup2(input[0], STDIN_FILENO) < 0) fail("dup2 verifier");
     close(input[0]);
     close(input[1]);
+    drop_to_operation_identity();
     execl(CONTEXT_VERIFIER, CONTEXT_VERIFIER, "verify-context", (char *)NULL);
     fail("exec verifier");
   }
@@ -239,8 +249,9 @@ static void remove_context(pid_t session_id) {
 }
 
 int main(int argc, char **argv) {
-  if (argc < 2 || strcmp(argv[1], "/usr/local/bin/claude") != 0 || getuid() != 1000 ||
-      geteuid() != 0) {
+  int is_claude = argc >= 2 && strcmp(argv[1], CLAUDE_RUNTIME) == 0;
+  int is_codex = argc >= 2 && strcmp(argv[1], CODEX_RUNTIME) == 0;
+  if (argc < 2 || (!is_claude && !is_codex) || getuid() != 1000 || geteuid() != 0) {
     fputs("invalid trusted task context invocation\n", stderr);
     return 126;
   }
@@ -249,20 +260,25 @@ int main(int argc, char **argv) {
   size_t grant_length = read_grant(grant);
   verify_grant(grant, grant_length);
 
-  char *claude_oauth = copy_optional_environment("CLAUDE_CODE_OAUTH_TOKEN");
+  char *claude_oauth = is_claude ? copy_optional_environment("CLAUDE_CODE_OAUTH_TOKEN") : NULL;
   char *anthropic_api =
-      claude_oauth == NULL ? copy_optional_environment("ANTHROPIC_API_KEY") : NULL;
+      is_claude && claude_oauth == NULL ? copy_optional_environment("ANTHROPIC_API_KEY") : NULL;
   char *anthropic_auth =
-      claude_oauth == NULL && anthropic_api == NULL
+      is_claude && claude_oauth == NULL && anthropic_api == NULL
           ? copy_optional_environment("ANTHROPIC_AUTH_TOKEN")
           : NULL;
+  char *codex_home = is_codex ? copy_optional_environment("CODEX_HOME") : NULL;
+  if (is_codex && (codex_home == NULL || strcmp(codex_home, CODEX_OPERATION_HOME) != 0)) {
+    fputs("sealed Codex home is invalid\n", stderr);
+    _exit(126);
+  }
   char *execution_tag = copy_optional_environment("TRINITY_EXECUTION_ID");
-  char *http_proxy = copy_optional_environment("HTTP_PROXY");
-  char *https_proxy = copy_optional_environment("HTTPS_PROXY");
-  char *no_proxy = copy_optional_environment("NO_PROXY");
-  char *ssl_cert_file = copy_optional_environment("SSL_CERT_FILE");
-  char *ssl_cert_dir = copy_optional_environment("SSL_CERT_DIR");
-  char *node_ca = copy_optional_environment("NODE_EXTRA_CA_CERTS");
+  char *http_proxy = is_claude ? copy_optional_environment("HTTP_PROXY") : NULL;
+  char *https_proxy = is_claude ? copy_optional_environment("HTTPS_PROXY") : NULL;
+  char *no_proxy = is_claude ? copy_optional_environment("NO_PROXY") : NULL;
+  char *ssl_cert_file = is_claude ? copy_optional_environment("SSL_CERT_FILE") : NULL;
+  char *ssl_cert_dir = is_claude ? copy_optional_environment("SSL_CERT_DIR") : NULL;
+  char *node_ca = is_claude ? copy_optional_environment("NODE_EXTRA_CA_CERTS") : NULL;
 
   int ready[2];
   int release[2];
@@ -287,7 +303,7 @@ int main(int argc, char **argv) {
     if (setenv("HOME", OPERATION_HOME, 1) != 0 ||
         setenv("USER", "fc-operation", 1) != 0 ||
         setenv("LOGNAME", "fc-operation", 1) != 0 ||
-        setenv("SHELL", "/bin/false", 1) != 0 ||
+        setenv("SHELL", is_codex ? "/opt/flashcrafter/bin/codex-operation-shell" : "/bin/false", 1) != 0 ||
         setenv("TMPDIR", "/tmp", 1) != 0 ||
         setenv("LANG", "C.UTF-8", 1) != 0 ||
         setenv("PATH", "/opt/flashcrafter/bin:/usr/local/bin:/usr/bin:/bin", 1) != 0)
@@ -295,6 +311,7 @@ int main(int argc, char **argv) {
     set_optional_environment("CLAUDE_CODE_OAUTH_TOKEN", claude_oauth);
     set_optional_environment("ANTHROPIC_API_KEY", anthropic_api);
     set_optional_environment("ANTHROPIC_AUTH_TOKEN", anthropic_auth);
+    set_optional_environment("CODEX_HOME", codex_home);
     set_optional_environment("TRINITY_EXECUTION_ID", execution_tag);
     set_optional_environment("HTTP_PROXY", http_proxy);
     set_optional_environment("HTTPS_PROXY", https_proxy);
@@ -302,9 +319,7 @@ int main(int argc, char **argv) {
     set_optional_environment("SSL_CERT_FILE", ssl_cert_file);
     set_optional_environment("SSL_CERT_DIR", ssl_cert_dir);
     set_optional_environment("NODE_EXTRA_CA_CERTS", node_ca);
-    if (setgroups(0, NULL) != 0) fail("setgroups");
-    if (setresgid(OPERATION_GID, OPERATION_GID, OPERATION_GID) != 0) fail("setresgid");
-    if (setresuid(OPERATION_UID, OPERATION_UID, OPERATION_UID) != 0) fail("setresuid");
+    drop_to_operation_identity();
     execv(argv[1], &argv[1]);
     fail("execv");
   }
@@ -312,6 +327,7 @@ int main(int argc, char **argv) {
   wipe_free(claude_oauth);
   wipe_free(anthropic_api);
   wipe_free(anthropic_auth);
+  wipe_free(codex_home);
   wipe_free(execution_tag);
   wipe_free(http_proxy);
   wipe_free(https_proxy);

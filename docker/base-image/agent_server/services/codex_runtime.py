@@ -137,6 +137,7 @@ def calculate_codex_cost(
 
 _API_KEY_VARS = ("OPENAI_API_KEY", "CODEX_API_KEY")
 _AGENT_HOME = "/home/developer"
+_SEALED_CODEX_HOME = "/home/developer/.codex-attestation"
 _READ_ONLY_CONFIG = Path(_AGENT_HOME) / ".trinity" / "read-only-config.json"
 
 
@@ -651,6 +652,7 @@ class CodexRuntime(AgentRuntime):
             session_tab_resume=False,    # MVP: Session tab stays Claude/Gemini
             mcp_support=True,            # codex mcp add
             cost_reporting="estimated",  # no native cost → derived from tokens
+            sealed_operation_grant=True,
         )
 
     def is_available(self) -> bool:
@@ -735,11 +737,12 @@ class CodexRuntime(AgentRuntime):
         allowed_tools: Optional[List[str]],
         execution_id: Optional[str],
         concurrent_reader: bool = False,
+        operation_grant: Optional[str] = None,
     ) -> Tuple[str, List[ExecutionLogEntry], ExecutionMetadata, List[Dict], Optional[str]]:
         execution_id = execution_id or str(uuid.uuid4())
 
-        codex_home = _ensure_codex_home()
-        subscription_auth = _has_chatgpt_subscription_auth(codex_home)
+        codex_home = _SEALED_CODEX_HOME if operation_grant else _ensure_codex_home()
+        subscription_auth = bool(operation_grant) or _has_chatgpt_subscription_auth(codex_home)
         # ChatGPT subscription identity is authoritative when present. A stale
         # process/.env API key must never silently switch a subscription-backed
         # agent onto metered billing.
@@ -753,8 +756,9 @@ class CodexRuntime(AgentRuntime):
                 ),
             )
 
-        result_file = os.path.join(codex_home, f"{_safe_result_token(execution_id)}-last.txt")
-        sandbox_mode = _resolve_sandbox_mode()
+        result_root = "/tmp" if operation_grant else codex_home
+        result_file = os.path.join(result_root, f"{_safe_result_token(execution_id)}-last.txt")
+        sandbox_mode = "danger-full-access" if operation_grant else _resolve_sandbox_mode()
         _surface_unmapped_guardrails(allowed_tools)
         composed_prompt = _compose_prompt(system_prompt, prompt)
 
@@ -766,6 +770,16 @@ class CodexRuntime(AgentRuntime):
             resume_thread_id=resume_thread_id,
         )
         cmd.append(composed_prompt)
+        if operation_grant:
+            separator = cmd.index("--")
+            cmd[separator:separator] = [
+                "--ignore-user-config",
+                "--ignore-rules",
+                "--ephemeral",
+                "-c",
+                'approval_policy="never"',
+            ]
+            cmd = ["/usr/local/bin/trinity-task-context", "/usr/local/bin/codex", *cmd[1:]]
 
         env = {
             **os.environ,
@@ -802,12 +816,12 @@ class CodexRuntime(AgentRuntime):
             sandbox_mode, bool(resume_thread_id), model or "(default)", execution_id,
         )
 
-        # stdin=DEVNULL: the prompt is a positional arg, so Codex must not block
-        # waiting on stdin. start_new_session=True isolates the process group so
-        # cleanup signals only Codex's descendants, never sibling executions.
+        # Ordinary prompts are positional and use DEVNULL. A sealed grant is the
+        # task-context runner's single stdin record; Codex receives no stdin after
+        # the runner consumes it. start_new_session isolates this process group.
         process = subprocess.Popen(
             cmd,
-            stdin=subprocess.DEVNULL,
+            stdin=subprocess.PIPE if operation_grant else subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
@@ -819,6 +833,13 @@ class CodexRuntime(AgentRuntime):
         registry.register(
             execution_id, process, metadata={"type": "codex", "pgid": process_pgid}
         )
+        if operation_grant:
+            assert process.stdin is not None
+            try:
+                process.stdin.write(f"{operation_grant}\n")
+                process.stdin.flush()
+            finally:
+                process.stdin.close()
 
         import threading
 
@@ -936,7 +957,7 @@ class CodexRuntime(AgentRuntime):
                 raise HTTPException(status_code=status_code, detail=detail)
 
             # -o file is authoritative; JSONL parts are the fallback.
-            result_text = _read_and_consume_result_file(result_file, codex_home)
+            result_text = _read_and_consume_result_file(result_file, result_root)
             response_text = _finalize_codex_response(result_text, response_parts)
             response_text = sanitize_text(response_text)
 
@@ -956,7 +977,7 @@ class CodexRuntime(AgentRuntime):
             return response_text, execution_log, metadata, raw_messages, session_id
         finally:
             # Read-then-delete in finally — happy + error path (#1187 decision 5).
-            _safe_unlink(result_file, codex_home)
+            _safe_unlink(result_file, result_root)
             registry.unregister(execution_id)
 
     # -- public interface ------------------------------------------------------
@@ -1040,11 +1061,6 @@ class CodexRuntime(AgentRuntime):
         images: Optional[List[Dict]] = None,
         operation_grant: Optional[str] = None,
     ) -> Tuple[str, List[ExecutionLogEntry], ExecutionMetadata, Optional[str]]:
-        if operation_grant:
-            raise HTTPException(
-                status_code=422,
-                detail="Codex runtime does not support sealed operation grants",
-            )
         if not self.is_available():
             raise HTTPException(
                 status_code=503,
@@ -1069,6 +1085,7 @@ class CodexRuntime(AgentRuntime):
                 allowed_tools=allowed_tools,
                 execution_id=execution_id,
                 concurrent_reader=True,  # /api/task runs concurrently → default reader
+                operation_grant=operation_grant,
             )
         except HTTPException:
             raise

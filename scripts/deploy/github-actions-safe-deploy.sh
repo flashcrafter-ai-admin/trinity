@@ -17,17 +17,20 @@ parse_target_commit() {
 assert_exact_clean_worktree() {
     local worktree_path="$1"
     local target_commit="$2"
-    local actual_commit actual_tree target_tree drift
+    local actual_commit actual_tree target_tree drift index_flags
     actual_commit=$(git -C "$worktree_path" rev-parse HEAD)
     if [[ "$actual_commit" != "$target_commit" ]]; then
         log "Deployment worktree points to unexpected commit: $worktree_path"
         return 73
     fi
-    drift=$(git -C "$worktree_path" status --porcelain=v1 --untracked-files=all)
+    drift=$(git -C "$worktree_path" status \
+        --porcelain=v1 --untracked-files=all --ignored=matching)
+    index_flags=$(git -C "$worktree_path" ls-files -v | sed -n '/^[a-zS] /p')
     if [[ -n "$drift" ]] \
+        || [[ -n "$index_flags" ]] \
         || ! git -C "$worktree_path" diff --quiet -- \
         || ! git -C "$worktree_path" diff --cached --quiet --; then
-        log "Deployment worktree contains tracked or untracked drift: $worktree_path"
+        log "Deployment worktree contains tracked, untracked, ignored, or index-hidden drift: $worktree_path"
         return 74
     fi
     actual_tree=$(git -C "$worktree_path" write-tree)
@@ -56,6 +59,9 @@ main() {
     local env_file="${TRINITY_ENV_FILE:-$TRINITY_PRIMARY_DIR/.env}"
     local backup_dir="${TRINITY_BACKUP_DIR:-$TRINITY_PRIMARY_DIR/backups/persistent-state}"
     local compose_override="${TRINITY_COMPOSE_OVERRIDE:-}"
+    local external_snapshot_receipt="${TRINITY_EXTERNAL_DB_SNAPSHOT_RECEIPT:-}"
+    local external_snapshot_public_key="${TRINITY_EXTERNAL_DB_SNAPSHOT_PUBLIC_KEY:-}"
+    local external_snapshot_verifier="${TRINITY_EXTERNAL_DB_SNAPSHOT_VERIFY_COMMAND:-}"
     local lock_file="${TRINITY_DEPLOY_LOCK_FILE:-$deploy_root/.trinity-deploy.lock}"
     local lock_timeout="${TRINITY_DEPLOY_LOCK_TIMEOUT_SECONDS:-2100}"
 
@@ -102,11 +108,23 @@ main() {
     log "Running backup-first safe upgrade for $target_commit"
     (
         cd "$deploy_dir"
-        ./scripts/deploy/safe-upgrade.sh \
-            --project-name "$project_name" \
-            --env-file "$env_file" \
-            --backup-dir "$backup_dir" \
+        export TRINITY_EXPECTED_SOURCE_REVISION="$target_commit"
+        local upgrade_args=(
+            --project-name "$project_name"
+            --env-file "$env_file"
+            --backup-dir "$backup_dir"
             "${compose_args[@]}"
+        )
+        if [[ -n "$external_snapshot_receipt" ]]; then
+            upgrade_args+=(--external-db-snapshot-receipt "$external_snapshot_receipt")
+        fi
+        if [[ -n "$external_snapshot_public_key" ]]; then
+            upgrade_args+=(--external-db-snapshot-public-key "$external_snapshot_public_key")
+        fi
+        if [[ -n "$external_snapshot_verifier" ]]; then
+            upgrade_args+=(--external-db-snapshot-verify-command "$external_snapshot_verifier")
+        fi
+        ./scripts/deploy/safe-upgrade.sh "${upgrade_args[@]}"
     )
 
     local running_commit working_dir

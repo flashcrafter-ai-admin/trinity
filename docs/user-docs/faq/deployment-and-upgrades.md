@@ -36,7 +36,7 @@ All encrypted credentials — OAuth tokens, channel bot tokens (Slack, Telegram,
 
 ## How do I upgrade Trinity safely?
 
-Use `./scripts/deploy/safe-upgrade.sh --project-name trinity`. It backs up persistent state first, rebuilds platform services, starts them under the same compose project, waits for backend health, and prints `/api/version`. For production, pass the same `--env-file` and `-f` compose files that created the running stack. Agent containers keep running throughout; their `agent-*-workspace` volumes are backed up and preserved. See [Upgrading](../guides/deploying/upgrading.md).
+Use `./scripts/deploy/safe-upgrade.sh --project-name trinity`. It backs up persistent state first, rebuilds platform services, activates them with `--no-build`, waits for backend health, and requires `/api/version` to match the deployed commit. The governed deploy path builds from the exact Git object and rejects hidden or ignored source drift. For production, pass the same `--env-file` and `-f` compose files that created the running stack. Agent workspaces are verified and preserved. See [Upgrading](../guides/deploying/upgrading.md).
 
 ## Why should I use docker compose restart instead of down and up?
 
@@ -52,11 +52,11 @@ Only when `docker/base-image/Dockerfile` changes in the code you pulled — run 
 
 ## How do I back up my Trinity instance?
 
-Run `./scripts/deploy/backup-persistent-state.sh --project-name trinity`. It verifies a PostgreSQL dump when a compose `postgres` service exists, takes and integrity-checks an online SQLite backup otherwise, verifies backend `/data`, requires a nonempty `.env`, and verifies every `agent-*-workspace` archive. Managed PostgreSQL requires a snapshot receipt bound to the active database URL digest. Use `--output-dir /srv/trinity-backups/persistent-state` or another durable host path in production. See [Backup and Restore](../guides/deploying/backup-and-restore.md).
+Run `./scripts/deploy/backup-persistent-state.sh --project-name trinity`. It follows the backend's actual `DATABASE_URL`, proves a fresh PostgreSQL restore or an integrity-checked SQLite backup, compares backend and workspace archives to paused live sources, and validates required `.env` recovery keys. Managed PostgreSQL requires a fresh signed receipt plus root-controlled provider verification. Use a durable `--output-dir` in production. See [Backup and Restore](../guides/deploying/backup-and-restore.md).
 
 ## How often should I back up, and how long should I keep backups?
 
-Back up before every upgrade and every destructive operation, and daily on production instances via cron. The documented cron job runs `backup-persistent-state.sh`, writes a timestamped bundle, and deletes bundles older than 14 days. Verify the manifest exists and verify `postgres.dump` with `pg_restore -l` when PostgreSQL is active. See [Backup and Restore](../guides/deploying/backup-and-restore.md).
+Back up before every upgrade and every destructive operation, and daily on production instances via cron. Require `backup_complete=yes` and the source-specific restore/provider marker in `manifest.txt`; a tar listing or `pg_restore -l` alone is not recovery evidence. See [Backup and Restore](../guides/deploying/backup-and-restore.md).
 
 ## How do I restore from a backup?
 

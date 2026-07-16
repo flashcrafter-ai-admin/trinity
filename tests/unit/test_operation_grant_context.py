@@ -247,6 +247,7 @@ def test_hardened_profile_requires_exact_root_owned_runtime_boundaries(monkeypat
     )
     monkeypatch.setattr(sealed_runtime, "_REQUIRED_ARTIFACT_PATHS", frozenset({str(artifact)}))
     monkeypatch.setattr(sealed_runtime, "_SOURCE_IDENTITY_PATH", source)
+    monkeypatch.setattr(sealed_runtime, "verify_manifest", lambda _path: True)
     monkeypatch.setattr(
         sealed_runtime,
         "_boundary_valid",
@@ -265,6 +266,33 @@ def test_hardened_profile_requires_exact_root_owned_runtime_boundaries(monkeypat
     assert sealed_runtime.sealed_runtime_eligibility(
         profile_path=profile, artifact_contract_path=contract
     ).eligible is True
+
+    original_contract = contract.read_text()
+    extra = tmp_path / "unreviewed-helper"
+    extra.write_text("unreviewed helper\n")
+    extra.chmod(0o555)
+    expanded = json.loads(original_contract)
+    expanded["artifacts"].append(
+        {
+            "path": str(extra),
+            "sha256": hashlib.sha256(extra.read_bytes()).hexdigest(),
+            "mode": "0555",
+            "uid": 0,
+            "gid": 0,
+        }
+    )
+    expanded["artifacts"].sort(key=lambda row: row["path"])
+    contract.chmod(0o644)
+    contract.write_text(json.dumps(expanded))
+    contract.chmod(0o444)
+    result = sealed_runtime.sealed_runtime_eligibility(
+        profile_path=profile, artifact_contract_path=contract
+    )
+    assert result.eligible is False
+    assert result.reason == "artifact-contract"
+    contract.chmod(0o644)
+    contract.write_text(original_contract)
+    contract.chmod(0o444)
 
     artifact.chmod(0o755)
     artifact.write_text("tampered monitor\n")
@@ -321,12 +349,14 @@ def test_sealed_route_is_distinct_from_legacy_task_route():
     assert "/api/task/sealed" in paths
 
 
-def test_native_runner_is_fixed_to_claude_and_root_context_paths():
+def test_native_runner_is_fixed_to_reviewed_runtimes_and_root_context_paths():
     source = (
         Path(__file__).parents[2] / "docker/base-image/task-context-runner.c"
     ).read_text()
 
     assert '"/usr/local/bin/claude"' in source
+    assert '"/usr/local/bin/codex"' in source
+    assert '"/home/developer/.codex-attestation"' in source
     assert 'CONTEXT_ROOT "/run/trinity-task-context"' in source
     assert "setsid()" in source
     assert '"session-start"' in source
@@ -338,6 +368,19 @@ def test_native_runner_is_fixed_to_claude_and_root_context_paths():
     assert "setresuid(OPERATION_UID, OPERATION_UID, OPERATION_UID)" in source
     assert '#define OPERATION_UID 1001' in source
     assert 'set_optional_environment("CLAUDE_CODE_OAUTH_TOKEN"' in source
+    assert 'set_optional_environment("CODEX_HOME", codex_home)' in source
+    assert 'copy_optional_environment("OPENAI_API_KEY")' not in source
+    assert 'copy_optional_environment("CODEX_API_KEY")' not in source
+    assert 'is_claude ? copy_optional_environment("HTTP_PROXY") : NULL' in source
+    assert 'is_claude ? copy_optional_environment("NODE_EXTRA_CA_CERTS") : NULL' in source
+
+    verifier_start = source.index("if (verifier_pid == 0)")
+    verifier_child = source[
+        verifier_start : source.index('fail("exec verifier")', verifier_start)
+    ]
+    assert verifier_child.index("drop_to_operation_identity();") < verifier_child.index(
+        "execl(CONTEXT_VERIFIER"
+    )
 
 
 def test_public_request_masks_and_excludes_operation_grant():

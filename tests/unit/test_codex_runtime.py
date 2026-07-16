@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import subprocess
 
 import pytest
 from fastapi import HTTPException
@@ -1059,6 +1060,21 @@ class _FakePipe:
         pass
 
 
+class _FakeInputPipe:
+    def __init__(self, captured):
+        self._captured = captured
+
+    def write(self, value):
+        self._captured.append(value)
+        return len(value)
+
+    def flush(self):
+        pass
+
+    def close(self):
+        pass
+
+
 class _FakeRegistry:
     def __init__(self):
         self.registered = []
@@ -1083,6 +1099,7 @@ def _install_fake_codex(
     extra_raw_lines=(),
     wait_exc=None,
     captured_popen=None,
+    captured_stdin=None,
 ):
     """Wire codex_runtime so _execute_codex runs its real body against a fake
     subprocess. Returns the registry so the caller can assert register/unregister.
@@ -1124,6 +1141,11 @@ def _install_fake_codex(
                 [json.dumps(e) + "\n" for e in stdout_events] + list(extra_raw_lines)
             )
             self.stderr = _FakePipe([])
+            self.stdin = (
+                _FakeInputPipe(captured_stdin)
+                if captured_stdin is not None and kwargs.get("stdin") == subprocess.PIPE
+                else None
+            )
 
         def wait(self, timeout=None):
             if wait_exc is not None:
@@ -1219,6 +1241,56 @@ async def test_chatgpt_subscription_wins_and_scrubs_stray_api_keys(tmp_path, mon
     assert len(captured) == 1
     assert "OPENAI_API_KEY" not in captured[0]["env"]
     assert "CODEX_API_KEY" not in captured[0]["env"]
+
+
+@pytest.mark.asyncio
+async def test_sealed_codex_uses_native_context_runner_and_stdin_only_grant(
+    tmp_path, monkeypatch
+):
+    sealed_home = tmp_path / "sealed-codex-home"
+    sealed_home.mkdir()
+    monkeypatch.setattr(codex_runtime, "_SEALED_CODEX_HOME", str(sealed_home))
+    monkeypatch.setenv("OPENAI_API_KEY", "sk-metered-openai")
+    monkeypatch.setenv("CODEX_API_KEY", "sk-metered-codex")
+    captured = []
+    stdin = []
+    _install_fake_codex(
+        monkeypatch,
+        result_text="sealed response",
+        stdout_events=[{"type": "thread.started", "thread_id": "thr_sealed"}],
+        captured_popen=captured,
+        captured_stdin=stdin,
+    )
+    grant = f"{'a' * 96}.{'b' * 96}"
+
+    response, _, _, _, _ = await CodexRuntime()._execute_codex(
+        prompt="sealed operation",
+        model="gpt-5.6-sol",
+        system_prompt="platform boundary",
+        resume_thread_id=None,
+        timeout_seconds=30,
+        allowed_tools=["Bash"],
+        execution_id="exec_sealed_codex",
+        concurrent_reader=True,
+        operation_grant=grant,
+    )
+
+    assert response == "sealed response"
+    assert len(captured) == 1
+    invocation = captured[0]
+    assert invocation["cmd"][:2] == [
+        "/usr/local/bin/trinity-task-context",
+        "/usr/local/bin/codex",
+    ]
+    assert "--ignore-user-config" in invocation["cmd"]
+    assert "--ignore-rules" in invocation["cmd"]
+    assert "--ephemeral" in invocation["cmd"]
+    assert grant not in "\0".join(invocation["cmd"])
+    assert invocation["env"]["CODEX_HOME"] == str(sealed_home)
+    assert "OPENAI_API_KEY" not in invocation["env"]
+    assert "CODEX_API_KEY" not in invocation["env"]
+    assert all(grant not in str(value) for value in invocation["env"].values())
+    assert stdin == [f"{grant}\n"]
 
 
 @pytest.mark.asyncio

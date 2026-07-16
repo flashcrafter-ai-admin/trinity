@@ -40,9 +40,9 @@ For a running instance, prefer the bundled backup script:
 ./scripts/deploy/backup-persistent-state.sh --project-name trinity
 ```
 
-It discovers the running compose project, verifies a PostgreSQL dump when the project includes a `postgres` service, uses SQLite's online backup API and an integrity check when no PostgreSQL database is active, archives backend `/data`, verifies every `agent-*-workspace` archive, and requires a nonempty `.env` backup.
+It discovers the running compose project and selects database authority from the backend's actual `DATABASE_URL`. It restores a bundled PostgreSQL dump into a fresh temporary server, or uses SQLite's online backup API plus `PRAGMA integrity_check`. It also compares restored backend and agent-workspace archives to their paused live sources and validates all required recovery/authentication keys in `.env`.
 
-For managed PostgreSQL, first create the provider snapshot and supply a JSON receipt bound to the active database URL digest with `--external-db-snapshot-receipt`. The script rejects an external database without that receipt; `safe-upgrade.sh` will not build until the receipt or an in-bundle database backup is verified.
+For managed PostgreSQL, first create the provider snapshot. Supply its fresh Ed25519-signed v2 receipt, the root-controlled public key, and a root-controlled provider verifier with `--external-db-snapshot-receipt`, `--external-db-snapshot-public-key`, and `--external-db-snapshot-verify-command`. The verifier must independently confirm the provider snapshot and emit a fresh receipt-bound attestation. `safe-upgrade.sh` will not build without that complete evidence.
 
 Use a durable host path for production backups:
 
@@ -90,14 +90,14 @@ Store this in a secure location (password manager, encrypted storage). Never com
 
 ## Verify
 
-For backup bundles produced by `backup-persistent-state.sh`:
+For backup bundles produced by `backup-persistent-state.sh`, inspect the manifest:
 
 ```bash
-ls -lh backups/persistent-state/*/manifest.txt
-docker run --rm -v "$PWD/backups/persistent-state/<bundle>:/backup:ro" postgres:16-alpine pg_restore -l /backup/postgres.dump
+grep -E '^(backup_complete|database_source|postgres_restore_verified|sqlite_backup_verified|external_postgres_provider_verified|backend_data_live_consistency_verified|agent_workspace_live_consistency_verified|environment_semantics_verified)=' \
+  backups/persistent-state/<bundle>/manifest.txt
 ```
 
-Use the PostgreSQL verification only when the bundle contains `postgres.dump`.
+`backup_complete=yes` is mandatory. The backup command already performs a real fresh-server PostgreSQL restore; a `pg_restore -l` listing alone is not recovery evidence.
 
 ```bash
 sqlite3 ~/backups/trinity-YYYYMMDD-HHMMSS.db ".tables"

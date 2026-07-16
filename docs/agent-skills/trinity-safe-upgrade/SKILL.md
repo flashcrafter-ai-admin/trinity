@@ -13,7 +13,8 @@ Use this skill before changing a running Trinity instance that may contain work 
 - Run a persistent-state backup before changing code, images, containers, or worktrees.
 - Never run `docker compose down -v` or `docker volume rm` during a routine upgrade.
 - Do not delete or recreate agent containers as a hidden side effect. Agent recreation is an explicit follow-up, and only after a backup exists.
-- Treat external PostgreSQL as incomplete until a managed snapshot or operator-provided dump exists.
+- Treat external PostgreSQL as incomplete until a fresh Ed25519-signed snapshot receipt and a root-controlled provider verifier prove that exact snapshot exists.
+- A governed deploy must use the exact requested Git object as its build context, reject ignored/index-hidden drift, and activate with `docker compose up --no-build`.
 
 ## Standard Path
 
@@ -33,7 +34,7 @@ For production with a host env file or override compose file, pass the same inpu
   -f /path/to/host-override.yml
 ```
 
-The wrapper runs `scripts/deploy/backup-persistent-state.sh`, rebuilds platform services, starts the selected services, waits for backend health, and prints `/api/version`.
+The wrapper runs `scripts/deploy/backup-persistent-state.sh`, rebuilds platform services, starts the selected services without rebuilding, waits for backend health, and requires `/api/version` to match the exact deployed commit. The governed SSH path freezes source, compose inputs, and `.env` before build.
 
 ## Backup-Only Path
 
@@ -49,10 +50,12 @@ Use this before any destructive operation or manual migration:
 Expected evidence:
 
 - `manifest.txt` exists in the new backup bundle.
-- `postgres.dump` exists and verifies with `pg_restore -l` when bundled PostgreSQL is active.
-- `backend-data.tgz` exists when the backend container is running.
-- `agent-workspaces/*.tgz` exists for each `agent-*-workspace` volume.
-- `env.backup` exists when `.env` is present.
+- `postgres.dump` exists and was restored with `pg_restore --exit-on-error` into a fresh temporary PostgreSQL instance when bundled PostgreSQL is authoritative.
+- External PostgreSQL evidence is fresh, signature-valid, database-bound, and independently provider-verified.
+- `backend-data.tgz` exactly restores the paused live `/data` tree.
+- `agent-workspaces/*.tgz` exactly restores every discovered `agent-*-workspace` volume, and every `agent-*` container has its governed volume.
+- `env.backup` contains exactly one nonempty value for every required recovery/authentication key.
+- `manifest.txt` ends with `backup_complete=yes`; any skip option makes the bundle partial and unusable for an upgrade.
 
 ## References
 

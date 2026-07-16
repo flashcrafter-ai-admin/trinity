@@ -38,7 +38,7 @@ For production with an env file or host-specific override:
   -f /path/to/host-override.yml
 ```
 
-The wrapper runs `backup-persistent-state.sh`, rebuilds platform images, starts the platform services with the same compose project, waits for backend health, and prints `/api/version`. Agent containers are not deleted during this path; their `agent-*-workspace` volumes are backed up first and then left attached to their existing containers.
+The wrapper runs `backup-persistent-state.sh`, rebuilds platform images, starts the platform services with the same compose project and `--no-build`, waits for backend health, and requires `/api/version` to match the deployed commit. The governed SSH deploy path rejects all source drift and builds from a write-protected archive of the exact Git object. Agent containers are not deleted; their `agent-*-workspace` volumes are verified and preserved first.
 
 Use the manual procedure below only when you need to perform the same steps by hand.
 
