@@ -183,7 +183,15 @@ def test_fleet_executions_normalizes_naive(ops):
     _assert_utc_normalized(rows[0]["queued_at"])
 
 
-def test_schedules_summary_last_run_at_normalized(ops):
+def test_schedules_summary_last_run_at_normalized(ops, monkeypatch):
+    import db.schedules as schedules_mod
+
+    # Keep the fixed fixture inside the requested window as wall-clock time advances.
+    monkeypatch.setattr(
+        schedules_mod,
+        "iso_cutoff",
+        lambda _hours: "2026-07-01T00:00:00.000000Z",
+    )
     out = ops.get_agent_schedules_summary("agent-1", 168)
     row = out["schedules"][0]
     _assert_utc_normalized(row["last_run_at"])
