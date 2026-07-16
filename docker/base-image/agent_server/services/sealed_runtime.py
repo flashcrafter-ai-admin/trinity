@@ -45,6 +45,8 @@ _SUDO_PATHS = (Path("/usr/bin/sudo"), Path("/bin/sudo"))
 _REQUIRED_ARTIFACT_PATHS = frozenset(
     {
         "/etc/claude-code/managed-settings.json",
+        "/etc/trinity/codex-operation.rules",
+        "/etc/trinity/validate-codex-auth.py",
         "/etc/trinity/sealed-runtime.json",
         "/opt/flashcrafter/bin/claude-operation-runtime",
         "/opt/flashcrafter/bin/codex-operation-shell",
@@ -78,6 +80,8 @@ _REQUIRED_ARTIFACT_PATHS = frozenset(
 _REQUIRED_BOUNDARIES = (
     (_DEFAULT_PROFILE_PATH, 0o444, True),
     (_DEFAULT_ARTIFACT_CONTRACT_PATH, 0o444, True),
+    (Path("/etc/trinity/codex-operation.rules"), 0o444, True),
+    (Path("/etc/trinity/validate-codex-auth.py"), 0o444, True),
     (Path("/usr/local/bin/trinity-task-context"), 0o4555, True),
     (Path("/usr/local/bin/claude"), 0o555, True),
     (Path("/opt/flashcrafter/bin/claude-operation-runtime"), 0o555, True),

@@ -1,6 +1,6 @@
 ---
 name: trinity-safe-upgrade
-description: Use when upgrading, deploying, rolling forward, pruning, or cleaning a running Trinity instance with real state. Ensures agents preserve database data, backend /data, .env encryption keys, and agent workspace volumes before changing Docker services or worktrees.
+description: Use when upgrading, deploying, rolling forward, pruning, or cleaning a running Trinity instance with real state. Preserves the database, backend /data, every Compose named volume, .env recovery keys, and agent workspaces before changing Docker services or worktrees.
 ---
 
 # Trinity Safe Upgrade
@@ -14,7 +14,7 @@ Use this skill before changing a running Trinity instance that may contain work 
 - Never run `docker compose down -v` or `docker volume rm` during a routine upgrade.
 - Do not delete or recreate agent containers as a hidden side effect. Agent recreation is an explicit follow-up, and only after a backup exists.
 - Treat external PostgreSQL as incomplete until a fresh Ed25519-signed snapshot receipt and a root-controlled provider verifier prove that exact snapshot exists.
-- A governed deploy must use the exact requested Git object as its build context, reject ignored/index-hidden drift, and activate with `docker compose up --no-build`.
+- A governed deploy must byte-verify an extracted exact Git object, close every resolved Compose build input over that source, reject ignored/index-hidden drift, and activate with `docker compose up --no-build` from frozen runtime inputs.
 
 ## Standard Path
 
@@ -34,7 +34,7 @@ For production with a host env file or override compose file, pass the same inpu
   -f /path/to/host-override.yml
 ```
 
-The wrapper runs `scripts/deploy/backup-persistent-state.sh`, rebuilds platform services, starts the selected services without rebuilding, waits for backend health, and requires `/api/version` to match the exact deployed commit. The governed SSH path freezes source, compose inputs, and `.env` before build.
+The wrapper runs `scripts/deploy/backup-persistent-state.sh`, rebuilds platform services, starts the selected services without rebuilding, waits for backend health, and authenticates from inside the backend before requiring `/api/version` to match the full and short deployed commit. The governed SSH path freezes source, compose inputs, and `.env` before build.
 
 ## Backup-Only Path
 
@@ -53,7 +53,9 @@ Expected evidence:
 - `postgres.dump` exists and was restored with `pg_restore --exit-on-error` into a fresh temporary PostgreSQL instance when bundled PostgreSQL is authoritative.
 - External PostgreSQL evidence is fresh, signature-valid, database-bound, and independently provider-verified.
 - `backend-data.tgz` exactly restores the paused live `/data` tree.
+- `platform-volumes/*.tgz` exactly restores every named volume mounted by the Compose project, including Redis AOF, agent configuration, and log volumes; its inventory must remain stable for the entire transaction.
 - `agent-workspaces/*.tgz` exactly restores every discovered `agent-*-workspace` volume, and every `agent-*` container has its governed volume.
+- Backend, scheduler, Redis, Vector, agents, and any bundled PostgreSQL writer remain paused while their physical state is archived.
 - `env.backup` contains exactly one nonempty value for every required recovery/authentication key.
 - `manifest.txt` ends with `backup_complete=yes`; any skip option makes the bundle partial and unusable for an upgrade.
 

@@ -1,4 +1,6 @@
 import hashlib
+import os
+import stat
 import sys
 from pathlib import Path
 
@@ -18,4 +20,8 @@ def test_status_exposes_exact_sha256_without_file_contents(tmp_path):
     assert status["exists"] is True
     assert status["size"] == len(secret)
     assert status["sha256"] == hashlib.sha256(secret).hexdigest()
+    assert status["mode"] == f"{stat.S_IMODE(path.stat().st_mode):04o}"
+    assert status["uid"] == os.geteuid()
+    assert status["gid"] == os.getegid()
+    assert status["nlink"] == 1
     assert secret.decode() not in repr(status)

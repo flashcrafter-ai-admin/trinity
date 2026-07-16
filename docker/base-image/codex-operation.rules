@@ -1,0 +1,29 @@
+# A sealed Codex turn may invoke only the root-owned operation shell. The shell
+# independently accepts only exact fc-operation-skill/fc-operation-exec commands.
+prefix_rule(
+    pattern=["/opt/flashcrafter/bin/codex-operation-shell"],
+    decision="allow",
+    justification="sealed operation commands are validated by the root-owned wrapper",
+)
+
+# Fixed shell paths are always forbidden, even when the request asks for one.
+prefix_rule(
+    pattern=[
+        [
+            "/bin/bash",
+            "/usr/bin/bash",
+            "bash",
+            "/bin/sh",
+            "/usr/bin/sh",
+            "sh",
+            "/bin/dash",
+            "/usr/bin/dash",
+            "dash",
+            "/bin/zsh",
+            "/usr/bin/zsh",
+            "zsh",
+        ]
+    ],
+    decision="forbidden",
+    justification="sealed turns cannot invoke a general-purpose shell",
+)

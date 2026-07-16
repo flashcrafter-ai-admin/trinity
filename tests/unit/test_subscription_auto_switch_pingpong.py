@@ -134,7 +134,7 @@ def tmp_db(tmp_path, monkeypatch):
 
     # Force re-import so the module-level DB_PATH picks up our env var.
     for mod in ("db.connection", "db.subscriptions"):
-        sys.modules.pop(mod, None)
+        monkeypatch.delitem(sys.modules, mod, raising=False)
 
     yield db_path
 

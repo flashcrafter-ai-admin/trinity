@@ -77,8 +77,10 @@ RUN gcc -std=c11 -O2 -Wall -Wextra -Werror -fPIE -pie \
 
 RUN mkdir -p /etc/trinity
 COPY ./sealed-runtime-profile.json /etc/trinity/sealed-runtime.json
-RUN chown root:root /etc/trinity/sealed-runtime.json && \
-    chmod 0444 /etc/trinity/sealed-runtime.json
+COPY ./codex-operation.rules /etc/trinity/codex-operation.rules
+COPY ./validate-codex-auth.py /etc/trinity/validate-codex-auth.py
+RUN chown root:root /etc/trinity/sealed-runtime.json /etc/trinity/codex-operation.rules /etc/trinity/validate-codex-auth.py && \
+    chmod 0444 /etc/trinity/sealed-runtime.json /etc/trinity/codex-operation.rules /etc/trinity/validate-codex-auth.py
 
 RUN useradd -m -s /bin/bash -u 1000 developer && \
     echo "developer:developer" | chpasswd && \

@@ -36,7 +36,7 @@ All encrypted credentials — OAuth tokens, channel bot tokens (Slack, Telegram,
 
 ## How do I upgrade Trinity safely?
 
-Use `./scripts/deploy/safe-upgrade.sh --project-name trinity`. It backs up persistent state first, rebuilds platform services, activates them with `--no-build`, waits for backend health, and requires `/api/version` to match the deployed commit. The governed deploy path builds from the exact Git object and rejects hidden or ignored source drift. For production, pass the same `--env-file` and `-f` compose files that created the running stack. Agent workspaces are verified and preserved. See [Upgrading](../guides/deploying/upgrading.md).
+Use `./scripts/deploy/safe-upgrade.sh --project-name trinity`. It backs up persistent state first, rebuilds platform services, activates frozen runtime inputs with `--no-build`, waits for backend health, and authenticates before requiring `/api/version` to match the full deployed commit. The governed path byte-verifies the exact Git tree, rejects hidden/ignored drift and escaped Compose build inputs, and preserves every Compose named volume plus every agent workspace. For production, pass the same `--env-file` and `-f` compose files that created the running stack. See [Upgrading](../guides/deploying/upgrading.md).
 
 ## Why should I use docker compose restart instead of down and up?
 
@@ -52,7 +52,7 @@ Only when `docker/base-image/Dockerfile` changes in the code you pulled — run 
 
 ## How do I back up my Trinity instance?
 
-Run `./scripts/deploy/backup-persistent-state.sh --project-name trinity`. It follows the backend's actual `DATABASE_URL`, proves a fresh PostgreSQL restore or an integrity-checked SQLite backup, compares backend and workspace archives to paused live sources, and validates required `.env` recovery keys. Managed PostgreSQL requires a fresh signed receipt plus root-controlled provider verification. Use a durable `--output-dir` in production. See [Backup and Restore](../guides/deploying/backup-and-restore.md).
+Run `./scripts/deploy/backup-persistent-state.sh --project-name trinity`. It follows the backend's actual `DATABASE_URL`, proves a fresh PostgreSQL restore or an integrity-checked SQLite backup, pauses every writer, compares backend, all Compose named-volume, and all agent-workspace archives to stable live inventories, and validates required `.env` recovery keys. Managed PostgreSQL requires a fresh signed receipt plus root-controlled provider verification. Use a durable `--output-dir` in production. See [Backup and Restore](../guides/deploying/backup-and-restore.md).
 
 ## How often should I back up, and how long should I keep backups?
 
@@ -64,7 +64,7 @@ Stop the writers first — `docker compose stop backend scheduler` — to releas
 
 ## Where does Trinity actually store my data?
 
-Platform state lives either in `trinity.db` (SQLite) or in PostgreSQL when `DATABASE_URL` is set. That database holds agents, schedules, chat history, user accounts, the audit log, and encrypted channel tokens. Backend `/data` also matters because it can hold the skills-library cache and local runtime artifacts. Each agent has a durable `agent-*-workspace` Docker volume mounted at `/home/developer`; that is where runtime work survives container recreation. Redis is transient. See [Backup and Restore](../guides/deploying/backup-and-restore.md).
+Platform state lives either in `trinity.db` (SQLite) or in PostgreSQL when `DATABASE_URL` is set. That database holds agents, schedules, chat history, user accounts, the audit log, and encrypted channel tokens. Backend `/data`, Redis AOF, generated agent config, logs, and every `agent-*-workspace` volume are separate persistent surfaces and are all included in the governed backup. See [Backup and Restore](../guides/deploying/backup-and-restore.md).
 
 ## Should I use SQLite or PostgreSQL?
 
@@ -84,7 +84,7 @@ It's a Claude Code agent (from the public `trinity-ops-public` repo) for operati
 
 ## How do I verify my deployment is healthy after an upgrade or restart?
 
-Run the six-probe health check: backend (`curl http://localhost:8000/health`), scheduler (`curl http://localhost:8001/health`), frontend (expect HTTP 200), Redis (`docker exec trinity-redis redis-cli ping` → `PONG`), MCP server (`curl http://localhost:8080/health`), and Vector (`http://localhost:8686/health`). All six must pass before you declare the change complete; `./scripts/deploy/verify-platform.sh` runs them for you. After an upgrade, also check `curl http://localhost:8000/api/version` to confirm the running build matches what you deployed. See [Monitoring](../guides/deploying/monitoring.md).
+Run the six-probe health check: backend (`curl http://localhost:8000/health`), scheduler (`curl http://localhost:8001/health`), frontend (expect HTTP 200), Redis (`docker exec trinity-redis redis-cli ping` → `PONG`), MCP server (`curl http://localhost:8080/health`), and Vector (`http://localhost:8686/health`). All six must pass before you declare the change complete; `./scripts/deploy/verify-platform.sh` runs them for you. After an upgrade, rely on `safe-upgrade.sh`'s authenticated full-SHA `/api/version` check; a public or unauthenticated health response is not provenance evidence. See [Monitoring](../guides/deploying/monitoring.md).
 
 ## Why is Docker using so much CPU when I run Trinity locally on Docker Desktop?
 

@@ -1283,7 +1283,7 @@ async def test_sealed_codex_uses_native_context_runner_and_stdin_only_grant(
         "/usr/local/bin/codex",
     ]
     assert "--ignore-user-config" in invocation["cmd"]
-    assert "--ignore-rules" in invocation["cmd"]
+    assert "--ignore-rules" not in invocation["cmd"]
     assert "--ephemeral" in invocation["cmd"]
     assert grant not in "\0".join(invocation["cmd"])
     assert invocation["env"]["CODEX_HOME"] == str(sealed_home)
@@ -1291,6 +1291,24 @@ async def test_sealed_codex_uses_native_context_runner_and_stdin_only_grant(
     assert "CODEX_API_KEY" not in invocation["env"]
     assert all(grant not in str(value) for value in invocation["env"].values())
     assert stdin == [f"{grant}\n"]
+
+
+@pytest.mark.asyncio
+async def test_sealed_codex_rejects_any_model_other_than_exact_sol(tmp_path, monkeypatch):
+    monkeypatch.setattr(codex_runtime, "_SEALED_CODEX_HOME", str(tmp_path))
+    with pytest.raises(HTTPException, match="exact server-side model") as failure:
+        await CodexRuntime()._execute_codex(
+            prompt="sealed operation",
+            model="gpt-5.6",
+            system_prompt="platform boundary",
+            resume_thread_id=None,
+            timeout_seconds=30,
+            allowed_tools=["Bash"],
+            execution_id="exec_wrong_model",
+            concurrent_reader=True,
+            operation_grant=f"{'a' * 96}.{'b' * 96}",
+        )
+    assert failure.value.status_code == 422
 
 
 @pytest.mark.asyncio

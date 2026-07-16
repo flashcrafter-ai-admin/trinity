@@ -79,4 +79,14 @@ git -C "$tmp" update-index --no-assume-unchanged tracked.txt
 git -C "$tmp" restore tracked.txt
 assert_exact_clean_worktree "$tmp" "$commit"
 
+git -C "$tmp" update-index --skip-worktree tracked.txt
+printf 'hidden\n' >> "$tmp/tracked.txt"
+if assert_exact_clean_worktree "$tmp" "$commit" >/dev/null 2>&1; then
+    echo "skip-worktree source drift was accepted" >&2
+    exit 1
+fi
+git -C "$tmp" update-index --no-skip-worktree tracked.txt
+git -C "$tmp" restore tracked.txt
+assert_exact_clean_worktree "$tmp" "$commit"
+
 echo "github-actions-safe-deploy: OK"

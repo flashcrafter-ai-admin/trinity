@@ -24,6 +24,7 @@ EXTERNAL_DB_SNAPSHOT_PUBLIC_KEY=""
 EXTERNAL_DB_SNAPSHOT_VERIFY_COMMAND=""
 RESULT_FILE=""
 PAUSED_CONTAINERS=()
+REQUIRED_PAUSED_CONTAINERS=()
 POSTGRES_VERIFY_CONTAINER=""
 
 usage() {
@@ -136,20 +137,53 @@ trap 'exit 130' INT
 trap 'exit 143' TERM
 
 pause_container() {
-  local container="$1"
+  local container="$1" existing required=0
   if container_running "${container}"; then
-    docker pause "${container}" >/dev/null
-    PAUSED_CONTAINERS+=("${container}")
+    for existing in ${REQUIRED_PAUSED_CONTAINERS[*]-}; do
+      [[ "${existing}" == "${container}" ]] && required=1
+    done
+    if [[ ${required} -eq 0 ]]; then
+      REQUIRED_PAUSED_CONTAINERS+=("${container}")
+    fi
+    if [[ "$(docker inspect --format '{{.State.Paused}}' "${container}")" != true ]]; then
+      docker pause "${container}" >/dev/null
+      PAUSED_CONTAINERS+=("${container}")
+    fi
   fi
 }
 
-resume_container() {
-  local container="$1"
-  local paused paused_snapshot="${PAUSED_CONTAINERS[*]-}"
-  docker unpause "${container}" >/dev/null
-  PAUSED_CONTAINERS=()
-  for paused in ${paused_snapshot}; do
-    [[ "${paused}" == "${container}" ]] || PAUSED_CONTAINERS+=("${paused}")
+agent_volume_inventory() {
+  docker volume ls --format '{{.Name}}' | grep -E '^agent-.+-workspace$' | sort || true
+}
+
+agent_container_inventory() {
+  docker ps -a --no-trunc --format '{{.ID}} {{.Names}} {{.Image}}' \
+    | awk '$2 ~ /^agent-.+/' | sort || true
+}
+
+compose_named_volume_inventory() {
+  local container
+  while IFS= read -r container; do
+    [[ -n "${container}" ]] || continue
+    docker inspect "${container}" \
+      --format '{{range .Mounts}}{{if eq .Type "volume"}}{{println .Name}}{{end}}{{end}}'
+  done < <(docker ps -a \
+    --filter "label=com.docker.compose.project=${PROJECT_NAME}" \
+    --format '{{.Names}}') | sed '/^$/d' | sort -u
+}
+
+assert_agent_inventory_unchanged() {
+  [[ "$(agent_volume_inventory)" == "${AGENT_VOLUME_INVENTORY}" ]] \
+    || die "Agent workspace volume inventory changed during backup"
+  [[ "$(agent_container_inventory)" == "${AGENT_CONTAINER_INVENTORY}" ]] \
+    || die "Agent container inventory changed during backup"
+}
+
+assert_writers_still_paused() {
+  local container
+  for container in ${REQUIRED_PAUSED_CONTAINERS[*]-}; do
+    [[ "$(docker inspect --format '{{.State.Running}}:{{.State.Paused}}' "${container}")" == true:true ]] \
+      || die "Writer ${container} resumed or changed state during backup"
   done
 }
 
@@ -235,11 +269,6 @@ archive_volume() {
   local archive_dir="$2"
   local archive_name="$3"
 
-  local attached=()
-  while IFS= read -r container; do
-    [[ -n "${container}" ]] && attached+=("${container}")
-  done < <(docker ps --filter "volume=${volume}" --format '{{.Names}}' | sort)
-  for container in ${attached[*]-}; do pause_container "${container}"; done
   mkdir -p "${archive_dir}"
   docker run --rm \
     -v "${volume}:/source:ro" \
@@ -248,11 +277,63 @@ archive_volume() {
     sh -c 'cd /source && tar -czf "/backup/$1" .' sh "${archive_name}"
   verify_archive "${archive_dir}" "${archive_name}"
   verify_archive_against_volume "${volume}" "${archive_dir}" "${archive_name}"
-  for container in ${attached[*]-}; do resume_container "${container}"; done
+}
+
+capture_postgres_inventory() {
+  local container="$1" user="$2" database="$3" output="$4"
+  docker exec -i "${container}" sh -ec \
+    'export PGPASSWORD="$POSTGRES_PASSWORD"; exec psql -X -v ON_ERROR_STOP=1 -U "$1" -d "$2" -Atq' \
+    sh "${user}" "${database}" > "${output}" <<'SQL'
+SELECT 'column:' || encode(convert_to(jsonb_build_array(n.nspname, c.relname,
+  a.attname, a.attnum::text, pg_catalog.format_type(a.atttypid, a.atttypmod),
+  a.attnotnull::text, coalesce(pg_get_expr(d.adbin, d.adrelid), ''))::text, 'UTF8'), 'hex')
+FROM pg_catalog.pg_attribute a
+JOIN pg_catalog.pg_class c ON c.oid = a.attrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+LEFT JOIN pg_catalog.pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
+WHERE a.attnum > 0 AND NOT a.attisdropped AND c.relkind IN ('r','p')
+  AND n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname !~ '^pg_toast'
+ORDER BY n.nspname, c.relname, a.attnum;
+SELECT 'constraint:' || encode(convert_to(jsonb_build_array(n.nspname, c.relname,
+  x.conname, x.contype, pg_get_constraintdef(x.oid, true))::text, 'UTF8'), 'hex')
+FROM pg_catalog.pg_constraint x
+JOIN pg_catalog.pg_class c ON c.oid = x.conrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname !~ '^pg_toast'
+ORDER BY n.nspname, c.relname, x.conname;
+SELECT 'index:' || encode(convert_to(jsonb_build_array(n.nspname, c.relname,
+  i.relname, pg_get_indexdef(i.oid))::text, 'UTF8'), 'hex')
+FROM pg_catalog.pg_index x
+JOIN pg_catalog.pg_class c ON c.oid = x.indrelid
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+JOIN pg_catalog.pg_class i ON i.oid = x.indexrelid
+WHERE n.nspname NOT IN ('pg_catalog','information_schema') AND n.nspname !~ '^pg_toast'
+ORDER BY n.nspname, c.relname, i.relname;
+SELECT format('SELECT %L || E''\t'' || count(*)::text FROM %I.%I;',
+  'rows:' || encode(convert_to(n.nspname || '.' || c.relname, 'UTF8'), 'hex'),
+  n.nspname, c.relname)
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind IN ('r','p') AND n.nspname NOT IN ('pg_catalog','information_schema')
+  AND n.nspname !~ '^pg_toast'
+ORDER BY n.nspname, c.relname;
+\gexec
+SELECT format('SELECT %L || E''\t'' || last_value::text || E''\t'' || is_called::text FROM %I.%I;',
+  'sequence:' || encode(convert_to(n.nspname || '.' || c.relname, 'UTF8'), 'hex'),
+  n.nspname, c.relname)
+FROM pg_catalog.pg_class c
+JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+WHERE c.relkind = 'S' AND n.nspname NOT IN ('pg_catalog','information_schema')
+  AND n.nspname !~ '^pg_toast'
+ORDER BY n.nspname, c.relname;
+\gexec
+SQL
+  [[ -s "${output}" ]] || die "PostgreSQL application inventory is empty"
 }
 
 verify_postgres_dump_restore() {
   local dump="$1"
+  local source_catalog="$2"
   POSTGRES_VERIFY_CONTAINER="trinity-backup-restore-${PROJECT_NAME}-$$"
   docker run --detach --name "${POSTGRES_VERIFY_CONTAINER}" \
     --tmpfs /var/lib/postgresql/data:rw,nosuid,nodev \
@@ -271,10 +352,10 @@ verify_postgres_dump_restore() {
   docker exec -i "${POSTGRES_VERIFY_CONTAINER}" pg_restore \
     --exit-on-error --no-owner --no-privileges -U postgres -d trinity_restore < "${dump}" \
     || die "PostgreSQL dump could not be restored into a fresh database"
-  docker exec "${POSTGRES_VERIFY_CONTAINER}" psql -U postgres -d trinity_restore \
-    -Atqc 'SELECT count(*) >= 0 FROM pg_catalog.pg_class' \
-    | grep -qx t \
-    || die "Restored PostgreSQL database failed its catalog query"
+  capture_postgres_inventory "${POSTGRES_VERIFY_CONTAINER}" postgres trinity_restore \
+    "${RUN_DIR}/postgres-restore-catalog.txt"
+  cmp -s "${source_catalog}" "${RUN_DIR}/postgres-restore-catalog.txt" \
+    || die "Restored PostgreSQL catalog differs from the paused source"
   docker rm -f "${POSTGRES_VERIFY_CONTAINER}" >/dev/null
   POSTGRES_VERIFY_CONTAINER=""
 }
@@ -430,20 +511,24 @@ chmod 700 "${RUN_DIR}"
 
 MANIFEST="${RUN_DIR}/manifest.txt"
 BACKEND_CONTAINER="$(service_container backend || true)"
+SCHEDULER_CONTAINER="$(service_container scheduler || true)"
 POSTGRES_CONTAINER="$(service_container postgres || true)"
 REDIS_CONTAINER="$(service_container redis || true)"
+VECTOR_CONTAINER="$(service_container vector || true)"
+COMPOSE_NAMED_VOLUME_INVENTORY="$(compose_named_volume_inventory)"
 AGENT_WORKSPACE_VOLUMES=()
 AGENT_CONTAINERS=()
 AGENT_WORKSPACE_VOLUME_COUNT=0
 AGENT_CONTAINER_COUNT=0
 if [[ ${INCLUDE_AGENT_WORKSPACES} -eq 1 ]]; then
-  AGENT_VOLUME_INVENTORY="$(docker volume ls --format '{{.Name}}')"
+  AGENT_VOLUME_INVENTORY="$(agent_volume_inventory)"
+  AGENT_CONTAINER_INVENTORY="$(agent_container_inventory)"
   while IFS= read -r volume; do
     if [[ -n "${volume}" ]]; then
       AGENT_WORKSPACE_VOLUMES+=("${volume}")
       AGENT_WORKSPACE_VOLUME_COUNT=$((AGENT_WORKSPACE_VOLUME_COUNT + 1))
     fi
-  done < <(printf '%s\n' "${AGENT_VOLUME_INVENTORY}" | grep -E '^agent-.+-workspace$' | sort || true)
+  done < <(printf '%s\n' "${AGENT_VOLUME_INVENTORY}")
   while IFS= read -r container; do
     if [[ -n "${container}" ]]; then
       AGENT_CONTAINERS+=("${container}")
@@ -460,6 +545,9 @@ if [[ ${INCLUDE_AGENT_WORKSPACES} -eq 1 ]]; then
     [[ "${mounted_workspace}" == "${expected_volume}" ]] \
       || die "Agent container ${container} does not mount ${expected_volume} at /home/developer"
   done
+else
+  AGENT_VOLUME_INVENTORY="$(agent_volume_inventory)"
+  AGENT_CONTAINER_INVENTORY="$(agent_container_inventory)"
 fi
 
 BACKUP_SOURCE_REVISION="${TRINITY_EXPECTED_SOURCE_REVISION:-}"
@@ -477,8 +565,10 @@ fi
   echo "git_head=${BACKUP_SOURCE_REVISION}"
   echo "backup_host=$(hostname 2>/dev/null || echo unknown)"
   echo "backend_container=${BACKEND_CONTAINER:-missing}"
+  echo "scheduler_container=${SCHEDULER_CONTAINER:-missing}"
   echo "postgres_container=${POSTGRES_CONTAINER:-missing}"
   echo "redis_container=${REDIS_CONTAINER:-missing}"
+  echo "vector_container=${VECTOR_CONTAINER:-missing}"
   echo "env_file=${ENV_FILE}"
   echo "contains_secrets=$([[ ${INCLUDE_ENV} -eq 1 && -s "${ENV_FILE}" ]] && echo yes || echo no)"
   echo
@@ -501,29 +591,76 @@ if [[ ${INCLUDE_ENV} -eq 1 ]]; then
     chmod 600 "${RUN_DIR}/env.backup"
     validate_environment_file "${RUN_DIR}/env.backup"
     echo "environment_semantics_verified=yes" >> "${MANIFEST}"
+    echo "environment_backup_sha256=sha256:$(sha256_file "${RUN_DIR}/env.backup")" >> "${MANIFEST}"
     log "Copied ${ENV_FILE} to env.backup"
   else
     die "Env file is missing or empty at ${ENV_FILE}; refusing an unrecoverable credential backup"
   fi
 fi
 
+container_running "${BACKEND_CONTAINER}" \
+  || die "Backend container ${BACKEND_CONTAINER} is stopped; no consistent backup is possible"
+pause_container "${BACKEND_CONTAINER}"
+if [[ -n "${SCHEDULER_CONTAINER}" ]]; then
+  pause_container "${SCHEDULER_CONTAINER}"
+fi
+if [[ -n "${REDIS_CONTAINER}" ]]; then
+  pause_container "${REDIS_CONTAINER}"
+fi
+if [[ -n "${VECTOR_CONTAINER}" ]]; then
+  pause_container "${VECTOR_CONTAINER}"
+fi
+for container in ${AGENT_CONTAINERS[*]-}; do
+  pause_container "${container}"
+done
+assert_agent_inventory_unchanged
+assert_writers_still_paused
+echo "writer_pause_verified=yes" >> "${MANIFEST}"
+echo "paused_writer_count=${#PAUSED_CONTAINERS[@]}" >> "${MANIFEST}"
+echo "agent_volume_inventory_sha256=sha256:$(sha256_text "${AGENT_VOLUME_INVENTORY}")" >> "${MANIFEST}"
+echo "agent_container_inventory_sha256=sha256:$(sha256_text "${AGENT_CONTAINER_INVENTORY}")" >> "${MANIFEST}"
+
 DATABASE_URL="$(docker inspect "${BACKEND_CONTAINER}" --format '{{range .Config.Env}}{{println .}}{{end}}' \
   | sed -n 's/^DATABASE_URL=//p' | head -n 1)"
-[[ -n "${DATABASE_URL}" ]] || die "Backend has no DATABASE_URL; database authority is ambiguous"
+TRINITY_DB_PATH="$(docker inspect "${BACKEND_CONTAINER}" --format '{{range .Config.Env}}{{println .}}{{end}}' \
+  | sed -n 's/^TRINITY_DB_PATH=//p' | head -n 1)"
 
 DATABASE_SOURCE="sqlite"
 if [[ "${DATABASE_URL}" == postgresql://* || "${DATABASE_URL}" == postgres://* ]]; then
   require_cmd python3
-  DATABASE_HOST="$(python3 - "${DATABASE_URL}" <<'PY'
-import sys
-from urllib.parse import urlparse
-
-value = urlparse(sys.argv[1]).hostname
-if not value:
-    raise SystemExit("PostgreSQL DATABASE_URL has no host")
-print(value)
-PY
-)"
+  POSTGRES_IDENTITY=()
+  while IFS= read -r field; do
+    POSTGRES_IDENTITY+=("${field}")
+  done < <(printf '%s' "${DATABASE_URL}" | python3 -c '
+import hashlib, sys
+from urllib.parse import unquote, urlsplit
+value = urlsplit(sys.stdin.read())
+if value.scheme not in {"postgres", "postgresql"} or not value.hostname:
+    raise SystemExit("PostgreSQL DATABASE_URL is invalid")
+username = unquote(value.username or "")
+password = unquote(value.password or "")
+database = unquote(value.path[1:] if value.path.startswith("/") else "")
+port = value.port or 5432
+if not username or not password or not database or "/" in database:
+    raise SystemExit("PostgreSQL DATABASE_URL identity is incomplete")
+if any(ord(character) < 32 for field in (username, database) for character in field):
+    raise SystemExit("PostgreSQL DATABASE_URL identity is invalid")
+identity = "\0".join((value.hostname, str(port), username, database)).encode()
+print(value.hostname)
+print(port)
+print(username)
+print(database)
+print(hashlib.sha256(password.encode()).hexdigest())
+print(hashlib.sha256(identity).hexdigest())
+')
+  [[ ${#POSTGRES_IDENTITY[@]} -eq 6 ]] \
+    || die "PostgreSQL DATABASE_URL identity could not be resolved"
+  DATABASE_HOST="${POSTGRES_IDENTITY[0]}"
+  DATABASE_PORT="${POSTGRES_IDENTITY[1]}"
+  DATABASE_USER="${POSTGRES_IDENTITY[2]}"
+  DATABASE_NAME="${POSTGRES_IDENTITY[3]}"
+  DATABASE_PASSWORD_DIGEST="${POSTGRES_IDENTITY[4]}"
+  DATABASE_IDENTITY_DIGEST="${POSTGRES_IDENTITY[5]}"
   if [[ "${DATABASE_HOST}" == postgres ]]; then
     DATABASE_SOURCE="bundled-postgres"
   else
@@ -531,24 +668,60 @@ PY
   fi
 elif [[ "${DATABASE_URL}" == sqlite:* ]]; then
   DATABASE_SOURCE="sqlite"
+  SQLITE_PATH="$(printf '%s' "${DATABASE_URL}" | python3 -c '
+import sys
+from urllib.parse import unquote, urlsplit
+raw = sys.stdin.read()
+value = urlsplit(raw)
+if value.scheme != "sqlite" or value.netloc or value.query or value.fragment or not raw.startswith("sqlite:////"):
+    raise SystemExit("SQLite DATABASE_URL must name one absolute local file")
+path = unquote(raw[len("sqlite:///"):])
+if not path.startswith("/") or path.endswith("/"):
+    raise SystemExit("SQLite DATABASE_URL path is invalid")
+print(path)
+')" || die "SQLite DATABASE_URL is invalid"
+  DATABASE_IDENTITY_DIGEST="$(sha256_text "sqlite:${SQLITE_PATH}")"
+elif [[ -z "${DATABASE_URL}" ]]; then
+  SQLITE_PATH="${TRINITY_DB_PATH:-/data/trinity.db}"
+  [[ "${SQLITE_PATH}" == /* && "${SQLITE_PATH}" != */ ]] \
+    || die "Default SQLite authority must be one absolute local file"
+  DATABASE_URL="sqlite:///${SQLITE_PATH}"
+  DATABASE_IDENTITY_DIGEST="$(sha256_text "sqlite:${SQLITE_PATH}")"
 else
   die "Unsupported DATABASE_URL scheme; refusing to guess the authoritative database"
 fi
 echo "database_source=${DATABASE_SOURCE}" >> "${MANIFEST}"
+echo "database_identity_sha256=sha256:${DATABASE_IDENTITY_DIGEST}" >> "${MANIFEST}"
 
 if [[ "${DATABASE_SOURCE}" == bundled-postgres ]]; then
   [[ -n "${POSTGRES_CONTAINER}" ]] \
     || die "Backend names bundled postgres but no compose PostgreSQL container exists"
   container_running "${POSTGRES_CONTAINER}" \
     || die "PostgreSQL container ${POSTGRES_CONTAINER} is stopped; refusing an unverifiable dump"
+  POSTGRES_ENV="$(docker inspect "${POSTGRES_CONTAINER}" --format '{{range .Config.Env}}{{println .}}{{end}}')"
+  POSTGRES_USER="$(printf '%s\n' "${POSTGRES_ENV}" | sed -n 's/^POSTGRES_USER=//p' | head -n 1)"
+  POSTGRES_DB="$(printf '%s\n' "${POSTGRES_ENV}" | sed -n 's/^POSTGRES_DB=//p' | head -n 1)"
+  POSTGRES_PASSWORD="$(printf '%s\n' "${POSTGRES_ENV}" | sed -n 's/^POSTGRES_PASSWORD=//p' | head -n 1)"
+  POSTGRES_USER="${POSTGRES_USER:-postgres}"
+  POSTGRES_DB="${POSTGRES_DB:-${POSTGRES_USER}}"
+  [[ "${DATABASE_PORT}" == 5432 \
+    && "${POSTGRES_USER}" == "${DATABASE_USER}" \
+    && "${POSTGRES_DB}" == "${DATABASE_NAME}" \
+    && -n "${POSTGRES_PASSWORD}" \
+    && "$(sha256_text "${POSTGRES_PASSWORD}")" == "${DATABASE_PASSWORD_DIGEST}" ]] \
+    || die "Bundled PostgreSQL identity does not match the authoritative DATABASE_URL"
+  capture_postgres_inventory "${POSTGRES_CONTAINER}" "${POSTGRES_USER}" "${POSTGRES_DB}" \
+    "${RUN_DIR}/postgres-source-catalog.txt"
   log "Creating PostgreSQL custom-format dump from ${POSTGRES_CONTAINER}"
-  docker exec "${POSTGRES_CONTAINER}" sh -lc \
-    'export PGPASSWORD="${POSTGRES_PASSWORD:-}"; pg_dump -U "${POSTGRES_USER:-trinity}" -d "${POSTGRES_DB:-trinity}" -Fc' \
+  docker exec "${POSTGRES_CONTAINER}" sh -ec \
+    'export PGPASSWORD="$POSTGRES_PASSWORD"; exec pg_dump -U "$POSTGRES_USER" -d "$POSTGRES_DB" -Fc' \
     > "${RUN_DIR}/postgres.dump"
 
   [[ -s "${RUN_DIR}/postgres.dump" ]] || die "PostgreSQL dump is missing or empty"
-  verify_postgres_dump_restore "${RUN_DIR}/postgres.dump"
+  verify_postgres_dump_restore "${RUN_DIR}/postgres.dump" "${RUN_DIR}/postgres-source-catalog.txt"
   log "Verified postgres.dump by restoring it into a fresh PostgreSQL instance"
+  echo "postgres_dump_sha256=sha256:$(sha256_file "${RUN_DIR}/postgres.dump")" >> "${MANIFEST}"
+  echo "postgres_catalog_sha256=sha256:$(sha256_file "${RUN_DIR}/postgres-source-catalog.txt")" >> "${MANIFEST}"
   echo "postgres_dump_verified=yes" >> "${MANIFEST}"
   echo "postgres_restore_verified=yes" >> "${MANIFEST}"
 elif [[ "${DATABASE_SOURCE}" == external-postgres ]]; then
@@ -558,24 +731,68 @@ elif [[ "${DATABASE_SOURCE}" == external-postgres ]]; then
   echo "external_postgres_provider_verified=yes" >> "${MANIFEST}"
   warn "External PostgreSQL snapshot is represented by a signed, fresh, provider-verified receipt"
 else
-  log "Backend declares SQLite; taking an online SQLite backup"
+  log "Backend declares SQLite at its authoritative mounted path; taking an online backup"
   BACKEND_IMAGE="$(docker inspect "${BACKEND_CONTAINER}" --format '{{.Image}}')"
   [[ -n "${BACKEND_IMAGE}" ]] || die "Could not resolve the backend image for SQLite backup"
+  SQLITE_MOUNT=()
+  while IFS= read -r field; do
+    SQLITE_MOUNT+=("${field}")
+  done < <(docker inspect "${BACKEND_CONTAINER}" --format '{{json .Mounts}}' \
+    | python3 -c '
+import hashlib, json, os, sys
+path = os.path.normpath(sys.argv[1])
+mounts = json.load(sys.stdin)
+candidates = []
+for mount in mounts:
+    destination = os.path.normpath(mount.get("Destination", ""))
+    if mount.get("Type") not in {"bind", "volume"} or not destination.startswith("/"):
+        continue
+    if path == destination or path.startswith(destination.rstrip("/") + "/"):
+        candidates.append((len(destination), mount, destination))
+if not candidates:
+    raise SystemExit("SQLite database is not under a persistent backend mount")
+_, mount, destination = max(candidates, key=lambda item: item[0])
+identity = "\0".join((mount["Type"], destination, mount.get("Name") or mount.get("Source") or "")).encode()
+print(destination)
+print(hashlib.sha256(identity).hexdigest())
+' "${SQLITE_PATH}")
+  [[ ${#SQLITE_MOUNT[@]} -eq 2 ]] \
+    || die "SQLite database mount authority could not be resolved"
+  echo "sqlite_path=${SQLITE_PATH}" >> "${MANIFEST}"
+  echo "sqlite_mount_destination=${SQLITE_MOUNT[0]}" >> "${MANIFEST}"
+  echo "sqlite_mount_identity_sha256=sha256:${SQLITE_MOUNT[1]}" >> "${MANIFEST}"
   docker run --rm \
     --volumes-from "${BACKEND_CONTAINER}:ro" \
     -v "${RUN_DIR}:/backup" \
     --user root \
     --entrypoint python3 \
     "${BACKEND_IMAGE}" \
-    -c 'import sqlite3; source=sqlite3.connect("file:/data/trinity.db?mode=ro", uri=True); target=sqlite3.connect("/backup/trinity.db"); source.backup(target); target.close(); source.close()'
+    -c 'import sqlite3,sys,urllib.parse; path=urllib.parse.quote(sys.argv[1], safe="/"); source=sqlite3.connect(f"file:{path}?mode=ro", uri=True); target=sqlite3.connect(sys.argv[2]); source.backup(target); target.close(); source.close()' \
+    "${SQLITE_PATH}" /backup/trinity.db
   [[ -s "${RUN_DIR}/trinity.db" ]] || die "SQLite online backup is missing or empty"
-  docker run --rm \
-    -v "${RUN_DIR}:/backup:ro" \
-    --user root \
-    --entrypoint python3 \
-    "${BACKEND_IMAGE}" \
-    -c 'import sqlite3,sys; db=sqlite3.connect("file:/backup/trinity.db?mode=ro", uri=True); result=db.execute("PRAGMA integrity_check").fetchone(); db.close(); sys.exit(0 if result == ("ok",) else 1)' \
-    || die "SQLite online backup failed PRAGMA integrity_check"
+  SQLITE_FINGERPRINT_PROGRAM='import hashlib,json,sqlite3,sys,urllib.parse
+path=urllib.parse.quote(sys.argv[1], safe="/")
+db=sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+if db.execute("PRAGMA integrity_check").fetchone() != ("ok",): raise SystemExit("integrity")
+tables=db.execute("SELECT name,coalesce(sql,\"\") FROM sqlite_master WHERE type=\"table\" AND name NOT LIKE \"sqlite_%\" ORDER BY name").fetchall()
+if not tables: raise SystemExit("empty catalog")
+rows=[]
+for name,sql in tables:
+    quoted=name.replace("\"", "\"\"")
+    rows.append([name,sql,db.execute(f"SELECT count(*) FROM \"{quoted}\"").fetchone()[0]])
+db.close()
+payload=json.dumps(rows,sort_keys=True,separators=(",",":" )).encode()
+print(hashlib.sha256(payload).hexdigest(),len(rows))'
+  read -r SQLITE_SOURCE_FINGERPRINT SQLITE_SOURCE_TABLES < <(docker run --rm \
+    --volumes-from "${BACKEND_CONTAINER}:ro" --user root --entrypoint python3 \
+    "${BACKEND_IMAGE}" -c "${SQLITE_FINGERPRINT_PROGRAM}" "${SQLITE_PATH}")
+  read -r SQLITE_BACKUP_FINGERPRINT SQLITE_BACKUP_TABLES < <(docker run --rm \
+    -v "${RUN_DIR}:/backup:ro" --user root --entrypoint python3 \
+    "${BACKEND_IMAGE}" -c "${SQLITE_FINGERPRINT_PROGRAM}" /backup/trinity.db)
+  [[ "${SQLITE_SOURCE_FINGERPRINT}" == "${SQLITE_BACKUP_FINGERPRINT}" \
+    && "${SQLITE_SOURCE_TABLES}" == "${SQLITE_BACKUP_TABLES}" \
+    && "${SQLITE_SOURCE_TABLES}" -gt 0 ]] \
+    || die "SQLite backup schema/table counts differ from the paused source"
   docker run --rm \
     -v "${RUN_DIR}:/backup" \
     alpine:3.20 \
@@ -584,12 +801,14 @@ else
   docker run --rm -v "${RUN_DIR}:/backup:ro" alpine:3.20 \
     tar -tzf /backup/sqlite-data.tgz trinity.db >/dev/null \
     || die "SQLite backup does not contain trinity.db"
+  echo "sqlite_backup_sha256=sha256:$(sha256_file "${RUN_DIR}/trinity.db")" >> "${MANIFEST}"
+  echo "sqlite_content_fingerprint_sha256=sha256:${SQLITE_BACKUP_FINGERPRINT}" >> "${MANIFEST}"
+  echo "sqlite_application_tables=${SQLITE_BACKUP_TABLES}" >> "${MANIFEST}"
   echo "sqlite_backup_verified=yes" >> "${MANIFEST}"
 fi
 
 if [[ ${INCLUDE_BACKEND_DATA} -eq 1 ]]; then
   log "Archiving backend /data mount"
-  pause_container "${BACKEND_CONTAINER}"
   docker run --rm \
     --volumes-from "${BACKEND_CONTAINER}:ro" \
     -v "${RUN_DIR}:/backup" \
@@ -609,10 +828,38 @@ if [[ ${INCLUDE_BACKEND_DATA} -eq 1 ]]; then
       test "$source_digest" = "$restore_digest"
     ' \
     || die "Backend data archive does not exactly restore the paused /data mount"
-  resume_container "${BACKEND_CONTAINER}"
   echo "backend_data_verified=yes" >> "${MANIFEST}"
   echo "backend_data_live_consistency_verified=yes" >> "${MANIFEST}"
+  echo "backend_data_sha256=sha256:$(sha256_file "${RUN_DIR}/backend-data.tgz")" >> "${MANIFEST}"
 fi
+
+if [[ -n "${POSTGRES_CONTAINER}" ]]; then
+  pause_container "${POSTGRES_CONTAINER}"
+fi
+assert_writers_still_paused
+
+PLATFORM_ARCHIVE_DIR="${RUN_DIR}/platform-volumes"
+mkdir -p "${PLATFORM_ARCHIVE_DIR}"
+platform_volume_count=0
+for volume in ${COMPOSE_NAMED_VOLUME_INVENTORY[*]-}; do
+  archive_volume "${volume}" "${PLATFORM_ARCHIVE_DIR}" "${volume}.tgz"
+  platform_volume_count=$((platform_volume_count + 1))
+done
+[[ "$(compose_named_volume_inventory)" == "${COMPOSE_NAMED_VOLUME_INVENTORY}" ]] \
+  || die "Compose named-volume inventory changed during backup"
+: > "${RUN_DIR}/platform-volumes.sha256"
+for archive in "${PLATFORM_ARCHIVE_DIR}"/*.tgz; do
+  [[ -e "${archive}" ]] || continue
+  printf '%s  %s\n' "$(sha256_file "${archive}")" "$(basename "${archive}")" \
+    >> "${RUN_DIR}/platform-volumes.sha256"
+done
+[[ "$(wc -l < "${RUN_DIR}/platform-volumes.sha256" | tr -d ' ')" -eq ${platform_volume_count} ]] \
+  || die "Compose named-volume digest inventory is incomplete"
+echo "platform_volume_archives=${platform_volume_count}" >> "${MANIFEST}"
+echo "platform_volume_inventory_sha256=sha256:$(sha256_text "${COMPOSE_NAMED_VOLUME_INVENTORY}")" >> "${MANIFEST}"
+echo "platform_volume_digest_inventory_sha256=sha256:$(sha256_file "${RUN_DIR}/platform-volumes.sha256")" >> "${MANIFEST}"
+echo "platform_volume_archives_verified=yes" >> "${MANIFEST}"
+echo "platform_volume_inventory_stable=yes" >> "${MANIFEST}"
 
 if [[ ${INCLUDE_AGENT_WORKSPACES} -eq 1 ]]; then
   log "Archiving agent workspace volumes"
@@ -628,6 +875,15 @@ if [[ ${INCLUDE_AGENT_WORKSPACES} -eq 1 ]]; then
     || die "Agent workspace archive inventory changed during backup"
   [[ ${agent_count} -ge ${AGENT_CONTAINER_COUNT} ]] \
     || die "Agent workspace archives do not cover every live agent container"
+  : > "${RUN_DIR}/agent-workspaces.sha256"
+  for archive in "${AGENT_ARCHIVE_DIR}"/*.tgz; do
+    [[ -e "${archive}" ]] || continue
+    printf '%s  %s\n' "$(sha256_file "${archive}")" "$(basename "${archive}")" \
+      >> "${RUN_DIR}/agent-workspaces.sha256"
+  done
+  [[ "$(wc -l < "${RUN_DIR}/agent-workspaces.sha256" | tr -d ' ')" -eq ${agent_count} ]] \
+    || die "Agent workspace digest inventory is incomplete"
+  echo "agent_workspace_digest_inventory_sha256=sha256:$(sha256_file "${RUN_DIR}/agent-workspaces.sha256")" >> "${MANIFEST}"
   echo "agent_workspace_archives_verified=yes" >> "${MANIFEST}"
   echo "agent_workspace_live_consistency_verified=yes" >> "${MANIFEST}"
   log "Archived ${agent_count} agent workspace volume(s)"
@@ -636,6 +892,20 @@ fi
 if [[ -n "${REDIS_CONTAINER}" ]]; then
   echo "redis_container_present=yes" >> "${MANIFEST}"
 fi
+
+assert_agent_inventory_unchanged
+assert_writers_still_paused
+echo "agent_inventory_stable=yes" >> "${MANIFEST}"
+
+ARTIFACT_INVENTORY="${RUN_DIR}/backup-artifacts.sha256"
+: > "${ARTIFACT_INVENTORY}"
+while IFS= read -r artifact; do
+  relative="${artifact#${RUN_DIR}/}"
+  printf '%s  %s\n' "$(sha256_file "${artifact}")" "${relative}" >> "${ARTIFACT_INVENTORY}"
+done < <(find "${RUN_DIR}" -type f ! -name manifest.txt ! -name backup-artifacts.sha256 | sort)
+[[ -s "${ARTIFACT_INVENTORY}" ]] || die "Backup artifact digest inventory is empty"
+echo "artifact_inventory_sha256=sha256:$(sha256_file "${ARTIFACT_INVENTORY}")" >> "${MANIFEST}"
+echo "artifact_inventory_verified=yes" >> "${MANIFEST}"
 
 du -sh "${RUN_DIR}" | awk '{print "backup_size=" $1}' >> "${MANIFEST}"
 BACKUP_COMPLETE=0

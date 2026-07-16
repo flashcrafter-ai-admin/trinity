@@ -2,7 +2,7 @@
 
 ## Summary
 
-Trinity upgrades must preserve the operator's work before changing code or containers. The durable state is not just the application database: agent runtime work lives in `agent-*-workspace` Docker volumes, backend runtime artifacts live in `/data`, and encrypted credentials are unrecoverable without the `.env` encryption key.
+Trinity upgrades must preserve the operator's work before changing code or containers. Durable state includes the application database, every Compose named volume, agent runtime work in `agent-*-workspace` volumes, backend `/data`, and the `.env` recovery keys.
 
 ## State Model
 
@@ -13,7 +13,7 @@ Trinity upgrades must preserve the operator's work before changing code or conta
 | Credential encryption key and secrets | `.env` on host | Copy into chmod 600 `env.backup` |
 | Skills/library runtime cache | backend `/data` | Archive `backend-data.tgz` |
 | Agent runtime work | `agent-*-workspace` volumes mounted at `/home/developer` | Archive each volume to `agent-workspaces/*.tgz` |
-| Redis | `trinity_redis-data` | Not authoritative; regenerate sessions/counters |
+| Compose-managed state | Every named volume mounted by the project, including Redis AOF, agent config, logs, and bundled DB storage | Pause all writers, archive each to `platform-volumes/*.tgz`, compare to the paused source, and prove inventory stability |
 | Platform images | Docker image cache | Rebuild from source |
 
 ## Upgrade Flow
@@ -25,10 +25,10 @@ flowchart TD
   C --> D["Freeze exact Git object, compose inputs, and env"]
   D --> E["Run backup-persistent-state.sh"]
   E --> F["Verify complete recoverable bundle"]
-  F --> G["Build from read-only exact-commit source"]
+  F --> G["Byte-verify exact Git tree and close Compose build inputs"]
   G --> H["docker compose up --no-build"]
   H --> I["Backend /health passes"]
-  I --> J["/api/version exactly matches target commit"]
+  I --> J["Authenticate and bind /api/version to exact target commit"]
 ```
 
 ## Invariants
@@ -39,8 +39,9 @@ flowchart TD
 - Agent containers are not removed as part of a platform upgrade. If the agent base image changes, recreate only after a persistent-state backup exists.
 - External PostgreSQL requires a fresh signed receipt bound to the active `DATABASE_URL` digest plus a fresh attestation from a root-controlled provider verifier; a backup bundle without both is incomplete.
 - The upgrade path has no backup-bypass option. Only an explicitly confirmed first install with no existing project containers or volumes may proceed without a backup.
-- A completed bundle must contain all required recovery/authentication keys, a byte-equivalent restored backend archive, complete byte-equivalent agent-workspace archives, and exactly one restored or provider-verified authoritative database artifact before any image build starts.
-- Governed builds reject tracked, untracked, ignored, assume-unchanged, and skip-worktree drift. Compose builds read a write-protected `git archive` of the exact commit and activation uses `--no-build`.
+- A completed bundle must contain all required recovery/authentication keys, a byte-equivalent restored backend archive, complete byte-equivalent Compose-volume and agent-workspace archives from stable inventories, and exactly one restored or provider-verified authoritative database artifact before any image build starts.
+- Backend, scheduler, Redis, Vector, agent containers, and bundled PostgreSQL are paused whenever their physical state is copied.
+- Governed builds reject tracked, untracked, ignored, assume-unchanged, and skip-worktree drift. Compose builds use a byte-verified extraction of the exact Git object, reject local or mutable build inputs outside it, and activate those frozen runtime inputs with `--no-build`.
 - Automated deploy credentials are least-privilege: Tailscale access is tag-scoped to a dedicated OpenSSH port, SSH host identity is pinned, and the deploy key is restricted to `deploy <40-character SHA>`.
 - Concurrent deploys serialize through a host lock and are never cancelled mid-upgrade.
 

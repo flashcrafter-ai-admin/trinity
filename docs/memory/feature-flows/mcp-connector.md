@@ -45,13 +45,15 @@ the public repo and the entitlement gate was dropped front and back. Part B
   bound `agent_name`. It is rejected by the central MCP validation surface and may
   reach only `POST /{agent}/task/sealed`. That route adds a body-aware fail-closed
   gate: it requires one exact signed operation grant, synchronous execution,
-  `Bash` as the only tool, bounded turns, an idempotency key, and no session, file,
-  model, prompt, timeout, result-injection, or caller-attribution headers. The
+  `Bash` as the only tool, bounded turns, an idempotency key bound to the exact raw
+  request digest, and no session, file, model, prompt, timeout, result-injection,
+  or caller-attribution headers. The
   backend dispatches only to the agent's dedicated internal `/api/task/sealed`
   endpoint, which is absent from legacy images and has no fallback to the ordinary
   task endpoint. Sealed request keys and primitive types are checked before
   Pydantic normalization, and execution stops before persistence if the required
-  idempotency claim cannot be established.
+  idempotency claim cannot be established. The server pins sealed Codex work to
+  `gpt-5.6-sol`; callers cannot select or downgrade the model.
 - **Allow-list** (`enterprise_connectors.exposed_playbooks`, JSON array; NULL ⇒ all
   `user_invocable`): `resolve_exposed_playbooks` drops `user_invocable:false`
   unconditionally (even if explicitly listed); `automation:gated` is passed through

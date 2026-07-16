@@ -42,6 +42,8 @@ ENV_FILE_SOURCE_DIGEST=""
 DOCKER_COMMAND=""
 COMPOSE_PROCESS_ENV=()
 COMPOSE_STATE_ROOT=""
+RUNTIME_PROJECT_ROOT=""
+RUNTIME_DATA_PATH=""
 
 usage() {
   cat <<'EOF'
@@ -297,10 +299,22 @@ prepare_immutable_release_inputs() {
   local config_root="${IMMUTABLE_RELEASE_ROOT}/config"
   local archive="${IMMUTABLE_RELEASE_ROOT}/source.tar"
   mkdir -p "${source_root}" "${config_root}"
-  git -C "${PROJECT_ROOT}" archive --format=tar \
+  local -a release_tool_environment=(
+    env -i
+    "PATH=/usr/local/bin:/usr/bin:/bin"
+    "HOME=${config_root}"
+    "TMPDIR=/tmp"
+    "LANG=C.UTF-8"
+    "LC_ALL=C.UTF-8"
+    "GIT_CONFIG_NOSYSTEM=1"
+  )
+  "${release_tool_environment[@]}" git -C "${PROJECT_ROOT}" archive --format=tar \
     --output="${archive}" "${EXPECTED_SOURCE_REVISION}"
-  tar -xf "${archive}" -C "${source_root}"
+  "${release_tool_environment[@]}" tar -xf "${archive}" -C "${source_root}"
   rm -f "${archive}"
+  "${release_tool_environment[@]}" python3 \
+    "${PROJECT_ROOT}/scripts/deploy/verify-exact-git-tree.py" \
+    "${PROJECT_ROOT}" "${EXPECTED_SOURCE_REVISION}" "${source_root}"
   IMMUTABLE_BUILD_SOURCE_ROOT="${source_root}"
 
   BUILD_COMPOSE_FILES=()
@@ -313,7 +327,7 @@ prepare_immutable_release_inputs() {
       [[ -f "${frozen}" && ! -L "${frozen}" ]] \
         || die "Governed compose file is absent from the exact Git object: ${relative}"
       BUILD_COMPOSE_FILES+=("${frozen}")
-      RUNTIME_COMPOSE_FILES+=("${compose_file}")
+      RUNTIME_COMPOSE_FILES+=("${frozen}")
     else
       [[ ${index} -gt 0 ]] \
         || die "The first governed compose file must come from the exact Git object"
@@ -350,11 +364,27 @@ prepare_immutable_release_inputs() {
   log "Prepared exact-commit build source ${EXPECTED_SOURCE_REVISION} (sha256:${IMMUTABLE_SOURCE_DIGEST})"
 }
 
+validate_compose_build_inputs() {
+  local project_root="$1"
+  shift
+  compose_execute "${project_root}" "$@" config --format json \
+    | python3 "${project_root}/scripts/deploy/validate-compose-build-inputs.py" \
+      "${project_root}" \
+    || die "Compose build inputs are not closed over the exact release source"
+}
+
 if git -C "${PROJECT_ROOT}" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
-  export GIT_COMMIT="${GIT_COMMIT:-$(git -C "${PROJECT_ROOT}" rev-parse HEAD)}"
-  export GIT_COMMIT_SUBJECT="${GIT_COMMIT_SUBJECT:-$(git -C "${PROJECT_ROOT}" log -1 --pretty=%s)}"
-  export GIT_COMMIT_TIMESTAMP="${GIT_COMMIT_TIMESTAMP:-$(git -C "${PROJECT_ROOT}" log -1 --pretty=%cI)}"
-  export GIT_BRANCH="${GIT_BRANCH:-$(git -C "${PROJECT_ROOT}" symbolic-ref --short -q HEAD || git -C "${PROJECT_ROOT}" name-rev --name-only --no-undefined HEAD 2>/dev/null || git -C "${PROJECT_ROOT}" rev-parse --short HEAD)}"
+  if [[ -n "${EXPECTED_SOURCE_REVISION}" ]]; then
+    export GIT_COMMIT="${EXPECTED_SOURCE_REVISION}"
+    export GIT_COMMIT_SUBJECT="$(git -C "${PROJECT_ROOT}" log -1 --format=%s "${EXPECTED_SOURCE_REVISION}")"
+    export GIT_COMMIT_TIMESTAMP="$(git -C "${PROJECT_ROOT}" log -1 --format=%cI "${EXPECTED_SOURCE_REVISION}")"
+    export GIT_BRANCH="detached-${EXPECTED_SOURCE_REVISION:0:8}"
+  else
+    export GIT_COMMIT="${GIT_COMMIT:-$(git -C "${PROJECT_ROOT}" rev-parse HEAD)}"
+    export GIT_COMMIT_SUBJECT="${GIT_COMMIT_SUBJECT:-$(git -C "${PROJECT_ROOT}" log -1 --pretty=%s)}"
+    export GIT_COMMIT_TIMESTAMP="${GIT_COMMIT_TIMESTAMP:-$(git -C "${PROJECT_ROOT}" log -1 --pretty=%cI)}"
+    export GIT_BRANCH="${GIT_BRANCH:-$(git -C "${PROJECT_ROOT}" symbolic-ref --short -q HEAD || git -C "${PROJECT_ROOT}" name-rev --name-only --no-undefined HEAD 2>/dev/null || git -C "${PROJECT_ROOT}" rev-parse --short HEAD)}"
+  fi
 fi
 export BUILD_DATE="${BUILD_DATE:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 DOCKER_COMMAND="$(command -v docker || true)"
@@ -399,15 +429,25 @@ if [[ -n "${ENV_FILE}" ]]; then
   [[ -f "${ENV_FILE}" ]] || die "Environment file does not exist: ${ENV_FILE}"
 fi
 
+RUNTIME_DATA_PATH="${PROJECT_ROOT}/trinity-data"
+if [[ -n "${ENV_FILE}" ]]; then
+  configured_data_path="$(sed -n 's/^TRINITY_DATA_PATH=//p' "${ENV_FILE}" | tail -n 1)"
+  if [[ -n "${configured_data_path}" ]]; then
+    RUNTIME_DATA_PATH="$(absolute_path "${configured_data_path}")"
+  fi
+fi
+COMPOSE_PROCESS_ENV+=("TRINITY_DATA_PATH=${RUNTIME_DATA_PATH}")
+
 if [[ -n "${EXPECTED_SOURCE_REVISION}" ]]; then
   prepare_immutable_release_inputs
 else
   BUILD_COMPOSE_FILES=("${COMPOSE_FILES[@]}")
   RUNTIME_COMPOSE_FILES=("${COMPOSE_FILES[@]}")
 fi
+RUNTIME_PROJECT_ROOT="${IMMUTABLE_BUILD_SOURCE_ROOT:-${PROJECT_ROOT}}"
 
 COMPOSE_ARGS=(-p "${PROJECT_NAME}")
-COMPOSE_ARGS+=(--project-directory "${PROJECT_ROOT}")
+COMPOSE_ARGS+=(--project-directory "${RUNTIME_PROJECT_ROOT}")
 if [[ -n "${ENV_FILE}" ]]; then
   COMPOSE_ARGS+=(--env-file "${ENV_FILE}")
 fi
@@ -424,18 +464,19 @@ for compose_file in "${BUILD_COMPOSE_FILES[@]}"; do
   BUILD_COMPOSE_ARGS+=(-f "${compose_file}")
 done
 
+if [[ -n "${EXPECTED_SOURCE_REVISION}" ]]; then
+  validate_compose_build_inputs "${IMMUTABLE_BUILD_SOURCE_ROOT}" "${BUILD_COMPOSE_ARGS[@]}"
+  assert_immutable_release_inputs
+fi
+
 docker info >/dev/null 2>&1 || die "Docker is not running"
 
 existing_containers="$(docker ps -a --filter "label=com.docker.compose.project=${PROJECT_NAME}" --format '{{.Names}}' || true)"
 existing_volumes="$(docker volume ls --format '{{.Name}}' | grep -E "^${PROJECT_NAME}_" || true)"
 existing_agent_workspaces="$(docker volume ls --format '{{.Name}}' | grep -E '^agent-.+-workspace$' || true)"
-configured_data_path=""
-if [[ -n "${ENV_FILE}" && -f "${ENV_FILE}" ]]; then
-  configured_data_path="$(sed -n 's/^TRINITY_DATA_PATH=//p' "${ENV_FILE}" | tail -n 1)"
-fi
 existing_configured_data=""
-if [[ -n "${configured_data_path}" && -e "${configured_data_path}" ]]; then
-  existing_configured_data="${configured_data_path}"
+if [[ -e "${RUNTIME_DATA_PATH}" ]]; then
+  existing_configured_data="${RUNTIME_DATA_PATH}"
 fi
 FRESH_INSTALL=0
 if [[ -z "${existing_containers}${existing_volumes}${existing_agent_workspaces}${existing_configured_data}" && ${ALLOW_FRESH} -eq 0 ]]; then
@@ -446,7 +487,7 @@ if [[ -z "${existing_containers}${existing_volumes}${existing_agent_workspaces}$
 fi
 
 assert_immutable_release_inputs
-COMPOSE_SERVICES="$(compose_execute "${PROJECT_ROOT}" "${COMPOSE_ARGS[@]}" config --services)"
+COMPOSE_SERVICES="$(compose_execute "${RUNTIME_PROJECT_ROOT}" "${COMPOSE_ARGS[@]}" config --services)"
 assert_immutable_release_inputs
 assert_governed_source
 
@@ -517,6 +558,18 @@ if [[ ${FRESH_INSTALL} -eq 0 ]]; then
       || die "Backup did not compare agent workspaces with paused live sources"
     grep -qx 'environment_semantics_verified=yes' "${BACKUP_MANIFEST}" \
       || die "Backup did not validate required environment keys"
+    grep -qx 'writer_pause_verified=yes' "${BACKUP_MANIFEST}" \
+      || die "Backup did not hold every application writer paused"
+    grep -qx 'agent_inventory_stable=yes' "${BACKUP_MANIFEST}" \
+      || die "Backup did not prove stable agent container/workspace coverage"
+    grep -qx 'artifact_inventory_verified=yes' "${BACKUP_MANIFEST}" \
+      || die "Backup did not produce a verified artifact digest inventory"
+    grep -qx 'platform_volume_archives_verified=yes' "${BACKUP_MANIFEST}" \
+      || die "Backup did not verify every Compose named-volume archive"
+    grep -qx 'platform_volume_inventory_stable=yes' "${BACKUP_MANIFEST}" \
+      || die "Backup did not prove stable Compose named-volume coverage"
+    grep -Eq '^database_identity_sha256=sha256:[0-9a-f]{64}$' "${BACKUP_MANIFEST}" \
+      || die "Backup did not bind the authoritative database identity"
     if grep -qx 'database_source=bundled-postgres' "${BACKUP_MANIFEST}"; then
       grep -qx 'postgres_dump_verified=yes' "${BACKUP_MANIFEST}" \
         && grep -qx 'postgres_restore_verified=yes' "${BACKUP_MANIFEST}" \
@@ -562,7 +615,7 @@ fi
 
 assert_governed_source
 assert_immutable_release_inputs
-run_compose "${PROJECT_ROOT}" "${COMPOSE_ARGS[@]}" up --no-build -d "${TARGET_SERVICES[@]}"
+run_compose "${RUNTIME_PROJECT_ROOT}" "${COMPOSE_ARGS[@]}" up --no-build -d "${TARGET_SERVICES[@]}"
 
 if [[ ${DRY_RUN} -eq 1 ]]; then
   log "Dry run complete"
@@ -579,14 +632,41 @@ done
 curl -fsS http://127.0.0.1:8000/health >/dev/null || die "Backend health check failed"
 
 backend_container="$(service_container backend || true)"
-if [[ -n "${backend_container}" ]]; then
-  backend_status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' "${backend_container}")"
-  log "Backend container health: ${backend_status}"
-fi
+[[ -n "${backend_container}" ]] || die "Running backend container was not found"
+backend_status="$(docker inspect -f '{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}' "${backend_container}")"
+log "Backend container health: ${backend_status}"
 
 VERSION_RESULT="$(mktemp)"
-curl -fsS http://127.0.0.1:8000/api/version >"${VERSION_RESULT}" \
-  || die "Version endpoint was not reachable"
+docker exec -i "${backend_container}" python3 - >"${VERSION_RESULT}" <<'PY' \
+  || die "Authenticated version endpoint verification failed"
+import json
+import os
+import urllib.parse
+import urllib.request
+
+password = os.environ.get("ADMIN_PASSWORD", "")
+username = os.environ.get("ADMIN_USERNAME", "admin")
+if not password or not username:
+    raise SystemExit("backend admin authentication is unavailable")
+login = urllib.request.Request(
+    "http://127.0.0.1:8000/token",
+    data=urllib.parse.urlencode({"username": username, "password": password}).encode(),
+    headers={"Content-Type": "application/x-www-form-urlencoded"},
+    method="POST",
+)
+with urllib.request.urlopen(login, timeout=15) as response:
+    token_payload = json.load(response)
+token = token_payload.get("access_token") if isinstance(token_payload, dict) else None
+if not isinstance(token, str) or not token:
+    raise SystemExit("backend did not issue an authentication token")
+version = urllib.request.Request(
+    "http://127.0.0.1:8000/api/version",
+    headers={"Authorization": f"Bearer {token}"},
+)
+with urllib.request.urlopen(version, timeout=15) as response:
+    payload = json.load(response)
+print(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+PY
 [[ -s "${VERSION_RESULT}" ]] || die "Version endpoint returned an empty response"
 command -v jq >/dev/null 2>&1 || die "jq is required to verify the version endpoint"
 jq -e --arg commit "${GIT_COMMIT}" --arg short "${GIT_COMMIT:0:8}" '

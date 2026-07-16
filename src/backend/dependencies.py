@@ -1,6 +1,7 @@
 """
 FastAPI dependencies for the Trinity backend.
 """
+import hashlib
 import json
 import logging
 import re
@@ -683,6 +684,7 @@ def parse_sealed_task_wire(raw_body: bytes) -> ParallelTaskRequest:
     except (UnicodeDecodeError, ValueError, TypeError, ValidationError):
         _reject_sealed_task_wire()
 
+    request.operation_request_digest = hashlib.sha256(raw_body).hexdigest()
     sealed_grant = request.operation_grant
     operation_grant = sealed_grant.get_secret_value() if sealed_grant else ""
     if (
@@ -752,6 +754,8 @@ def _enforce_sealed_executor_task_request(
         or "\r" in normalized_idempotency_key
         or "\n" in normalized_idempotency_key
         or not normalized_idempotency_key
+        or re.fullmatch(r"[0-9a-f]{64}", request.operation_request_digest or "")
+        is None
         or any(
             value is not None
             for value in (x_source_agent, x_via_mcp, x_mcp_key_id, x_mcp_key_name)

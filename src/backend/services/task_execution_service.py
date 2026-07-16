@@ -932,9 +932,14 @@ class TaskExecutionService:
         if timeout_seconds is None:
             timeout_seconds = db.get_execution_timeout(agent_name)
 
-        # #831: Resolve null model → platform default so the agent always receives
-        # a concrete model string. Avoids the stale "sonnet" hardcode in base-image.
-        if model is None:
+        # A sealed operation is authenticated by the server-owned grant and must
+        # use the independently reviewed Codex model, never an operator/platform
+        # default that can drift between build and execution.
+        if operation_grant:
+            model = "gpt-5.6-sol"
+        # #831: Resolve null model → platform default so ordinary tasks always
+        # receive a concrete model string.
+        elif model is None:
             model = settings_service.get_platform_default_model()
 
         # Dispatch circuit breaker (#526): combined global master-switch AND

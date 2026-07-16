@@ -230,6 +230,7 @@ class ParallelTaskRequest(BaseModel):
     # attempts to combine it with an asynchronous task.
     operation_grant: Optional[SecretStr] = Field(default=None, exclude=True, repr=False)
     operation_wire_exact: bool = Field(default=False, exclude=True, repr=False)
+    operation_request_digest: Optional[str] = Field(default=None, exclude=True, repr=False)
 
     @model_validator(mode="before")
     @classmethod

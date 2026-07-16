@@ -20,16 +20,33 @@ cat > "$TMP/bin/docker" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 joined=" $* "
+state=${FAKE_DOCKER_STATE:-$(dirname "$0")/docker-state}
+is_paused() {
+  [[ -f "$state" ]] && grep -Fxq "$1" "$state"
+}
 if [[ -n "${FAKE_DOCKER_LOG:-}" ]]; then printf '%s\n' "$*" >> "${FAKE_DOCKER_LOG}"; fi
 case "${1:-}" in
   info) exit 0 ;;
   ps)
     if [[ "$joined" == *"com.docker.compose.service=backend"* ]]; then
       echo trinity-backend
+    elif [[ "$joined" == *"com.docker.compose.service=scheduler"* ]]; then
+      echo trinity-scheduler
+    elif [[ "$joined" == *"com.docker.compose.service=redis"* ]]; then
+      echo trinity-redis
+    elif [[ "$joined" == *"com.docker.compose.service=vector"* ]]; then
+      echo trinity-vector
     elif [[ "$joined" == *"com.docker.compose.service=postgres"* && "${FAKE_POSTGRES:-0}" == 1 ]]; then
       echo trinity-postgres
     elif [[ "$joined" == *"com.docker.compose.service="* ]]; then
       :
+    elif [[ "$joined" == *"com.docker.compose.project=trinity"* && "$joined" == *" --format {{.Names}} "* ]]; then
+      printf '%s\n' trinity-backend trinity-scheduler trinity-redis trinity-vector
+      if [[ "${FAKE_POSTGRES:-0}" == 1 ]]; then echo trinity-postgres; fi
+    elif [[ "$joined" == *" -a "* && "$joined" == *" --no-trunc "* && "$joined" == *"{{.ID}} {{.Names}} {{.Image}}"* ]]; then
+      for container in ${FAKE_AGENT_CONTAINERS:-}; do
+        printf 'id-%s %s image:fixture\n' "$container" "$container"
+      done
     elif [[ "$joined" == *" -a "* && "$joined" == *" --format {{.Names}} "* ]]; then
       printf '%s\n' "${FAKE_AGENT_CONTAINERS:-}"
     elif [[ "$joined" == *"com.docker.compose.project=trinity"* ]]; then
@@ -41,25 +58,60 @@ case "${1:-}" in
     printf '%s\n' "${FAKE_AGENT_VOLUMES:-}"
     ;;
   inspect)
-    if [[ "$joined" == *"range .Mounts"* ]]; then
+    container=${2:-${!#}}
+    if [[ "$joined" == *"{{json .Mounts}}"* ]]; then
+      printf '%s\n' '[{"Type":"volume","Name":"trinity-data","Source":"/var/lib/docker/volumes/trinity-data/_data","Destination":"/data"}]'
+    elif [[ "$joined" == *"range .Mounts"* && "$joined" == *"eq .Type"*"volume"* ]]; then
+      case "$container" in
+        trinity-backend) printf '%s\n' agent-configs trinity-logs ;;
+        trinity-redis) echo redis-data ;;
+        trinity-vector) echo trinity-logs ;;
+        trinity-postgres) echo postgres-data ;;
+      esac
+    elif [[ "$joined" == *"range .Mounts"* ]]; then
       container=${2:-}
       printf '%s\n' "${FAKE_AGENT_WORKSPACE_MOUNT:-${container}-workspace}"
     elif [[ "$joined" == *"range .Config.Env"* ]]; then
-      printf 'DATABASE_URL=%s\n' "${FAKE_DATABASE_URL:-sqlite:////data/trinity.db}"
+      if [[ "$container" == trinity-postgres ]]; then
+        printf '%s\n' \
+          'POSTGRES_USER=trinity' \
+          'POSTGRES_DB=trinity' \
+          'POSTGRES_PASSWORD=fixture-postgres'
+      else
+        printf 'DATABASE_URL=%s\n' "${FAKE_DATABASE_URL:-sqlite:////data/trinity.db}"
+        printf 'TRINITY_DB_PATH=/data/trinity.db\n'
+      fi
     elif [[ "$joined" == *"{{.Image}}"* ]]; then
       echo sha256:backendfixture
+    elif [[ "$joined" == *"{{.State.Running}}:{{.State.Paused}}"* ]]; then
+      if is_paused "${!#}"; then echo true:true; else echo true:false; fi
+    elif [[ "$joined" == *"{{.State.Paused}}"* ]]; then
+      if is_paused "${!#}"; then echo true; else echo false; fi
     elif [[ "$joined" == *"{{.State.Running}}"* ]]; then
       echo true
     else
       exit 2
     fi
     ;;
-  pause|unpause|rm) exit 0 ;;
+  pause)
+    is_paused "${2:?}" || printf '%s\n' "$2" >> "$state"
+    ;;
+  unpause)
+    if [[ -f "$state" ]]; then
+      grep -Fvx "${2:?}" "$state" > "$state.next" || true
+      mv "$state.next" "$state"
+    fi
+    ;;
+  rm) exit 0 ;;
   exec)
-    if [[ "$joined" == *" pg_dump "* ]]; then
+    if [[ "$joined" == *" pg_isready "* || "$joined" == *" createdb "* ]]; then
+      exit 0
+    elif [[ "$joined" == *" pg_dump "* ]]; then
       printf 'postgres-dump-fixture\n'
+    elif [[ "$joined" == *" pg_restore "* ]]; then
+      cat >/dev/null
     elif [[ "$joined" == *" psql "* ]]; then
-      printf 't\n'
+      printf 'public.jobs\n'
     else
       cat >/dev/null || true
     fi
@@ -67,6 +119,13 @@ case "${1:-}" in
   run)
     if [[ "$joined" == *" --detach "* && "$joined" == *" postgres:16-alpine "* ]]; then
       echo trinity-backup-restore-fixture
+      exit 0
+    fi
+    if [[ "$joined" == *"sqlite_master"* ]]; then
+      if [[ "${FAKE_SQLITE_INTEGRITY_FAIL:-0}" != 0 ]]; then
+        exit 23
+      fi
+      printf '%064d 1\n' 0
       exit 0
     fi
     backup=""
@@ -107,7 +166,16 @@ case "${1:-}" in
     fi
     ;;
   compose)
-    if [[ "$joined" == *" config --services "* ]]; then
+    if [[ "$joined" == *" config --format json "* ]]; then
+      project=""
+      previous=""
+      for argument in "$@"; do
+        if [[ "$previous" == --project-directory ]]; then project=$argument; fi
+        previous=$argument
+      done
+      [[ -n "$project" ]] || exit 2
+      printf '{"services":{"backend":{"build":{"context":"%s","dockerfile":"Dockerfile"}}}}\n' "$project"
+    elif [[ "$joined" == *" config --services "* ]]; then
       echo backend
     fi
     ;;
@@ -115,11 +183,22 @@ case "${1:-}" in
 esac
 EOF
 chmod 755 "$TMP/bin/docker"
+export FAKE_DOCKER_STATE="$TMP/docker-state"
+: > "$FAKE_DOCKER_STATE"
 
 run_backup() {
   local output=$1
   local result=$2
-  PATH="$TMP/bin:$PATH" "$SCRIPT" \
+  env \
+    FAKE_AGENT_CONTAINERS="${FAKE_AGENT_CONTAINERS:-}" \
+    FAKE_AGENT_VOLUMES="${FAKE_AGENT_VOLUMES:-}" \
+    FAKE_AGENT_WORKSPACE_MOUNT="${FAKE_AGENT_WORKSPACE_MOUNT:-}" \
+    FAKE_DATABASE_URL="${FAKE_DATABASE_URL:-}" \
+    FAKE_DOCKER_LOG="${FAKE_DOCKER_LOG:-}" \
+    FAKE_DOCKER_STATE="$FAKE_DOCKER_STATE" \
+    FAKE_POSTGRES="${FAKE_POSTGRES:-0}" \
+    FAKE_SQLITE_INTEGRITY_FAIL="${FAKE_SQLITE_INTEGRITY_FAIL:-0}" \
+    PATH="$TMP/bin:$PATH" "$SCRIPT" \
     --project-name trinity \
     --output-dir "$output" \
     --env-file "$TMP/trinity.env" \
@@ -137,6 +216,16 @@ grep -qx 'backend_data_verified=yes' "$bundle/manifest.txt"
 grep -qx 'backend_data_live_consistency_verified=yes' "$bundle/manifest.txt"
 grep -qx 'environment_semantics_verified=yes' "$bundle/manifest.txt"
 grep -qx 'agent_workspace_live_consistency_verified=yes' "$bundle/manifest.txt"
+grep -qx 'writer_pause_verified=yes' "$bundle/manifest.txt"
+grep -qx 'paused_writer_count=4' "$bundle/manifest.txt"
+grep -qx 'platform_volume_archives=3' "$bundle/manifest.txt"
+grep -qx 'platform_volume_archives_verified=yes' "$bundle/manifest.txt"
+grep -qx 'platform_volume_inventory_stable=yes' "$bundle/manifest.txt"
+test -s "$bundle/platform-volumes/redis-data.tgz"
+test -s "$bundle/platform-volumes/agent-configs.tgz"
+test -s "$bundle/platform-volumes/trinity-logs.tgz"
+grep -qx 'agent_inventory_stable=yes' "$bundle/manifest.txt"
+grep -qx 'artifact_inventory_verified=yes' "$bundle/manifest.txt"
 grep -qx 'backup_complete=yes' "$bundle/manifest.txt"
 
 agent_result="$TMP/agent-result"
@@ -193,13 +282,13 @@ if PATH="$TMP/bin:$PATH" "$SCRIPT" --project-name trinity --output-dir "$TMP/no-
   exit 1
 fi
 
-if FAKE_DATABASE_URL='postgresql://managed.example/trinity' run_backup \
+if FAKE_DATABASE_URL='postgresql://user:password@managed.example:5432/trinity' run_backup \
   "$TMP/external-db" "$result" >/dev/null 2>&1; then
   echo 'external PostgreSQL without a governed snapshot was accepted' >&2
   exit 1
 fi
 
-external_url='postgresql://managed.example/trinity'
+external_url='postgresql://user:password@managed.example:5432/trinity'
 if command -v sha256sum >/dev/null 2>&1; then
   external_digest="sha256:$(printf '%s' "$external_url" | sha256sum | awk '{print $1}')"
 else
@@ -217,7 +306,7 @@ if FAKE_DATABASE_URL="$external_url" PATH="$TMP/bin:$PATH" "$SCRIPT" \
 fi
 
 postgres_result="$TMP/postgres-result"
-FAKE_POSTGRES=1 FAKE_DATABASE_URL='postgresql://postgres/trinity' \
+FAKE_POSTGRES=1 FAKE_DATABASE_URL='postgresql://trinity:fixture-postgres@postgres:5432/trinity' \
 FAKE_DOCKER_LOG="$TMP/postgres-docker.log" PATH="$TMP/bin:$PATH" "$SCRIPT" \
   --project-name trinity --output-dir "$TMP/postgres" --env-file "$TMP/trinity.env" \
   --result-file "$postgres_result" >/dev/null
@@ -236,7 +325,11 @@ grep -q "external_postgres_provider_verified=yes" "$UPGRADE_SCRIPT"
 grep -q "postgres_restore_verified=yes" "$UPGRADE_SCRIPT"
 grep -q "environment_semantics_verified=yes" "$UPGRADE_SCRIPT"
 grep -q "agent_workspace_archives_verified=yes" "$UPGRADE_SCRIPT"
-grep -q "Version endpoint was not reachable" "$UPGRADE_SCRIPT"
+grep -q "platform_volume_archives_verified=yes" "$UPGRADE_SCRIPT"
+grep -q "platform_volume_inventory_stable=yes" "$UPGRADE_SCRIPT"
+grep -q "Authenticated version endpoint verification failed" "$UPGRADE_SCRIPT"
+grep -q 'docker exec -i.*backend_container' "$UPGRADE_SCRIPT"
+grep -q 'http://127.0.0.1:8000/token' "$UPGRADE_SCRIPT"
 ! grep -q 'api/version.*|| true' "$UPGRADE_SCRIPT"
 
 printf 'services: {}\n' > "$TMP/compose.yml"
@@ -253,7 +346,11 @@ mkdir -p "$governed/scripts/deploy"
 cp "$ROOT/scripts/deploy/safe-upgrade.sh" "$governed/scripts/deploy/safe-upgrade.sh"
 cp "$ROOT/scripts/deploy/backup-persistent-state.sh" "$governed/scripts/deploy/backup-persistent-state.sh"
 cp "$ROOT/scripts/deploy/github-actions-safe-deploy.sh" "$governed/scripts/deploy/github-actions-safe-deploy.sh"
+cp "$ROOT/scripts/deploy/validate-compose-build-inputs.py" "$governed/scripts/deploy/validate-compose-build-inputs.py"
+cp "$ROOT/scripts/deploy/verify-exact-git-tree.py" "$governed/scripts/deploy/verify-exact-git-tree.py"
 chmod 755 "$governed/scripts/deploy/"*.sh
+chmod 755 "$governed/scripts/deploy/"*.py
+printf 'FROM scratch\n' > "$governed/Dockerfile"
 printf 'services:\n  backend:\n    build:\n      context: .\n' > "$governed/docker-compose.yml"
 git -C "$governed" init -q
 git -C "$governed" config user.email test@example.com
@@ -270,5 +367,44 @@ printf '%s\n' "$governed_plan" | grep -q "Prepared exact-commit build source $go
 printf '%s\n' "$governed_plan" | grep -q 'trinity-release-inputs.*source.*build'
 printf '%s\n' "$governed_plan" | grep -q -- '--env-file .*trinity-release-inputs.*config/runtime.env'
 printf '%s\n' "$governed_plan" | grep -q 'up --no-build -d backend'
+
+tar_options_plan=$(TAR_OPTIONS='--exclude=Dockerfile' \
+  TRINITY_EXPECTED_SOURCE_REVISION="$governed_commit" GIT_COMMIT="$governed_commit" \
+  FAKE_AGENT_VOLUMES='agent-paid-media-workspace' PATH="$TMP/bin:$PATH" \
+  "$governed/scripts/deploy/safe-upgrade.sh" --allow-fresh --dry-run \
+  --env-file "$TMP/trinity.env" -f "$governed/docker-compose.yml")
+printf '%s\n' "$tar_options_plan" | grep -q "Prepared exact-commit build source $governed_commit"
+
+reject_compose_build_input() {
+  local description="$1"
+  local configuration="$2"
+  if printf '%s\n' "$configuration" \
+    | python3 "$ROOT/scripts/deploy/validate-compose-build-inputs.py" "$governed" \
+    >/dev/null 2>&1; then
+    echo "$description was accepted" >&2
+    exit 1
+  fi
+}
+
+reject_compose_build_input 'compose build context outside the exact source' \
+  '{"services":{"backend":{"build":{"context":"/tmp","dockerfile":"Dockerfile"}}}}'
+reject_compose_build_input 'compose Dockerfile outside the exact source' \
+  '{"services":{"backend":{"build":{"context":".","dockerfile":"/tmp/Dockerfile"}}}}'
+reject_compose_build_input 'compose inline Dockerfile outside the exact source tree' \
+  '{"services":{"backend":{"build":{"context":".","dockerfile_inline":"FROM scratch"}}}}'
+reject_compose_build_input 'compose mutable remote build context' \
+  '{"services":{"backend":{"build":{"context":"https://example.invalid/repository.git"}}}}'
+reject_compose_build_input 'compose build SSH authority' \
+  '{"services":{"backend":{"build":{"context":".","ssh":["default"]}}}}'
+reject_compose_build_input 'compose environment-backed build secret' \
+  '{"secrets":{"token":{"environment":"TOKEN"}},"services":{"backend":{"build":{"context":".","secrets":["token"]}}}}'
+reject_compose_build_input 'compose mutable image additional context' \
+  '{"services":{"backend":{"build":{"context":".","additional_contexts":{"base":"docker-image://alpine:latest"}}}}}'
+reject_compose_build_input 'compose local additional context outside the exact source' \
+  '{"services":{"backend":{"build":{"context":".","additional_contexts":{"base":"/tmp"}}}}}'
+
+printf '%s\n' \
+  '{"services":{"backend":{"build":{"context":".","additional_contexts":{"base":"docker-image://alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}}}}' \
+  | python3 "$ROOT/scripts/deploy/validate-compose-build-inputs.py" "$governed" >/dev/null
 
 echo 'backup-persistent-state: OK'

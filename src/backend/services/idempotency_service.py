@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Any, AsyncIterator, Optional, Union
 
 from database import db
-from db.idempotency import STATE_COMPLETED, STATE_IN_FLIGHT, STATE_NEW
+from db.idempotency import STATE_COMPLETED, STATE_CONFLICT, STATE_IN_FLIGHT, STATE_NEW
 
 logger = logging.getLogger(__name__)
 
@@ -34,6 +34,7 @@ class IdempotencyDecision:
     enabled: bool                      # False when no key supplied (dedup off)
     replay: bool                       # True → caller must NOT dispatch again
     in_flight: bool                    # replay of a still-running claim → 409
+    conflict: bool = False             # caller key was already bound to other bytes
     scope: Optional[str] = None
     key: Optional[str] = None
     execution_id: Optional[str] = None
@@ -59,6 +60,11 @@ class EffectInProgressError(Exception):
 def make_agent_scope(agent_name: str) -> str:
     """Scope execution-creating boundaries per agent (cross-tenant isolation)."""
     return f"agent:{agent_name}"
+
+
+def make_sealed_agent_scope(agent_name: str) -> str:
+    """Keep sealed-executor claims separate from ordinary task callers."""
+    return f"sealed-agent:{agent_name}"
 
 
 def make_webhook_scope(token: str) -> str:
@@ -348,12 +354,21 @@ async def effect_guard(
 # Lifecycle
 # ---------------------------------------------------------------------------
 
-def begin(scope: str, key: Optional[str]) -> IdempotencyDecision:
+def begin(
+    scope: str,
+    key: Optional[str],
+    *,
+    request_digest: Optional[str] = None,
+) -> IdempotencyDecision:
     """Claim (scope, key). No-op decision when key is falsy (dedup disabled)."""
     if not key:
         return IdempotencyDecision(enabled=False, replay=False, in_flight=False)
     try:
-        res = db.idempotency_claim(scope, key)
+        res = db.idempotency_claim(
+            scope,
+            key,
+            request_digest=request_digest,
+        )
     except Exception as e:  # fail-open: never block a real execution on the dedup layer
         logger.warning("Idempotency claim failed (scope=%s) — proceeding without dedup: %s", scope, e)
         return IdempotencyDecision(enabled=False, replay=False, in_flight=False)
@@ -361,6 +376,16 @@ def begin(scope: str, key: Optional[str]) -> IdempotencyDecision:
     state = res.get("state")
     if state == STATE_NEW:
         return IdempotencyDecision(enabled=True, replay=False, in_flight=False, scope=scope, key=key)
+    if state == STATE_CONFLICT:
+        return IdempotencyDecision(
+            enabled=True,
+            replay=True,
+            in_flight=False,
+            conflict=True,
+            scope=scope,
+            key=key,
+            execution_id=res.get("execution_id"),
+        )
     if state == STATE_IN_FLIGHT:
         return IdempotencyDecision(
             enabled=True, replay=True, in_flight=True, scope=scope, key=key,

@@ -6,8 +6,10 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import site
 import stat
 import sys
+import sysconfig
 from typing import Mapping
 
 SCHEMA_VERSION = "trinity-packaged-runtime-tree/1"
@@ -21,6 +23,8 @@ DEFAULT_ROOTS = (
 )
 DEFAULT_EXTERNAL_PATHS = (
     Path("/etc/claude-code/managed-settings.json"),
+    Path("/etc/trinity/codex-operation.rules"),
+    Path("/etc/trinity/validate-codex-auth.py"),
     Path("/opt/flashcrafter/AGENTS.md"),
     Path("/opt/flashcrafter/agent.json"),
     Path("/opt/flashcrafter/base.json"),
@@ -29,11 +33,82 @@ DEFAULT_EXTERNAL_PATHS = (
     Path("/opt/flashcrafter/runtime-exclusions.json"),
     Path("/opt/flashcrafter/skills.json"),
     Path("/usr/local/bin/codex"),
+    Path("/usr/local/bin/trinity-task-context"),
     Path("/usr/bin/node"),
 )
 DEFAULT_DYNAMIC_SYMLINKS = {
     Path("/opt/flashcrafter/app/.env"): "/home/developer/.env",
 }
+DEFAULT_OPERATION_CONTRACT = Path("/opt/flashcrafter/operation-contract.json")
+
+
+def _existing_directories(paths: set[Path]) -> tuple[Path, ...]:
+    return tuple(sorted((path for path in paths if path.is_dir()), key=str))
+
+
+def python_runtime_roots() -> tuple[Path, ...]:
+    """Resolve every Python library tree the packaged server can import."""
+    roots: set[Path] = set()
+    configured = sysconfig.get_paths()
+    for key in ("stdlib", "platstdlib", "purelib", "platlib"):
+        value = configured.get(key)
+        if value:
+            roots.add(Path(value))
+    for value in site.getsitepackages():
+        roots.add(Path(value))
+    user_site = site.getusersitepackages()
+    if isinstance(user_site, str):
+        roots.add(Path(user_site))
+    for pattern in (
+        "/usr/lib/python3*",
+        "/usr/lib/python3/dist-packages",
+        "/usr/local/lib/python3*",
+        "/home/developer/.local/lib/python*/site-packages",
+    ):
+        roots.update(Path("/").glob(pattern.lstrip("/")))
+    return _existing_directories(roots)
+
+
+def operation_executable_paths(
+    contract_path: Path = DEFAULT_OPERATION_CONTRACT,
+) -> tuple[Path, ...]:
+    """Return every exact executable named by the signed operation contract."""
+    try:
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("operation contract is unavailable for runtime closure") from exc
+    operations = contract.get("operations") if isinstance(contract, dict) else None
+    if not isinstance(operations, dict) or not operations:
+        raise ValueError("operation contract has no executable operations")
+    paths: set[Path] = set()
+    for operation in operations.values():
+        commands = operation.get("commands") if isinstance(operation, dict) else None
+        if not isinstance(commands, list) or not commands:
+            raise ValueError("operation contract command closure is incomplete")
+        for command in commands:
+            executable = command.get("executable") if isinstance(command, dict) else None
+            if not isinstance(executable, str) or not executable.startswith("/"):
+                raise ValueError("operation contract executable is invalid")
+            paths.add(Path(executable))
+    return tuple(sorted(paths, key=str))
+
+
+def runtime_roots() -> tuple[Path, ...]:
+    return tuple(dict.fromkeys((*DEFAULT_ROOTS, *python_runtime_roots())))
+
+
+def runtime_external_paths(
+    contract_path: Path = DEFAULT_OPERATION_CONTRACT,
+) -> tuple[Path, ...]:
+    candidates = {
+        *DEFAULT_EXTERNAL_PATHS,
+        Path(sys.executable),
+        *operation_executable_paths(contract_path),
+    }
+    for path in (Path("/usr/bin/python3"), Path("/usr/local/bin/python3")):
+        if path.exists() or path.is_symlink():
+            candidates.add(path)
+    return tuple(sorted(candidates, key=str))
 
 
 def _node_package_root(path: Path) -> Path | None:
@@ -74,12 +149,16 @@ def _entry(path: Path) -> dict[str, object]:
 
 
 def build_manifest(
-    roots: tuple[Path, ...] = DEFAULT_ROOTS,
-    external_paths: tuple[Path, ...] = DEFAULT_EXTERNAL_PATHS,
+    roots: tuple[Path, ...] | None = None,
+    external_paths: tuple[Path, ...] | None = None,
     *,
     require_root_owned: bool = True,
     dynamic_symlinks: Mapping[Path, str] = DEFAULT_DYNAMIC_SYMLINKS,
 ) -> dict[str, object]:
+    if roots is None:
+        roots = runtime_roots()
+    if external_paths is None:
+        external_paths = runtime_external_paths()
     expanded_roots = set(roots)
     for path in external_paths:
         resolved = path.resolve(strict=True)
@@ -147,8 +226,8 @@ def write_manifest(output: Path) -> None:
 
 def verify_manifest(
     path: Path,
-    roots: tuple[Path, ...] = DEFAULT_ROOTS,
-    external_paths: tuple[Path, ...] = DEFAULT_EXTERNAL_PATHS,
+    roots: tuple[Path, ...] | None = None,
+    external_paths: tuple[Path, ...] | None = None,
 ) -> bool:
     try:
         metadata = path.lstat()

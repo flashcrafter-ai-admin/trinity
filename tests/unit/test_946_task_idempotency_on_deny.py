@@ -82,14 +82,17 @@ def _env(idem, acquire_exc):
 
 def _call(async_mode, operation_grant=None):
     sealed = operation_grant is not None
+    request = ParallelTaskRequest(
+        message="hi",
+        allowed_tools=["Bash"] if sealed else None,
+        max_turns=12 if sealed else None,
+        async_mode=async_mode,
+        operation_grant=operation_grant,
+    )
+    if sealed:
+        request.operation_request_digest = "a" * 64
     return asyncio.run(execute_parallel_task(
-        request=ParallelTaskRequest(
-            message="hi",
-            allowed_tools=["Bash"] if sealed else None,
-            max_turns=12 if sealed else None,
-            async_mode=async_mode,
-            operation_grant=operation_grant,
-        ),
+        request=request,
         name="agent1",
         current_user=_user(sealed=sealed),
         x_source_agent=None,

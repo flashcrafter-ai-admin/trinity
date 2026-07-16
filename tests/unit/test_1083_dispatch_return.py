@@ -150,6 +150,7 @@ class TestAsyncDispatchReturn:
         }
         assert type(payload["message"]) is str
         assert type(payload["model"]) is str
+        assert payload["model"] == "gpt-5.6-sol"
         assert payload["allowed_tools"] == ["Bash"]
         assert type(payload["system_prompt"]) is str
         assert type(payload["timeout_seconds"]) is int

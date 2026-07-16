@@ -80,10 +80,12 @@ trinity-agent-base:dev        # Development builds
 
 **Upgrade Process**:
 ```bash
-git pull origin main
-docker compose pull
-docker compose up -d
+./scripts/deploy/safe-upgrade.sh --project-name trinity
 ```
+
+For production, pass the original `--env-file` and Compose files. The wrapper
+backs up first, builds from an exact byte-verified Git object, and activates with
+`--no-build` without removing volumes or the agent network.
 
 **Downtime**: ~30 seconds (container restart)
 
@@ -93,22 +95,15 @@ docker compose up -d
 
 **Upgrade Process**:
 ```bash
-# 1. Backup (recommended)
-./scripts/deploy/backup.sh
-
-# 2. Pull changes
-git pull origin main
-
-# 3. Rebuild base image (if changed)
-./scripts/deploy/build-base-image.sh
-
-# 4. Restart services
-docker compose down
-docker compose up -d
-
-# 5. Verify
-curl http://localhost:8000/health
+./scripts/deploy/safe-upgrade.sh \
+  --project-name trinity \
+  --env-file /path/to/.env \
+  -f docker-compose.prod.yml
 ```
+
+Rebuild and attest the agent base and leaf images as a separate governed release
+when their Dockerfiles or runtime contracts change. A platform upgrade does not
+silently recreate running agents.
 
 **Downtime**: 2-5 minutes
 
@@ -123,28 +118,17 @@ curl http://localhost:8000/health
 
 **Upgrade Process**:
 ```bash
-# 1. Stop all agents
-curl -X POST http://localhost:8000/api/ops/stop-all
-
-# 2. Full backup
-./scripts/deploy/backup.sh
-
-# 3. Pull changes
-git pull origin main
-
-# 4. Run migrations (if any)
-./scripts/deploy/migrate.sh
-
-# 5. Rebuild everything
-./scripts/deploy/build-base-image.sh
-docker compose build
-
-# 6. Start services
-docker compose up -d
-
-# 7. Recreate agents (if base image changed)
-# Use UI or API to recreate agents from templates
+# First create and verify a complete recovery bundle.
+./scripts/deploy/backup-persistent-state.sh \
+  --project-name trinity \
+  --env-file /path/to/.env \
+  --output-dir /srv/trinity-backups/persistent-state
 ```
+
+Run a separately reviewed migration plan after the complete-backup gate. Use
+`safe-upgrade.sh` for the actual build and activation. Never use `down -v` as a
+migration shortcut, and recreate agents only when the reviewed image cutover
+explicitly requires it.
 
 **Downtime**: 10-30 minutes
 
@@ -167,9 +151,9 @@ This is a **MINOR** version update. Here's the specific upgrade path:
 ### Upgrade Steps
 
 ```bash
-# 1. Pull latest code
-git fetch origin
-git checkout v0.9.0  # Or: git pull origin main
+# 1. Fetch and check out the reviewed release object
+git fetch --tags origin
+git checkout --detach v0.9.0
 
 # 2. (Optional) Add Google API key for Gemini
 echo "GOOGLE_API_KEY=your-key" >> .env
@@ -211,9 +195,10 @@ docker compose restart backend
 ### Pre-Upgrade Checklist
 
 - [ ] Review git history for breaking changes (`git log --oneline`)
-- [ ] Backup database (`data/trinity.db`)
-- [ ] Backup Redis (`data/redis/`)
-- [ ] Note running agents and their configurations
+- [ ] Produce `backup_complete=yes` with verified database restore/snapshot evidence
+- [ ] Verify backend `/data`, every Compose named volume, and every agent workspace archive
+- [ ] Verify `.env` recovery keys, writer pause, stable inventories, and artifact digests
+- [ ] Note running agents and active work before the drain window
 - [ ] Schedule maintenance window if production
 
 ### Post-Upgrade Verification
@@ -241,8 +226,8 @@ Always have a rollback plan:
 git checkout <previous-tag>
 docker compose up -d
 
-# Full rollback (including data)
-./scripts/deploy/restore.sh <backup-timestamp>
+# Full rollback (including data) follows the verified bundle runbook.
+# See docs/user-docs/guides/deploying/backup-and-restore.md.
 ```
 
 ---
@@ -259,15 +244,11 @@ See `git log --oneline` for detailed history.
 
 ---
 
-## Future: Automated Upgrades
+## Upgrade Provenance
 
-Planned for v1.0+:
-
-1. **Version Check Endpoint**: `/api/version` returns current and latest available
-2. **Upgrade Notifications**: UI banner when new version available
-3. **One-Click Upgrades**: For non-breaking updates
-4. **Migration Scripts**: Automatic database migrations
-5. **Agent Auto-Rebuild**: Option to auto-rebuild agents on base image change
+`safe-upgrade.sh` authenticates from inside the running backend and requires
+`/api/version` to return the exact full and short deployed Git SHA. Health alone,
+an unauthenticated response, or `unknown` provenance is not release evidence.
 
 ---
 
@@ -277,4 +258,3 @@ If you encounter upgrade issues:
 1. Check [Known Issues](KNOWN_ISSUES.md)
 2. Review [Troubleshooting](onboarding/04-troubleshooting.md)
 3. Open an issue on GitHub
-

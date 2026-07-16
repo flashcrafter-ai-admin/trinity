@@ -1204,6 +1204,7 @@ TABLES = {
         CREATE TABLE IF NOT EXISTS idempotency_keys (
             scope TEXT NOT NULL,
             idempotency_key TEXT NOT NULL,
+            request_digest TEXT,
             execution_id TEXT,
             status TEXT NOT NULL,
             response_snapshot TEXT,

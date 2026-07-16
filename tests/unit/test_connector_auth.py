@@ -10,6 +10,8 @@ the same core-primitive + enterprise-knob shape as `users.suspended_at` (#995).
 These tests pin that enforcement.
 """
 import asyncio
+import hashlib
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -218,7 +220,12 @@ class TestSealedExecutorTaskContract:
             "operation_grant": TestSealedExecutorTaskContract._grant(),
         }
         values.update(overrides)
-        return ParallelTaskRequest(**values)
+        request = ParallelTaskRequest(**values)
+        if request.operation_wire_exact is True:
+            request.operation_request_digest = hashlib.sha256(
+                b"exact sealed test request"
+            ).hexdigest()
+        return request
 
     @staticmethod
     def _enforce(request, **overrides):
@@ -245,6 +252,52 @@ class TestSealedExecutorTaskContract:
         request = self._request()
         assert request.operation_wire_exact is True
         self._enforce(request)
+
+    def test_wire_parser_binds_request_to_exact_raw_bytes(self):
+        from dependencies import parse_sealed_task_wire
+
+        body = json.dumps(
+            {
+                "allowed_tools": ["Bash"],
+                "async_mode": False,
+                "max_turns": 12,
+                "message": "execute the signed operation",
+                "operation_grant": self._grant(),
+            },
+            separators=(",", ":"),
+        ).encode()
+        request = parse_sealed_task_wire(body)
+        assert request.operation_request_digest == hashlib.sha256(body).hexdigest()
+        assert "operation_request_digest" not in request.model_dump()
+
+    def test_sealed_idempotency_claim_replays_only_exact_request_bytes(self):
+        from services import idempotency_service
+
+        scope = idempotency_service.make_sealed_agent_scope("agent-idem-exact")
+        key = "dispatch:task:attempt:exact"
+        first = idempotency_service.begin(scope, key, request_digest="a" * 64)
+        assert first.enabled is True
+        assert first.replay is False
+
+        exact_replay = idempotency_service.begin(
+            scope, key, request_digest="a" * 64
+        )
+        assert exact_replay.replay is True
+        assert exact_replay.in_flight is True
+        assert exact_replay.conflict is False
+
+        changed_request = idempotency_service.begin(
+            scope, key, request_digest="b" * 64
+        )
+        assert changed_request.replay is True
+        assert changed_request.conflict is True
+
+    def test_sealed_contract_rejects_a_missing_request_digest(self):
+        request = self._request()
+        request.operation_request_digest = None
+        with pytest.raises(HTTPException) as exc:
+            self._enforce(request)
+        assert exc.value.status_code == 403
 
     def test_task_route_checks_sealed_contract_before_container_lookup(self, monkeypatch):
         """WHY: the body gate precedes runtime state, idempotency, and execution."""
@@ -328,7 +381,9 @@ class TestSealedExecutorTaskContract:
         monkeypatch.setattr(chat, "get_capacity_manager", lambda: capacity)
         monkeypatch.setattr(chat, "dispatch_breaker_active", lambda _name: False)
         monkeypatch.setattr(chat, "get_task_execution_service", lambda: service)
-        monkeypatch.setattr(chat.idempotency_service, "begin", lambda *_a: decision)
+        monkeypatch.setattr(
+            chat.idempotency_service, "begin", lambda *_a, **_kw: decision
+        )
         monkeypatch.setattr(chat.idempotency_service, "attach_execution", lambda *_a: None)
         monkeypatch.setattr(chat.idempotency_service, "complete", lambda *_a: None)
 
@@ -391,7 +446,9 @@ class TestSealedExecutorTaskContract:
 
         monkeypatch.setattr(chat, "get_agent_container", lambda _name: container)
         monkeypatch.setattr(chat, "db", db)
-        monkeypatch.setattr(chat.idempotency_service, "begin", lambda *_a: disabled)
+        monkeypatch.setattr(
+            chat.idempotency_service, "begin", lambda *_a, **_kw: disabled
+        )
 
         with pytest.raises(HTTPException) as exc:
             asyncio.run(
@@ -412,6 +469,48 @@ class TestSealedExecutorTaskContract:
 
         assert exc.value.status_code == 503
         db.create_task_execution.assert_not_called()
+
+    def test_sealed_task_rejects_key_reuse_with_changed_request_bytes(self, monkeypatch):
+        """WHY: a caller key can replay only the exact authenticated wire."""
+        from routers import chat
+
+        conflict = SimpleNamespace(
+            enabled=True,
+            replay=True,
+            in_flight=False,
+            conflict=True,
+            execution_id="exec-original",
+            snapshot=None,
+        )
+        monkeypatch.setattr(
+            chat,
+            "get_agent_container",
+            lambda _name: SimpleNamespace(status="running"),
+        )
+        monkeypatch.setattr(
+            chat.idempotency_service, "begin", lambda *_a, **_kw: conflict
+        )
+        monkeypatch.setattr(chat.platform_audit_service, "log", AsyncMock())
+
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(
+                chat.execute_parallel_task(
+                    request=self._request(),
+                    name="agent-1",
+                    current_user=_user(
+                        sealed_executor_agent="agent-1",
+                        sealed_executor_key_id="sealed-key-1",
+                    ),
+                    x_source_agent=None,
+                    x_via_mcp=None,
+                    x_mcp_key_id=None,
+                    x_mcp_key_name=None,
+                    idempotency_key="dispatch:task:attempt:1",
+                )
+            )
+
+        assert exc.value.status_code == 409
+        assert exc.value.detail["error"] == "idempotency_key_conflict"
 
     def test_non_sealed_principal_preserves_existing_task_contract(self):
         """WHY: sealed execution must not change ordinary user or agent task calls."""

@@ -137,7 +137,8 @@ def calculate_codex_cost(
 
 _API_KEY_VARS = ("OPENAI_API_KEY", "CODEX_API_KEY")
 _AGENT_HOME = "/home/developer"
-_SEALED_CODEX_HOME = "/home/developer/.codex-attestation"
+_SEALED_CODEX_HOME = "/home/developer/.codex-subscription"
+_SEALED_CODEX_MODEL = "gpt-5.6-sol"
 _READ_ONLY_CONFIG = Path(_AGENT_HOME) / ".trinity" / "read-only-config.json"
 
 
@@ -742,6 +743,11 @@ class CodexRuntime(AgentRuntime):
         execution_id = execution_id or str(uuid.uuid4())
 
         codex_home = _SEALED_CODEX_HOME if operation_grant else _ensure_codex_home()
+        if operation_grant and model != _SEALED_CODEX_MODEL:
+            raise HTTPException(
+                status_code=422,
+                detail="sealed Codex tasks require the exact server-side model",
+            )
         subscription_auth = bool(operation_grant) or _has_chatgpt_subscription_auth(codex_home)
         # ChatGPT subscription identity is authoritative when present. A stale
         # process/.env API key must never silently switch a subscription-backed
@@ -774,7 +780,6 @@ class CodexRuntime(AgentRuntime):
             separator = cmd.index("--")
             cmd[separator:separator] = [
                 "--ignore-user-config",
-                "--ignore-rules",
                 "--ephemeral",
                 "-c",
                 'approval_policy="never"',

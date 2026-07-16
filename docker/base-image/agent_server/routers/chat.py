@@ -129,7 +129,8 @@ async def execute_sealed_task(request: ParallelTaskRequest):
     if request.operation_wire_exact is not True:
         raise HTTPException(status_code=422, detail="invalid sealed task contract")
     if (
-        request.allowed_tools != ["Bash"]
+        request.model != "gpt-5.6-sol"
+        or request.allowed_tools != ["Bash"]
         or type(request.max_turns) is not int
         or not 1 <= request.max_turns <= 32
         or request.resume_session_id is not None

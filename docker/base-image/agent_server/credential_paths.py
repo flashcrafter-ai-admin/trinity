@@ -13,6 +13,8 @@ Policy model (deny takes precedence over allow):
 Anything that is executed or sourced at shell/agent startup stays blocked
 regardless of ALLOW (shell rc files, CLAUDE.md/AGENTS.md, .claude/**,
 .mcp.json.template, .ssh/authorized_keys & config, .git/** & .gitconfig, bin/**).
+The exact Codex subscription auth path is a data-only exception consumed through
+the sealed root runner; sibling Codex config/rules paths remain blocked.
 `.mcp.json` passes the PATH layer here but is still CONTENT-validated by
 `services.mcp_validator` (the #590/#598 guard) at the call site.
 
@@ -27,8 +29,10 @@ from __future__ import annotations
 
 import fnmatch
 
-# Exact full-path matches (workspace root only).
-ALLOW_EXACT = {".env", ".credentials.enc", ".mcp.json"}
+CODEX_SUBSCRIPTION_AUTH_PATH = ".codex-subscription/auth.json"
+
+# Exact full-path matches. Nested paths are explicit data-only exceptions.
+ALLOW_EXACT = {".env", ".credentials.enc", ".mcp.json", CODEX_SUBSCRIPTION_AUTH_PATH}
 
 # Glob rules. A pattern containing "/" is matched segment-by-segment ("**"
 # matches one or more whole segments); a pattern with no "/" is matched against

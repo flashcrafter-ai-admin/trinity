@@ -2431,6 +2431,16 @@ def _migrate_idempotency_keys_table(cursor, conn):
     print("Created idempotency_keys table with index (RELIABILITY-006, #525)")
 
 
+def _migrate_idempotency_request_digest(cursor, conn):
+    """Bind sealed-task idempotency claims to their exact request bytes."""
+    cursor.execute("PRAGMA table_info(idempotency_keys)")
+    columns = {row[1] for row in cursor.fetchall()}
+    if "request_digest" not in columns:
+        cursor.execute("ALTER TABLE idempotency_keys ADD COLUMN request_digest TEXT")
+        conn.commit()
+        print("Added request_digest to idempotency_keys")
+
+
 def _migrate_agent_loops_tables(cursor, conn):
     """Create agent_loops + agent_loop_runs tables and link to schedule_executions (#740).
 
@@ -2880,6 +2890,7 @@ MIGRATIONS = [
     # both 900 (legacy) and 3600 (post-#665 rewrite) in one pass.
     ("null_legacy_schedule_timeouts", _migrate_null_legacy_schedule_timeouts),
     ("idempotency_keys_table", _migrate_idempotency_keys_table),
+    ("idempotency_request_digest", _migrate_idempotency_request_digest),
     ("agent_loops_tables", _migrate_agent_loops_tables),
     ("users_suspended_at", _migrate_users_suspended_at),
     ("agent_ownership_circuit_breaker", _migrate_agent_ownership_circuit_breaker),

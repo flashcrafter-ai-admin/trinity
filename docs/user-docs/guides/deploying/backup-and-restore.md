@@ -17,9 +17,9 @@
 | Backend `/data` | **Yes** | Compose volume or host bind mount mounted at `/data` in `backend` | Skills library sync cache, local runtime artifacts, and SQLite files when SQLite is active |
 | `.env` file | **Yes** | Host filesystem | **Not in git.** Losing it means losing `CREDENTIAL_ENCRYPTION_KEY`, which makes all encrypted credentials unrecoverable. |
 | Agent workspaces | **Yes** | Docker volumes named `agent-*-workspace` | Durable `/home/developer` state for running agents; survives container recreation but not volume loss |
+| Compose named volumes | **Yes** | Volumes mounted by containers in the selected Compose project | Includes Redis AOF, `agent-configs`, Vector logs, and any bundled database volume; every archive is compared to its paused source |
 | Agent source repos | Not separately | Git repositories | Versioned agent template/source code should already live in git. |
-| Redis data | Not separately | Named volume `trinity_redis-data` | Ephemeral: JWT tokens, capacity counters. All regenerated on next start. |
-| Platform config | Not separately | Git repo | `docker-compose.yml`, `config/`, `scripts/` — all in version control. |
+| Platform config | Git plus volume backup | Git repo and `agent-configs` volume | Tracked config is rebuilt from the exact Git object; generated configuration in the volume is archived. |
 
 ---
 
@@ -40,7 +40,7 @@ For a running instance, prefer the bundled backup script:
 ./scripts/deploy/backup-persistent-state.sh --project-name trinity
 ```
 
-It discovers the running compose project and selects database authority from the backend's actual `DATABASE_URL`. It restores a bundled PostgreSQL dump into a fresh temporary server, or uses SQLite's online backup API plus `PRAGMA integrity_check`. It also compares restored backend and agent-workspace archives to their paused live sources and validates all required recovery/authentication keys in `.env`.
+It discovers the running Compose project and selects database authority from the backend's actual `DATABASE_URL`. It restores a bundled PostgreSQL dump into a fresh temporary server, or uses SQLite's online backup API plus integrity and source/backup catalog fingerprints. During one pause transaction it compares restored backend, Compose named-volume, and agent-workspace archives to their live sources, proves inventories stayed stable, and validates all required recovery/authentication keys in `.env`.
 
 For managed PostgreSQL, first create the provider snapshot. Supply its fresh Ed25519-signed v2 receipt, the root-controlled public key, and a root-controlled provider verifier with `--external-db-snapshot-receipt`, `--external-db-snapshot-public-key`, and `--external-db-snapshot-verify-command`. The verifier must independently confirm the provider snapshot and emit a fresh receipt-bound attestation. `safe-upgrade.sh` will not build without that complete evidence.
 
@@ -93,7 +93,7 @@ Store this in a secure location (password manager, encrypted storage). Never com
 For backup bundles produced by `backup-persistent-state.sh`, inspect the manifest:
 
 ```bash
-grep -E '^(backup_complete|database_source|postgres_restore_verified|sqlite_backup_verified|external_postgres_provider_verified|backend_data_live_consistency_verified|agent_workspace_live_consistency_verified|environment_semantics_verified)=' \
+grep -E '^(backup_complete|database_source|postgres_restore_verified|sqlite_backup_verified|external_postgres_provider_verified|backend_data_live_consistency_verified|platform_volume_archives_verified|platform_volume_inventory_stable|agent_workspace_live_consistency_verified|environment_semantics_verified|writer_pause_verified|artifact_inventory_verified)=' \
   backups/persistent-state/<bundle>/manifest.txt
 ```
 
@@ -192,7 +192,7 @@ ls -lh /srv/trinity-backups/persistent-state/*/manifest.txt
 **Not in `trinity.db`:**
 - Agent source code (in git)
 - Agent runtime work in `/home/developer` (in each `agent-*-workspace` volume)
-- Runtime secrets held by Redis (ephemeral — regenerate on restart)
+- Redis AOF and runtime coordination state (archived under `platform-volumes/` even when individual keys are short-lived)
 - Container logs (in Vector's log files under the `trinity-logs` volume)
 - Platform images (rebuild from source)
 

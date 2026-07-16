@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import sysconfig
 
 import pytest
 
@@ -8,6 +10,9 @@ from agent_server.services.sealed_artifact_tree import (
     DEFAULT_EXTERNAL_PATHS,
     DEFAULT_ROOTS,
     build_manifest,
+    operation_executable_paths,
+    python_runtime_roots,
+    runtime_external_paths,
 )
 
 
@@ -28,6 +33,8 @@ def test_default_manifest_covers_server_instructions_hooks_and_packaged_metadata
     )
     assert {
         Path("/etc/claude-code/managed-settings.json"),
+        Path("/etc/trinity/codex-operation.rules"),
+        Path("/etc/trinity/validate-codex-auth.py"),
         Path("/opt/flashcrafter/AGENTS.md"),
         Path("/opt/flashcrafter/agent.json"),
         Path("/opt/flashcrafter/base.json"),
@@ -35,6 +42,44 @@ def test_default_manifest_covers_server_instructions_hooks_and_packaged_metadata
         Path("/opt/flashcrafter/runtime-exclusions.json"),
         Path("/opt/flashcrafter/skills.json"),
     }.issubset(DEFAULT_EXTERNAL_PATHS)
+
+
+def test_operation_contract_closes_every_declared_executable(tmp_path: Path):
+    contract = tmp_path / "operation-contract.json"
+    first = tmp_path / "bin" / "readonly"
+    second = tmp_path / "bin" / "boundary"
+    first.parent.mkdir()
+    first.write_text("readonly\n")
+    second.write_text("boundary\n")
+    contract.write_text(
+        json.dumps(
+            {
+                "operations": {
+                    "verify": {
+                        "commands": [
+                            {"executable": str(first)},
+                            {"executable": str(second)},
+                        ]
+                    }
+                }
+            }
+        )
+    )
+
+    assert operation_executable_paths(contract) == tuple(sorted((first, second), key=str))
+    external = runtime_external_paths(contract)
+    assert first in external
+    assert second in external
+
+
+def test_python_runtime_closure_includes_import_roots_not_the_install_prefix():
+    roots = python_runtime_roots()
+    configured = sysconfig.get_paths()
+    assert Path(configured["stdlib"]) in roots
+    assert Path(configured["purelib"]) in roots
+    install_prefix = Path(configured["data"])
+    if install_prefix not in {Path(configured["stdlib"]), Path(configured["purelib"])}:
+        assert install_prefix not in roots
 
 
 def test_manifest_closes_runtime_trees_and_resolved_launcher_targets(tmp_path: Path):

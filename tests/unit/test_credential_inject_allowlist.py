@@ -47,6 +47,12 @@ class TestAllowedPaths:
         """#598: .mcp.json passes the path gate (content validated separately)."""
         assert validate_credential_paths({".mcp.json": "{}"}) == []
 
+    def test_exact_codex_subscription_auth_file(self):
+        assert validate_credential_paths({".codex-subscription/auth.json": "{}"}) == []
+        assert validate_credential_paths({".codex-subscription/config.toml": "x"}) == [
+            ".codex-subscription/config.toml"
+        ]
+
     def test_multiple_valid_files(self):
         files = {
             ".env": "KEY=val",

@@ -1035,6 +1035,7 @@ idempotency_keys = Table(
     metadata,
     Column("scope", Text, primary_key=True),
     Column("idempotency_key", Text, primary_key=True),
+    Column("request_digest", Text),
     Column("execution_id", Text),
     Column("status", Text),
     Column("response_snapshot", Text),

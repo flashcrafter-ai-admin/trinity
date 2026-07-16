@@ -2443,9 +2443,20 @@ class DatabaseManager:
     # Idempotency keys (RELIABILITY-006, #525 — delegated to db/idempotency.py)
     # =========================================================================
 
-    def idempotency_claim(self, scope: str, key: str, ttl_hours: int = 24) -> dict:
+    def idempotency_claim(
+        self,
+        scope: str,
+        key: str,
+        ttl_hours: int = 24,
+        request_digest: Optional[str] = None,
+    ) -> dict:
         """Atomically claim (scope, key). See IdempotencyOperations.claim."""
-        return self._idempotency_ops.claim(scope, key, ttl_hours=ttl_hours)
+        return self._idempotency_ops.claim(
+            scope,
+            key,
+            ttl_hours=ttl_hours,
+            request_digest=request_digest,
+        )
 
     def idempotency_attach_execution(self, scope: str, key: str, execution_id: str) -> None:
         """Record the execution_id for an in-flight idempotency claim."""

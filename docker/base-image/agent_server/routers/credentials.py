@@ -4,7 +4,9 @@ Credential management endpoints.
 import os
 import base64
 import binascii
+import json
 import logging
+import stat
 from pathlib import Path
 from typing import List
 
@@ -27,7 +29,7 @@ from ..utils.credential_sanitizer import refresh_credential_values
 from ..utils.credential_status import credential_file_status
 # Second-layer credential-path policy (Invariant #5) — byte-identical vendored
 # copy of src/backend/services/credential_paths.py (#11).
-from ..credential_paths import is_allowed_credential_path
+from ..credential_paths import CODEX_SUBSCRIPTION_AUTH_PATH, is_allowed_credential_path
 
 _HOME = Path("/home/developer")
 
@@ -39,11 +41,87 @@ def _safe_credential_target(rel_path: str) -> Path:
     if not is_allowed_credential_path(rel_path):
         logger.warning(f"Credential injection blocked: disallowed path '{rel_path}'")
         raise HTTPException(status_code=400, detail=f"Disallowed credential file path: '{rel_path}'")
-    target = (_HOME / rel_path).resolve()
-    if target != _HOME and _HOME not in target.parents:
+    home = _HOME.resolve()
+    target = _HOME / rel_path
+    parent = target.parent.resolve()
+    if parent != home and home not in parent.parents:
         logger.warning(f"Credential injection blocked: path escapes home '{rel_path}'")
         raise HTTPException(status_code=400, detail=f"Path escapes workspace: '{rel_path}'")
+    if target.is_symlink():
+        logger.warning(f"Credential injection blocked: symlink target '{rel_path}'")
+        raise HTTPException(status_code=400, detail=f"Unsafe credential file target: '{rel_path}'")
     return target
+
+
+def _validate_codex_subscription_auth(payload: bytes) -> None:
+    if not 1 <= len(payload) <= 262_144:
+        raise HTTPException(status_code=400, detail="Codex subscription auth size is invalid")
+
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError("duplicate JSON key")
+            value[key] = item
+        return value
+
+    try:
+        auth = json.loads(payload.decode("utf-8"), object_pairs_hook=unique_object)
+    except (UnicodeDecodeError, ValueError, TypeError) as exc:
+        raise HTTPException(status_code=400, detail="Codex subscription auth is invalid") from exc
+    if not isinstance(auth, dict) or set(auth) - {
+        "OPENAI_API_KEY", "auth_mode", "last_refresh", "tokens"
+    }:
+        raise HTTPException(status_code=400, detail="Codex subscription auth schema is invalid")
+    if auth.get("auth_mode") != "chatgpt" or auth.get("OPENAI_API_KEY") is not None:
+        raise HTTPException(status_code=400, detail="Codex subscription auth must use ChatGPT")
+    if auth.get("last_refresh") is not None and not isinstance(auth["last_refresh"], str):
+        raise HTTPException(status_code=400, detail="Codex subscription refresh metadata is invalid")
+    tokens = auth.get("tokens")
+    allowed_token_keys = {"access_token", "account_id", "id_token", "refresh_token"}
+    if not isinstance(tokens, dict) or set(tokens) - allowed_token_keys:
+        raise HTTPException(status_code=400, detail="Codex subscription token schema is invalid")
+    for required in ("access_token", "refresh_token"):
+        if not isinstance(tokens.get(required), str) or not tokens[required].strip():
+            raise HTTPException(status_code=400, detail="Codex subscription tokens are incomplete")
+    for optional in ("account_id", "id_token"):
+        if tokens.get(optional) is not None and (
+            not isinstance(tokens[optional], str) or not tokens[optional].strip()
+        ):
+            raise HTTPException(status_code=400, detail="Codex subscription token is invalid")
+
+
+def _open_credential_parent(rel_path: str) -> tuple[int, str]:
+    parts = Path(rel_path).parts
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        raise HTTPException(status_code=400, detail=f"Unsafe credential path: '{rel_path}'")
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    directory_flags |= getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        current_fd = os.open(_HOME, directory_flags)
+        for part in parts[:-1]:
+            try:
+                os.mkdir(part, 0o700, dir_fd=current_fd)
+            except FileExistsError:
+                pass
+            next_fd = os.open(part, directory_flags, dir_fd=current_fd)
+            os.close(current_fd)
+            current_fd = next_fd
+            metadata = os.fstat(current_fd)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_gid != os.getegid()
+                or stat.S_IMODE(metadata.st_mode) & 0o022
+            ):
+                raise OSError("credential parent boundary is unsafe")
+        if rel_path == CODEX_SUBSCRIPTION_AUTH_PATH:
+            os.fchmod(current_fd, 0o700)
+        return current_fd, parts[-1]
+    except OSError as exc:
+        if "current_fd" in locals():
+            os.close(current_fd)
+        raise HTTPException(status_code=400, detail=f"Unsafe credential parent: '{rel_path}'") from exc
 
 
 def _write_credential_file(rel_path: str, *, text: str = None, b64: str = None) -> str:
@@ -54,16 +132,41 @@ def _write_credential_file(rel_path: str, *, text: str = None, b64: str = None) 
     # that guard (#590 RCE-by-config).
     if b64 is not None and rel_path.rsplit("/", 1)[-1] == ".mcp.json":
         raise HTTPException(status_code=400, detail=".mcp.json may not be injected as binary")
-    target = _safe_credential_target(rel_path)
-    target.parent.mkdir(parents=True, exist_ok=True)
     if b64 is not None:
         try:
-            target.write_bytes(base64.b64decode(b64, validate=True))
+            payload = base64.b64decode(b64, validate=True)
         except (binascii.Error, ValueError):
             raise HTTPException(status_code=400, detail=f"Invalid base64 for '{rel_path}'")
     else:
-        target.write_text(text or "")
-    target.chmod(0o600)
+        payload = (text or "").encode()
+    if rel_path == CODEX_SUBSCRIPTION_AUTH_PATH:
+        _validate_codex_subscription_auth(payload)
+    _safe_credential_target(rel_path)
+    parent_fd, filename = _open_credential_parent(rel_path)
+    flags = os.O_WRONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        try:
+            fd = os.open(filename, flags | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=parent_fd)
+        except FileExistsError:
+            fd = os.open(filename, flags, dir_fd=parent_fd)
+        with os.fdopen(fd, "wb", closefd=True) as output:
+            metadata = os.fstat(output.fileno())
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_uid != os.geteuid()
+                or metadata.st_gid != os.getegid()
+                or metadata.st_nlink != 1
+            ):
+                raise OSError("credential file boundary is unsafe")
+            os.fchmod(output.fileno(), 0o600)
+            os.ftruncate(output.fileno(), 0)
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+    except OSError as exc:
+        raise HTTPException(status_code=400, detail=f"Unsafe credential file target: '{rel_path}'") from exc
+    finally:
+        os.close(parent_fd)
     logger.info(f"Wrote credential file: {rel_path}")
     return rel_path
 
@@ -84,7 +187,7 @@ async def update_credentials(request: CredentialUpdateRequest):
     2. If mcp_config provided, write to /home/developer/.mcp.json
     3. If .mcp.json.template exists, generate .mcp.json from it using envsubst
     """
-    home_dir = Path("/home/developer")
+    home_dir = _HOME
     env_file = home_dir / ".env"
     mcp_file = home_dir / ".mcp.json"
     mcp_template = home_dir / ".mcp.json.template"
@@ -225,7 +328,7 @@ async def get_credentials_status():
     """
     Get current credential status - which files exist and when they were last modified.
     """
-    home_dir = Path("/home/developer")
+    home_dir = _HOME
     files_status = {}
 
     credential_files = [
@@ -233,12 +336,17 @@ async def get_credentials_status():
         ".mcp.json",
         ".mcp.json.template",
         ".credentials.enc",  # Encrypted credentials file
+        CODEX_SUBSCRIPTION_AUTH_PATH,
     ]
 
     for filename in credential_files:
         filepath = home_dir / filename
         if filepath.exists():
-            files_status[filename] = credential_file_status(filepath)
+            status = credential_file_status(
+                filepath,
+                include_parent=filename == CODEX_SUBSCRIPTION_AUTH_PATH,
+            )
+            files_status[filename] = status
         else:
             files_status[filename] = {"exists": False}
 

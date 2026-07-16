@@ -24,7 +24,7 @@ def _grant() -> str:
 def _sealed_request(**overrides) -> ParallelTaskRequest:
     values = {
         "message": "run",
-        "model": "claude-sonnet-4-6",
+        "model": "gpt-5.6-sol",
         "allowed_tools": ["Bash"],
         "system_prompt": "platform boundary",
         "timeout_seconds": 900,
@@ -356,7 +356,11 @@ def test_native_runner_is_fixed_to_reviewed_runtimes_and_root_context_paths():
 
     assert '"/usr/local/bin/claude"' in source
     assert '"/usr/local/bin/codex"' in source
-    assert '"/home/developer/.codex-attestation"' in source
+    assert 'CODEX_SOURCE_HOME "/home/developer/.codex-subscription"' in source
+    assert 'CODEX_SOURCE_PARENT "/home/developer"' in source
+    assert 'CODEX_SOURCE_DIRECTORY ".codex-subscription"' in source
+    assert 'CODEX_TASK_ROOT "/run/trinity-codex"' in source
+    assert 'CODEX_RULES_SOURCE "/etc/trinity/codex-operation.rules"' in source
     assert 'CONTEXT_ROOT "/run/trinity-task-context"' in source
     assert "setsid()" in source
     assert '"session-start"' in source
@@ -368,7 +372,15 @@ def test_native_runner_is_fixed_to_reviewed_runtimes_and_root_context_paths():
     assert "setresuid(OPERATION_UID, OPERATION_UID, OPERATION_UID)" in source
     assert '#define OPERATION_UID 1001' in source
     assert 'set_optional_environment("CLAUDE_CODE_OAUTH_TOKEN"' in source
-    assert 'set_optional_environment("CODEX_HOME", codex_home)' in source
+    assert 'set_optional_environment("CODEX_HOME", is_codex ? codex_task_home : NULL)' in source
+    assert "open_codex_auth_source(&codex_auth_source_parent_fd" in source
+    assert "fstatat(parent_fd, CODEX_SOURCE_DIRECTORY" in source
+    assert "openat(directory_fd, \"auth.json\"" in source
+    assert "flock(fd, LOCK_EX)" in source
+    assert "getrandom(random_bytes" in source
+    assert "install_codex_task_home(codex_task_home, codex_auth_source_fd)" in source
+    assert "refresh_codex_auth(codex_task_home, codex_auth_source_parent_fd" in source
+    assert "remove_codex_task_home(codex_task_home)" in source
     assert 'copy_optional_environment("OPENAI_API_KEY")' not in source
     assert 'copy_optional_environment("CODEX_API_KEY")' not in source
     assert 'is_claude ? copy_optional_environment("HTTP_PROXY") : NULL' in source

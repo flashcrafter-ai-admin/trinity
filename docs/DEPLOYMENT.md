@@ -126,19 +126,23 @@ ADMIN_PASSWORD=your-secure-password
 
 | Data | Location | Backup Strategy |
 |------|----------|-----------------|
-| SQLite (users, agents) | `~/trinity-data/trinity.db` | Regular file backup |
-| Redis (credentials) | Docker volume | Redis RDB snapshots |
-| Agent workspaces | Docker volumes | Per-agent backup |
+| SQLite or PostgreSQL | Backend `DATABASE_URL` authority | Online SQLite backup or verified PostgreSQL restore/provider snapshot |
+| Backend `/data` and Compose volumes | Bind mounts and Docker volumes | Paused, byte-compared archives, including Redis AOF, agent config, and logs |
+| Agent workspaces | `agent-*-workspace` volumes | Paused, byte-compared per-agent archives |
+| Recovery credentials | Host `.env` | Mode-600 copy with required-key validation |
 
 ### Backup Script
 
 ```bash
-# Backup database
-./scripts/deploy/backup-database.sh ./backups/
-
-# Restore from backup
-./scripts/deploy/restore-database.sh ./backups/trinity_backup.db
+# Back up all recoverable state before an upgrade
+./scripts/deploy/backup-persistent-state.sh \
+  --project-name trinity \
+  --env-file /path/to/.env \
+  --output-dir /srv/trinity-backups/persistent-state
 ```
+
+Require `backup_complete=yes` plus database, writer-pause, Compose-volume,
+agent-workspace, and artifact-inventory verification in `manifest.txt`.
 
 ## Troubleshooting
 

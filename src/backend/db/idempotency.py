@@ -29,12 +29,19 @@ logger = logging.getLogger(__name__)
 STATE_NEW = "new"            # first-seen — caller proceeds to dispatch
 STATE_IN_FLIGHT = "in_flight"  # a prior claim is still running
 STATE_COMPLETED = "completed"  # a prior claim finished — replay its snapshot
+STATE_CONFLICT = "conflict"    # same caller key, different bound request bytes
 
 
 class IdempotencyOperations:
     """CRUD for the idempotency_keys table."""
 
-    def claim(self, scope: str, key: str, ttl_hours: int = 24) -> dict:
+    def claim(
+        self,
+        scope: str,
+        key: str,
+        ttl_hours: int = 24,
+        request_digest: Optional[str] = None,
+    ) -> dict:
         """Atomically claim (scope, key).
 
         Returns a dict: {state, execution_id, snapshot}.
@@ -69,6 +76,7 @@ class IdempotencyOperations:
                             insert(idempotency_keys).values(
                                 scope=scope,
                                 idempotency_key=key,
+                                request_digest=request_digest,
                                 execution_id=None,
                                 status=STATE_IN_FLIGHT,
                                 response_snapshot=None,
@@ -82,6 +90,7 @@ class IdempotencyOperations:
                     row = conn.execute(
                         select(
                             idempotency_keys.c.status,
+                            idempotency_keys.c.request_digest,
                             idempotency_keys.c.execution_id,
                             idempotency_keys.c.response_snapshot,
                         ).where(
@@ -100,6 +109,15 @@ class IdempotencyOperations:
                         raise RuntimeError(
                             "idempotency claim disappeared after conflicting insert"
                         )
+                    if (
+                        request_digest is not None
+                        and row["request_digest"] != request_digest
+                    ):
+                        return {
+                            "state": STATE_CONFLICT,
+                            "execution_id": row["execution_id"],
+                            "snapshot": None,
+                        }
                     snapshot = None
                     if row["response_snapshot"]:
                         try:

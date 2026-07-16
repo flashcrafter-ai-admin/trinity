@@ -1515,9 +1515,16 @@ async def execute_parallel_task(
     # leave the claim in place (a duplicate within the 24h TTL gets a 409 with
     # the original execution_id to poll); only upfront at-capacity rejections
     # release the claim so the caller can retry once capacity frees.
-    idem = idempotency_service.begin(
-        idempotency_service.make_agent_scope(name), idempotency_key
-    )
+    if current_user.sealed_executor_agent:
+        idem = idempotency_service.begin(
+            idempotency_service.make_sealed_agent_scope(name),
+            idempotency_key,
+            request_digest=request.operation_request_digest,
+        )
+    else:
+        idem = idempotency_service.begin(
+            idempotency_service.make_agent_scope(name), idempotency_key
+        )
     if current_user.sealed_executor_agent and not idem.enabled:
         raise HTTPException(
             status_code=503,
@@ -1545,6 +1552,14 @@ async def execute_parallel_task(
                 "in_flight": idem.in_flight,
             },
         )
+        if idem.conflict:
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "error": "idempotency_key_conflict",
+                    "message": "This Idempotency-Key is bound to a different sealed request.",
+                },
+            )
         if idem.in_flight:
             raise HTTPException(
                 status_code=409,

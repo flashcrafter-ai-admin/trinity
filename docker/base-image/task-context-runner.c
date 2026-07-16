@@ -2,11 +2,14 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <ftw.h>
 #include <grp.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
+#include <sys/random.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -18,9 +21,19 @@
 #define CONTEXT_VERIFIER "/opt/flashcrafter/bin/fc-operation-broker"
 #define CLAUDE_RUNTIME "/usr/local/bin/claude"
 #define CODEX_RUNTIME "/usr/local/bin/codex"
-#define CODEX_OPERATION_HOME "/home/developer/.codex-attestation"
+#define CODEX_SOURCE_PARENT "/home/developer"
+#define CODEX_SOURCE_DIRECTORY ".codex-subscription"
+#define CODEX_SOURCE_HOME "/home/developer/.codex-subscription"
+#define CODEX_TASK_ROOT "/run/trinity-codex"
+#define CODEX_RULES_SOURCE "/etc/trinity/codex-operation.rules"
+#define CODEX_AUTH_VALIDATOR "/etc/trinity/validate-codex-auth.py"
+#define PYTHON_RUNTIME "/usr/bin/python3"
+#define MAX_CODEX_AUTH_BYTES 262144
+#define CODEX_TASK_PATH_BYTES 192
 #define OPERATION_UID 1001
 #define OPERATION_GID 1001
+#define DEVELOPER_UID 1000
+#define DEVELOPER_GID 1000
 #define OPERATION_HOME "/var/empty"
 
 static volatile sig_atomic_t child_pid = -1;
@@ -47,8 +60,28 @@ static void require_root_owned_regular(int fd, mode_t mode) {
 static void require_root_owned_directory(const char *path, mode_t mode) {
   struct stat value;
   if (lstat(path, &value) != 0 || !S_ISDIR(value.st_mode) || S_ISLNK(value.st_mode) ||
-      value.st_uid != 0 || value.st_gid != 0 || (value.st_mode & 0777) != mode) {
+      value.st_uid != 0 || value.st_gid != 0 || (value.st_mode & 07777) != mode) {
     fputs("invalid task context directory boundary\n", stderr);
+    _exit(126);
+  }
+}
+
+static void require_owned_regular(int fd, uid_t uid, gid_t gid, mode_t mode) {
+  struct stat value;
+  if (fstat(fd, &value) != 0) fail("fstat protected file");
+  if (!S_ISREG(value.st_mode) || value.st_uid != uid || value.st_gid != gid ||
+      (value.st_mode & 0777) != mode || value.st_nlink != 1) {
+    fputs("invalid protected file boundary\n", stderr);
+    _exit(126);
+  }
+}
+
+static void require_owned_directory_fd(int fd, uid_t uid, gid_t gid, mode_t mode) {
+  struct stat value;
+  if (fstat(fd, &value) != 0) fail("fstat protected directory");
+  if (!S_ISDIR(value.st_mode) || value.st_uid != uid || value.st_gid != gid ||
+      (value.st_mode & 07777) != mode) {
+    fputs("invalid protected directory boundary\n", stderr);
     _exit(126);
   }
 }
@@ -89,6 +122,273 @@ static void write_all(int fd, const char *buffer, size_t length) {
     if (count <= 0) fail("write");
     offset += (size_t)count;
   }
+}
+
+static void validate_codex_auth(const char *buffer, size_t length) {
+  int input[2];
+  if (pipe2(input, O_CLOEXEC) != 0) fail("pipe Codex auth validator");
+  pid_t validator = fork();
+  if (validator < 0) fail("fork Codex auth validator");
+  if (validator == 0) {
+    close(input[1]);
+    if (dup2(input[0], STDIN_FILENO) < 0) fail("Codex auth validator stdin");
+    close(input[0]);
+    if (clearenv() != 0 || setenv("PATH", "/usr/bin:/bin", 1) != 0 ||
+        setenv("HOME", "/var/empty", 1) != 0 || setenv("LANG", "C.UTF-8", 1) != 0)
+      fail("Codex auth validator environment");
+    execl(PYTHON_RUNTIME, "python3", "-I", "-S", "-B", CODEX_AUTH_VALIDATOR,
+          (char *)NULL);
+    fail("exec Codex auth validator");
+  }
+  close(input[0]);
+  write_all(input[1], buffer, length);
+  if (close(input[1]) != 0) fail("close Codex auth validator input");
+  int status = 0;
+  while (waitpid(validator, &status, 0) < 0) {
+    if (errno != EINTR) fail("wait Codex auth validator");
+  }
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    fputs("Codex subscription auth failed the sealed runtime policy\n", stderr);
+    _exit(126);
+  }
+}
+
+static char *read_protected_file(int fd, uid_t uid, gid_t gid, mode_t mode,
+                                 size_t maximum, size_t *length_out) {
+  struct stat before;
+  if (fstat(fd, &before) != 0) fail("fstat protected input");
+  require_owned_regular(fd, uid, gid, mode);
+  if (before.st_size <= 0 || (unsigned long long)before.st_size > maximum) {
+    fputs("protected input size is invalid\n", stderr);
+    _exit(126);
+  }
+  size_t length = (size_t)before.st_size;
+  char *buffer = malloc(length);
+  if (buffer == NULL) fail("malloc protected input");
+  if (lseek(fd, 0, SEEK_SET) < 0) fail("seek protected input");
+  size_t offset = 0;
+  while (offset < length) {
+    ssize_t count = read(fd, buffer + offset, length - offset);
+    if (count < 0 && errno == EINTR) continue;
+    if (count <= 0) fail("read protected input");
+    offset += (size_t)count;
+  }
+  struct stat after;
+  if (fstat(fd, &after) != 0 || before.st_dev != after.st_dev ||
+      before.st_ino != after.st_ino || before.st_size != after.st_size ||
+      before.st_mtim.tv_sec != after.st_mtim.tv_sec ||
+      before.st_mtim.tv_nsec != after.st_mtim.tv_nsec ||
+      before.st_ctim.tv_sec != after.st_ctim.tv_sec ||
+      before.st_ctim.tv_nsec != after.st_ctim.tv_nsec) {
+    memset(buffer, 0, length);
+    free(buffer);
+    fputs("protected input changed while its descriptor was read\n", stderr);
+    _exit(126);
+  }
+  *length_out = length;
+  return buffer;
+}
+
+static int same_file_identity(const struct stat *expected, const struct stat *actual) {
+  return expected->st_dev == actual->st_dev && expected->st_ino == actual->st_ino &&
+         expected->st_uid == actual->st_uid && expected->st_gid == actual->st_gid &&
+         expected->st_mode == actual->st_mode && expected->st_nlink == actual->st_nlink &&
+         expected->st_size == actual->st_size &&
+         expected->st_mtim.tv_sec == actual->st_mtim.tv_sec &&
+         expected->st_mtim.tv_nsec == actual->st_mtim.tv_nsec &&
+         expected->st_ctim.tv_sec == actual->st_ctim.tv_sec &&
+         expected->st_ctim.tv_nsec == actual->st_ctim.tv_nsec;
+}
+
+static int open_codex_auth_source(int *parent_fd_out, int *directory_fd_out,
+                                  struct stat *directory_identity_out,
+                                  struct stat *auth_identity_out) {
+  int parent_fd =
+      open(CODEX_SOURCE_PARENT, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (parent_fd < 0) fail("open Codex subscription parent");
+  int directory_fd = openat(parent_fd, CODEX_SOURCE_DIRECTORY,
+                            O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (directory_fd < 0) fail("open Codex subscription directory");
+  require_owned_directory_fd(directory_fd, DEVELOPER_UID, DEVELOPER_GID, 0700);
+  if (fstat(directory_fd, directory_identity_out) != 0)
+    fail("identify Codex subscription directory");
+  int fd = openat(directory_fd, "auth.json", O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+  if (fd < 0) fail("open Codex subscription auth");
+  require_owned_regular(fd, DEVELOPER_UID, DEVELOPER_GID, 0600);
+  if (flock(fd, LOCK_EX) != 0) fail("lock Codex subscription auth");
+  if (fstat(fd, auth_identity_out) != 0) fail("identify Codex subscription auth");
+  struct stat named_directory;
+  struct stat named_auth;
+  if (fstatat(parent_fd, CODEX_SOURCE_DIRECTORY, &named_directory,
+              AT_SYMLINK_NOFOLLOW) != 0 ||
+      fstatat(directory_fd, "auth.json", &named_auth, AT_SYMLINK_NOFOLLOW) != 0 ||
+      !same_file_identity(directory_identity_out, &named_directory) ||
+      !same_file_identity(auth_identity_out, &named_auth)) {
+    fputs("Codex subscription projection changed while it was opened\n", stderr);
+    _exit(126);
+  }
+  *parent_fd_out = parent_fd;
+  *directory_fd_out = directory_fd;
+  return fd;
+}
+
+static void codex_task_home_path(char *path, size_t size) {
+  unsigned char random_bytes[24];
+  size_t offset = 0;
+  while (offset < sizeof(random_bytes)) {
+    ssize_t count = getrandom(random_bytes + offset, sizeof(random_bytes) - offset, 0);
+    if (count < 0 && errno == EINTR) continue;
+    if (count <= 0) fail("generate Codex task home identity");
+    offset += (size_t)count;
+  }
+  char token[sizeof(random_bytes) * 2 + 1];
+  for (size_t index = 0; index < sizeof(random_bytes); index++)
+    snprintf(token + index * 2, 3, "%02x", random_bytes[index]);
+  memset(random_bytes, 0, sizeof(random_bytes));
+  if (snprintf(path, size, CODEX_TASK_ROOT "/%s", token) >= (int)size)
+    fail("Codex task home path");
+  memset(token, 0, sizeof(token));
+}
+
+static void copy_protected_file(int source_fd, uid_t source_uid, gid_t source_gid,
+                                mode_t source_mode, int destination_fd,
+                                uid_t destination_uid, gid_t destination_gid,
+                                mode_t destination_mode, size_t maximum,
+                                int validate_auth) {
+  size_t length = 0;
+  char *buffer = read_protected_file(
+      source_fd, source_uid, source_gid, source_mode, maximum, &length);
+  if (validate_auth) validate_codex_auth(buffer, length);
+  if (fchown(destination_fd, destination_uid, destination_gid) != 0 ||
+      fchmod(destination_fd, destination_mode) != 0)
+    fail("protect copied file");
+  write_all(destination_fd, buffer, length);
+  memset(buffer, 0, length);
+  free(buffer);
+  if (fsync(destination_fd) != 0) fail("persist copied file");
+  require_owned_regular(
+      destination_fd, destination_uid, destination_gid, destination_mode);
+}
+
+static void install_codex_task_home(const char *path, int auth_source_fd) {
+  if (mkdir(CODEX_TASK_ROOT, 0711) != 0 && errno != EEXIST)
+    fail("mkdir Codex task root");
+  require_root_owned_directory(CODEX_TASK_ROOT, 0711);
+
+  if (mkdir(path, 01777) != 0) fail("mkdir Codex task home");
+  if (chown(path, 0, 0) != 0 || chmod(path, 01777) != 0)
+    fail("protect Codex task home");
+  require_root_owned_directory(path, 01777);
+  int directory_fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (directory_fd < 0) fail("open Codex task home");
+
+  int auth_fd = openat(directory_fd, "auth.json",
+                       O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+  if (auth_fd < 0) fail("create Codex task auth");
+  copy_protected_file(auth_source_fd, DEVELOPER_UID, DEVELOPER_GID, 0600,
+                      auth_fd, OPERATION_UID, OPERATION_GID, 0600,
+                      MAX_CODEX_AUTH_BYTES, 1);
+  if (close(auth_fd) != 0) fail("close Codex task auth");
+
+  if (mkdirat(directory_fd, "rules", 0555) != 0) fail("mkdir Codex task rules");
+  int rules_directory_fd =
+      openat(directory_fd, "rules", O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (rules_directory_fd < 0) fail("open Codex task rules");
+  int rules_source_fd = open(CODEX_RULES_SOURCE, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (rules_source_fd < 0) fail("open Codex operation rules");
+  int rules_fd = openat(rules_directory_fd, "default.rules",
+                        O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0444);
+  if (rules_fd < 0) fail("create Codex task rules");
+  copy_protected_file(rules_source_fd, 0, 0, 0444, rules_fd, 0, 0, 0444, 65536, 0);
+  if (close(rules_fd) != 0 || close(rules_source_fd) != 0)
+    fail("close Codex task rules");
+  if (fsync(rules_directory_fd) != 0 || close(rules_directory_fd) != 0)
+    fail("persist Codex task rules");
+  if (fsync(directory_fd) != 0 || close(directory_fd) != 0)
+    fail("persist Codex task home");
+}
+
+static int source_projection_unchanged(int parent_fd, int directory_fd, int auth_fd,
+                                       const struct stat *directory_identity,
+                                       const struct stat *auth_identity) {
+  struct stat current_directory;
+  struct stat current_auth;
+  struct stat named_directory;
+  struct stat named_auth;
+  return fstat(directory_fd, &current_directory) == 0 &&
+         fstat(auth_fd, &current_auth) == 0 &&
+         fstatat(parent_fd, CODEX_SOURCE_DIRECTORY, &named_directory,
+                 AT_SYMLINK_NOFOLLOW) == 0 &&
+         fstatat(directory_fd, "auth.json", &named_auth, AT_SYMLINK_NOFOLLOW) == 0 &&
+         same_file_identity(directory_identity, &current_directory) &&
+         same_file_identity(auth_identity, &current_auth) &&
+         current_directory.st_dev == named_directory.st_dev &&
+         current_directory.st_ino == named_directory.st_ino &&
+         S_ISDIR(named_directory.st_mode) &&
+         current_auth.st_dev == named_auth.st_dev && current_auth.st_ino == named_auth.st_ino &&
+         S_ISREG(named_auth.st_mode);
+}
+
+static int refresh_codex_auth(const char *path, int auth_source_parent_fd,
+                              int auth_source_directory_fd, int auth_source_fd,
+                              const struct stat *directory_identity,
+                              const struct stat *auth_identity) {
+  int directory_fd = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+  if (directory_fd < 0) return -1;
+  int auth_fd = openat(directory_fd, "auth.json", O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+  if (auth_fd < 0) {
+    close(directory_fd);
+    return -1;
+  }
+  if (!source_projection_unchanged(auth_source_parent_fd, auth_source_directory_fd,
+                                   auth_source_fd,
+                                   directory_identity, auth_identity)) {
+    close(auth_fd);
+    close(directory_fd);
+    return -1;
+  }
+  size_t length = 0;
+  char *buffer = read_protected_file(
+      auth_fd, OPERATION_UID, OPERATION_GID, 0600, MAX_CODEX_AUTH_BYTES, &length);
+  validate_codex_auth(buffer, length);
+  int result = 0;
+  if (!source_projection_unchanged(auth_source_parent_fd, auth_source_directory_fd,
+                                   auth_source_fd,
+                                   directory_identity, auth_identity) ||
+      lseek(auth_source_fd, 0, SEEK_SET) < 0 ||
+      ftruncate(auth_source_fd, 0) != 0) {
+    result = -1;
+  } else {
+    write_all(auth_source_fd, buffer, length);
+    if (fsync(auth_source_fd) != 0) result = -1;
+    struct stat named_auth;
+    struct stat current_auth;
+    if (fstat(auth_source_fd, &current_auth) != 0 ||
+        fstatat(auth_source_directory_fd, "auth.json", &named_auth, AT_SYMLINK_NOFOLLOW) != 0 ||
+        current_auth.st_dev != named_auth.st_dev || current_auth.st_ino != named_auth.st_ino ||
+        !S_ISREG(named_auth.st_mode) || named_auth.st_uid != DEVELOPER_UID ||
+        named_auth.st_gid != DEVELOPER_GID || (named_auth.st_mode & 0777) != 0600 ||
+        named_auth.st_nlink != 1)
+      result = -1;
+  }
+  memset(buffer, 0, length);
+  free(buffer);
+  if (close(auth_fd) != 0 || close(directory_fd) != 0) result = -1;
+  return result;
+}
+
+static int remove_tree_node(const char *path, const struct stat *value,
+                            int kind, struct FTW *context) {
+  (void)value;
+  (void)kind;
+  (void)context;
+  return remove(path);
+}
+
+static void remove_codex_task_home(const char *path) {
+  require_root_owned_directory(path, 01777);
+  if (nftw(path, remove_tree_node, 32, FTW_DEPTH | FTW_PHYS | FTW_MOUNT) != 0)
+    fail("remove Codex task home");
 }
 
 static char *copy_optional_environment(const char *name) {
@@ -268,10 +568,22 @@ int main(int argc, char **argv) {
           ? copy_optional_environment("ANTHROPIC_AUTH_TOKEN")
           : NULL;
   char *codex_home = is_codex ? copy_optional_environment("CODEX_HOME") : NULL;
-  if (is_codex && (codex_home == NULL || strcmp(codex_home, CODEX_OPERATION_HOME) != 0)) {
+  if (is_codex && (codex_home == NULL || strcmp(codex_home, CODEX_SOURCE_HOME) != 0)) {
     fputs("sealed Codex home is invalid\n", stderr);
     _exit(126);
   }
+  int codex_auth_source_directory_fd = -1;
+  int codex_auth_source_parent_fd = -1;
+  struct stat codex_auth_source_directory_identity = {0};
+  struct stat codex_auth_source_identity = {0};
+  int codex_auth_source_fd =
+      is_codex ? open_codex_auth_source(&codex_auth_source_parent_fd,
+                                        &codex_auth_source_directory_fd,
+                                        &codex_auth_source_directory_identity,
+                                        &codex_auth_source_identity)
+               : -1;
+  char codex_task_home[CODEX_TASK_PATH_BYTES] = {0};
+  if (is_codex) codex_task_home_path(codex_task_home, sizeof(codex_task_home));
   char *execution_tag = copy_optional_environment("TRINITY_EXECUTION_ID");
   char *http_proxy = is_claude ? copy_optional_environment("HTTP_PROXY") : NULL;
   char *https_proxy = is_claude ? copy_optional_environment("HTTPS_PROXY") : NULL;
@@ -290,6 +602,11 @@ int main(int argc, char **argv) {
     close(release[1]);
     if (prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 || getppid() == 1) fail("parent death signal");
     if (setsid() < 0) fail("setsid");
+    if (is_codex) {
+      close(codex_auth_source_fd);
+      close(codex_auth_source_directory_fd);
+      close(codex_auth_source_parent_fd);
+    }
     write_all(ready[1], "R", 1);
     close(ready[1]);
     char go = 0;
@@ -311,7 +628,7 @@ int main(int argc, char **argv) {
     set_optional_environment("CLAUDE_CODE_OAUTH_TOKEN", claude_oauth);
     set_optional_environment("ANTHROPIC_API_KEY", anthropic_api);
     set_optional_environment("ANTHROPIC_AUTH_TOKEN", anthropic_auth);
-    set_optional_environment("CODEX_HOME", codex_home);
+    set_optional_environment("CODEX_HOME", is_codex ? codex_task_home : NULL);
     set_optional_environment("TRINITY_EXECUTION_ID", execution_tag);
     set_optional_environment("HTTP_PROXY", http_proxy);
     set_optional_environment("HTTPS_PROXY", https_proxy);
@@ -319,6 +636,7 @@ int main(int argc, char **argv) {
     set_optional_environment("SSL_CERT_FILE", ssl_cert_file);
     set_optional_environment("SSL_CERT_DIR", ssl_cert_dir);
     set_optional_environment("NODE_EXTRA_CA_CERTS", node_ca);
+    wipe_free(codex_home);
     drop_to_operation_identity();
     execv(argv[1], &argv[1]);
     fail("execv");
@@ -347,6 +665,7 @@ int main(int argc, char **argv) {
     fputs("task session initialization failed\n", stderr);
     return 126;
   }
+  if (is_codex) install_codex_task_home(codex_task_home, codex_auth_source_fd);
   install_context(pid, grant, grant_length);
   memset(grant, 0, sizeof(grant));
   write_all(release[1], "G", 1);
@@ -364,7 +683,24 @@ int main(int argc, char **argv) {
     if (errno != EINTR) fail("waitpid");
   }
   child_pid = -1;
+  int codex_refresh_ok = 1;
+  if (is_codex) {
+    codex_refresh_ok =
+        refresh_codex_auth(codex_task_home, codex_auth_source_parent_fd,
+                           codex_auth_source_directory_fd, codex_auth_source_fd,
+                           &codex_auth_source_directory_identity,
+                           &codex_auth_source_identity) == 0;
+    remove_codex_task_home(codex_task_home);
+    if (close(codex_auth_source_fd) != 0) codex_refresh_ok = 0;
+    if (close(codex_auth_source_directory_fd) != 0) codex_refresh_ok = 0;
+    if (close(codex_auth_source_parent_fd) != 0) codex_refresh_ok = 0;
+  }
   remove_context(pid);
+
+  if (!codex_refresh_ok) {
+    fputs("Codex subscription auth refresh persistence failed\n", stderr);
+    return 126;
+  }
 
   if (WIFEXITED(status)) return WEXITSTATUS(status);
   if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);

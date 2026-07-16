@@ -4,7 +4,7 @@ Apply code changes safely to a running Trinity instance. The procedure below kee
 
 ## When to Run This
 
-Run this procedure before or after every `git pull` that includes changes to platform code (backend, frontend, MCP server, scheduler). Skip it for documentation-only changes.
+Run this procedure for every reviewed release that includes changes to platform code (backend, frontend, MCP server, scheduler). Skip it for documentation-only changes.
 
 ---
 
@@ -38,7 +38,7 @@ For production with an env file or host-specific override:
   -f /path/to/host-override.yml
 ```
 
-The wrapper runs `backup-persistent-state.sh`, rebuilds platform images, starts the platform services with the same compose project and `--no-build`, waits for backend health, and requires `/api/version` to match the deployed commit. The governed SSH deploy path rejects all source drift and builds from a write-protected archive of the exact Git object. Agent containers are not deleted; their `agent-*-workspace` volumes are verified and preserved first.
+The wrapper runs `backup-persistent-state.sh`, rebuilds platform images, starts the platform services with the same compose project and `--no-build`, waits for backend health, and authenticates inside the backend before requiring `/api/version` to match the exact deployed commit. The governed SSH deploy path rejects tracked, untracked, ignored, and index-hidden drift; byte-verifies the extracted Git tree; and rejects Compose build inputs outside that frozen source. Agent containers are not deleted. Every Compose named volume and `agent-*-workspace` volume is verified and preserved first.
 
 Use the manual procedure below only when you need to perform the same steps by hand.
 
@@ -48,7 +48,7 @@ Use the manual procedure below only when you need to perform the same steps by h
 
 ### Step 1: Back Up Persistent State
 
-The database is critical, but it is not the only state that matters. Back up the database, backend `/data`, `.env`, and agent workspace volumes before every upgrade:
+The database is critical, but it is not the only state that matters. Back up the database, backend `/data`, every Compose named volume, `.env`, and agent workspace volume before every upgrade:
 
 ```bash
 ./scripts/deploy/backup-persistent-state.sh --project-name trinity
@@ -64,34 +64,13 @@ Production example:
 
 The backup bundle is created under `backups/persistent-state/` by default. It is intentionally gitignored and chmod 700 because `env.backup` contains secrets when `.env` exists.
 
-If you need the legacy SQLite-only copy command, use it only after confirming the instance is not using PostgreSQL:
+Do not use `cp` or `tar` against a live SQLite file. The governed backup uses SQLite's online backup API, verifies integrity and schema/table counts against the paused source, and selects PostgreSQL authority from the running backend's exact `DATABASE_URL`.
+
+### Step 2: Check Out the Reviewed Release
 
 ```bash
-# Development (named volume)
-docker run --rm \
-  -v trinity_trinity-data:/data \
-  -v ~/backups:/backup \
-  alpine cp /data/trinity.db /backup/trinity-$(date +%Y%m%d-%H%M%S).db
-```
-
-> On a production server using `docker-compose.prod.yml`, the database lives in a bind-mount directory (e.g., `/srv/trinity-data/`), not in the named volume. Adjust accordingly:
-> ```bash
-> cp /srv/trinity-data/trinity.db ~/backups/trinity-$(date +%Y%m%d-%H%M%S).db
-> ```
-
-Verify the backup is readable:
-
-```bash
-sqlite3 ~/backups/trinity-<timestamp>.db ".tables"
-# Expected: a list of table names, no errors
-```
-
-> **PostgreSQL deployments** (instances running with `DATABASE_URL` set): back up with `pg_dump` instead of copying `trinity.db` — see [Backup and Restore](backup-and-restore.md). PostgreSQL schema migrations run automatically on backend boot, same as SQLite.
-
-### Step 2: Pull Latest Changes
-
-```bash
-git pull origin main
+git fetch origin <reviewed-commit-sha>
+git checkout --detach <reviewed-commit-sha>
 ```
 
 Review what changed:
@@ -167,12 +146,7 @@ All six probes must pass before you declare the upgrade complete.
 
 **Confirm the new version is live.** After the probes pass, check that the backend is actually running the build you just deployed:
 
-```bash
-curl -s http://localhost:8000/api/version
-# Expected: {"version":"0.6.0","git_commit_short":"<sha>","git_branch":"...","build_date":"..."}
-```
-
-The `git_commit_short`, `git_branch`, `git_commit_subject`, and `build_date` fields come from build-time provenance baked into the image. If they read `"unknown"`, the image was built without the deploy script's build args — rebuild with `scripts/deploy/start.sh` to populate them. The same metadata is visible in the UI via the version chip in the navigation bar (click it for the **Build Info** dialog) and in **Settings**.
+`safe-upgrade.sh` obtains an admin token from `/token` inside the backend container and then verifies the authenticated `/api/version` response. Both `git_commit` and `git_commit_short` must match the requested full SHA; `"unknown"`, an unauthenticated response, or a merely healthy backend fails the release.
 
 **Note:** JWT tokens are invalidated when the backend restarts. Users with active web UI sessions will need to log in again. MCP clients (Claude Code) will need to reconnect — run `/mcp` in your Claude Code session or restart the client.
 
