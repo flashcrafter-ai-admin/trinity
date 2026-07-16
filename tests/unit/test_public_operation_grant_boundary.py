@@ -27,7 +27,13 @@ async def test_async_sealed_grant_rejected_before_idempotency_or_persistence(mon
         async_mode=True,
         operation_grant=f"{'a' * 96}.{'b' * 96}",
     )
-    user = SimpleNamespace(id=1, email=None, username="operator", agent_name=None)
+    user = SimpleNamespace(
+        id=1,
+        email=None,
+        username="operator",
+        agent_name=None,
+        connector_agent=None,
+    )
 
     with pytest.raises(HTTPException, match="require synchronous tasks") as failure:
         await chat.execute_parallel_task(

@@ -36,6 +36,7 @@ def _user():
     u.email = "u@e.com"
     u.username = "u"
     u.agent_name = None
+    u.connector_agent = None
     return u
 
 

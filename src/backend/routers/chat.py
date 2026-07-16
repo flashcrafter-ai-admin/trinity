@@ -14,7 +14,12 @@ from datetime import datetime
 from typing import NamedTuple, NoReturn, Optional
 
 from models import User, ChatMessageRequest, ModelChangeRequest, ParallelTaskRequest, ActivityType, ActivityState, TaskExecutionStatus, ExecutionSource, activity_state_for_terminal
-from dependencies import get_current_user, get_authorized_agent, get_owned_agent
+from dependencies import (
+    _enforce_connector_task_request,
+    get_current_user,
+    get_authorized_agent,
+    get_owned_agent,
+)
 from services.agent_call_limiter import BackendAgentCallBudgetExhausted
 from services.agent_auth import agent_httpx_client
 from services.model_context import DEFAULT_CONTEXT_WINDOW
@@ -1378,6 +1383,16 @@ async def execute_parallel_task(
     Note: Does NOT update conversation history or session state.
     Executions are saved to the database for history tracking.
     """
+    _enforce_connector_task_request(
+        current_user,
+        request,
+        idempotency_key=idempotency_key,
+        x_source_agent=x_source_agent,
+        x_via_mcp=x_via_mcp,
+        x_mcp_key_id=x_mcp_key_id,
+        x_mcp_key_name=x_mcp_key_name,
+    )
+
     container = get_agent_container(name)
     if not container:
         raise HTTPException(status_code=404, detail="Agent not found")

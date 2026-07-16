@@ -109,10 +109,22 @@ class TestCentralGuard:
         u = self._call(patched, _fake_request("GET", "/api/agents/agent-1/connector/playbooks"))
         assert u.connector_agent == "agent-1"
 
+    def test_allows_bound_agent_sealed_task_route(self, patched):
+        """WHY: a connector may reach the bound task handler, which separately requires a grant."""
+        u = self._call(patched, _fake_request("POST", "/api/agents/agent-1/task"))
+        assert u.connector_agent == "agent-1"
+
     def test_blocks_other_agent_chat(self, patched):
         from fastapi import HTTPException
         with pytest.raises(HTTPException) as exc:
             self._call(patched, _fake_request("POST", "/api/agents/agent-2/chat"))
+        assert exc.value.status_code == 403
+
+    def test_blocks_other_agent_task(self, patched):
+        """WHY: widening the task path must not widen the connector's agent identity."""
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as exc:
+            self._call(patched, _fake_request("POST", "/api/agents/agent-2/task"))
         assert exc.value.status_code == 403
 
     def test_blocks_owner_endpoint_on_bound_agent(self, patched):
@@ -127,6 +139,167 @@ class TestCentralGuard:
         from fastapi import HTTPException
         with pytest.raises(HTTPException) as exc:
             self._call(patched, _fake_request("DELETE", "/api/agents/agent-1/chat"))
+        assert exc.value.status_code == 403
+
+
+class TestConnectorTaskContract:
+    """A connector bearer alone never authorizes stateless task execution.
+
+    The backend pins the transport shape; the root-owned agent runtime verifies
+    the grant signature and claims before exposing an operation command.
+    """
+
+    @staticmethod
+    def _grant():
+        return f"{'a' * 96}.{'b' * 96}"
+
+    @staticmethod
+    def _request(**overrides):
+        from models import ParallelTaskRequest
+        values = {
+            "message": "execute the signed operation",
+            "allowed_tools": ["Bash"],
+            "max_turns": 12,
+            "async_mode": False,
+            "operation_grant": TestConnectorTaskContract._grant(),
+        }
+        values.update(overrides)
+        return ParallelTaskRequest(**values)
+
+    @staticmethod
+    def _enforce(request, **overrides):
+        from dependencies import _enforce_connector_task_request
+        arguments = {
+            "idempotency_key": "dispatch:task:attempt:1",
+            "x_source_agent": None,
+            "x_via_mcp": None,
+            "x_mcp_key_id": None,
+            "x_mcp_key_name": None,
+        }
+        arguments.update(overrides)
+        _enforce_connector_task_request(
+            _user(connector_agent="agent-1"),
+            request,
+            **arguments,
+        )
+
+    def test_accepts_exact_sync_sealed_task(self):
+        """WHY: the production connector path needs one narrowly shaped signed task call."""
+        self._enforce(self._request())
+
+    def test_task_route_checks_connector_contract_before_container_lookup(self, monkeypatch):
+        """WHY: the body gate precedes runtime state, idempotency, and execution."""
+        from fastapi import HTTPException
+        from routers import chat
+
+        def unexpected_lookup(_name):
+            pytest.fail("connector contract did not fail before agent lookup")
+
+        monkeypatch.setattr(chat, "get_agent_container", unexpected_lookup)
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(chat.execute_parallel_task(
+                request=self._request(operation_grant=None),
+                name="agent-1",
+                current_user=_user(connector_agent="agent-1"),
+                x_source_agent=None,
+                x_via_mcp=None,
+                x_mcp_key_id=None,
+                x_mcp_key_name=None,
+                idempotency_key="dispatch:task:attempt:1",
+            ))
+        assert exc.value.status_code == 403
+
+    def test_task_route_accepts_contract_before_normal_agent_lookup(self, monkeypatch):
+        """WHY: a valid sealed connector request must enter the existing task path unchanged."""
+        from fastapi import HTTPException
+        from routers import chat
+
+        monkeypatch.setattr(chat, "get_agent_container", lambda _name: None)
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(chat.execute_parallel_task(
+                request=self._request(),
+                name="agent-1",
+                current_user=_user(connector_agent="agent-1"),
+                x_source_agent=None,
+                x_via_mcp=None,
+                x_mcp_key_id=None,
+                x_mcp_key_name=None,
+                idempotency_key="dispatch:task:attempt:1",
+            ))
+        assert exc.value.status_code == 404
+
+    def test_non_connector_preserves_existing_task_contract(self):
+        """WHY: the connector hardening must not change ordinary user or agent task calls."""
+        from dependencies import _enforce_connector_task_request
+        _enforce_connector_task_request(
+            _user(),
+            self._request(operation_grant=None, allowed_tools=None, max_turns=None),
+            idempotency_key=None,
+            x_source_agent="agent-1",
+            x_via_mcp="true",
+            x_mcp_key_id="key-1",
+            x_mcp_key_name="key",
+        )
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {"operation_grant": None},
+            {"operation_grant": "too-short"},
+            {"operation_grant": f" {'a' * 96}.{'b' * 96}"},
+            {"operation_grant": f"{'a' * 96}.{'b' * 96}\n"},
+            {"operation_grant": f"{'a' * 96}.{'b' * 96}.extra"},
+            {"operation_grant": f"{'a' * 96}.{'b' * 95}!"},
+            {"allowed_tools": None},
+            {"allowed_tools": ["Read"]},
+            {"allowed_tools": ["Bash", "Read"]},
+            {"async_mode": True},
+            {"async_mode": None},
+            {"max_turns": None},
+            {"max_turns": 0},
+            {"max_turns": 33},
+            {"model": "some-model"},
+            {"system_prompt": "override"},
+            {"timeout_seconds": 1},
+            {"files": []},
+            {"save_to_session": True},
+            {"save_to_session": None},
+            {"create_new_session": True},
+            {"create_new_session": None},
+            {"chat_session_id": "session-1"},
+            {"resume_session_id": "session-1"},
+            {"inject_result": True},
+            {"inject_result": None},
+            {"user_message": "shadow message"},
+        ],
+    )
+    def test_rejects_unsealed_or_broader_task_shapes(self, overrides):
+        """WHY: connector execution must remain stateless and sealed to one command boundary."""
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as exc:
+            self._enforce(self._request(**overrides))
+        assert exc.value.status_code == 403
+        assert self._grant() not in str(exc.value.detail)
+
+    @pytest.mark.parametrize(
+        "headers",
+        [
+            {"idempotency_key": None},
+            {"idempotency_key": " "},
+            {"idempotency_key": " dispatch:task:attempt:1"},
+            {"idempotency_key": "dispatch:task:attempt:1\n"},
+            {"idempotency_key": "x" * 513},
+            {"x_source_agent": "agent-1"},
+            {"x_via_mcp": "true"},
+            {"x_mcp_key_id": "spoofed"},
+            {"x_mcp_key_name": "spoofed"},
+        ],
+    )
+    def test_rejects_missing_idempotency_or_spoofable_source_headers(self, headers):
+        """WHY: connector retries and audit attribution must be deterministic and non-spoofable."""
+        from fastapi import HTTPException
+        with pytest.raises(HTTPException) as exc:
+            self._enforce(self._request(), **headers)
         assert exc.value.status_code == 403
 
 

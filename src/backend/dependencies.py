@@ -10,7 +10,7 @@ from fastapi import Depends, HTTPException, status, Request, Path
 from fastapi.security import OAuth2PasswordBearer
 from jose import JWTError, jwt
 from passlib.context import CryptContext
-from models import User
+from models import ParallelTaskRequest, User
 from config import SECRET_KEY, ALGORITHM
 from database import db
 from redis_breaker_util import get_breaker_redis
@@ -332,20 +332,25 @@ async def get_current_user(request: Request, token: str = Depends(oauth2_scheme)
             connector_agent = mcp_key_info.get("agent_name") if scope == "connector" else None
             if connector_agent:
                 # Central containment (ent#46): a connector key may reach ONLY
-                # its bound agent's chat + connector playbook list. Enforced here
+                # its bound agent's chat, sealed task execution, and connector
+                # playbook list. Enforced here
                 # at the single auth entry point — NOT only in the agent path-
                 # deps — so the many endpoints that do inline access checks (and
                 # resolve this principal to the owner) can't be reached by a
-                # leaked connector snippet. The allowlist is the exact set of
-                # backend routes the connector MCP tools call.
+                # leaked connector snippet. The task handler applies a second,
+                # body-aware gate before it touches the runtime container.
                 allowed = {
                     ("POST", f"/api/agents/{connector_agent}/chat"),
+                    ("POST", f"/api/agents/{connector_agent}/task"),
                     ("GET", f"/api/agents/{connector_agent}/connector/playbooks"),
                 }
                 if (request.method.upper(), request.url.path) not in allowed:
                     raise HTTPException(
                         status_code=status.HTTP_403_FORBIDDEN,
-                        detail="Connector keys may only chat their bound agent and list its playbooks",
+                        detail=(
+                            "Connector keys may only consume their bound agent through "
+                            "the approved chat, sealed-task, and playbook routes"
+                        ),
                     )
             # trinity-enterprise#69: ephemeral ("ghost") agent containment.
             # An agent-scoped key resolves to the OWNER user on REST — for a
@@ -600,6 +605,66 @@ def _enforce_connector_scope(current_user: User, agent_name: str, *, owner_op: b
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Connector key is scoped to a different agent",
+        )
+
+
+def _enforce_connector_task_request(
+    current_user: User,
+    request: ParallelTaskRequest,
+    *,
+    idempotency_key: Optional[str],
+    x_source_agent: Optional[str],
+    x_via_mcp: Optional[str],
+    x_mcp_key_id: Optional[str],
+    x_mcp_key_name: Optional[str],
+) -> None:
+    """Permit only the stateless, sealed task shape used by a lane connector."""
+    if not current_user.connector_agent:
+        return
+
+    sealed_grant = request.operation_grant
+    operation_grant = sealed_grant.get_secret_value() if sealed_grant else ""
+    grant_framing_valid = re.fullmatch(
+        r"[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", operation_grant
+    ) is not None
+    normalized_idempotency_key = idempotency_key or ""
+    forbidden_request_fields = (
+        request.model,
+        request.system_prompt,
+        request.timeout_seconds,
+        request.user_message,
+        request.chat_session_id,
+        request.resume_session_id,
+    )
+    if (
+        len(operation_grant) < 64
+        or len(operation_grant) > 32_768
+        or operation_grant != operation_grant.strip()
+        or "\r" in operation_grant
+        or "\n" in operation_grant
+        or not grant_framing_valid
+        or request.allowed_tools != ["Bash"]
+        or request.async_mode is not False
+        or not isinstance(request.max_turns, int)
+        or not 1 <= request.max_turns <= 32
+        or any(value is not None for value in forbidden_request_fields)
+        or request.files is not None
+        or request.save_to_session is not False
+        or request.create_new_session is not False
+        or request.inject_result is not False
+        or len(normalized_idempotency_key) > 512
+        or normalized_idempotency_key != normalized_idempotency_key.strip()
+        or "\r" in normalized_idempotency_key
+        or "\n" in normalized_idempotency_key
+        or not normalized_idempotency_key
+        or any(
+            value is not None
+            for value in (x_source_agent, x_via_mcp, x_mcp_key_id, x_mcp_key_name)
+        )
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Connector task execution requires one synchronous sealed operation contract",
         )
 
 
