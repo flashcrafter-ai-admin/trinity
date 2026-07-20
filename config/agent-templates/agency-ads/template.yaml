@@ -1,0 +1,40 @@
+name: agency-ads
+display_name: "Agency Ads"
+description: Owns Google Ads and LSA launch plus maintenance workflows.
+tagline: Paid media launch and maintenance
+version: "2.0.0"
+author: Trinity Platform
+
+resources:
+  cpu: "2"
+  memory: "4g"
+
+capabilities:
+  - google-ads-onboarding
+  - google-ads-maintenance
+  - lsa-onboarding
+  - tracking-readiness
+  - paid-media-qa
+
+shared_folders:
+  expose: true
+  consume: true
+
+commands:
+  - {name: ads-plan, description: Prepare Google Ads launch plan}
+  - {name: ads-scan, description: Run read-only paid media maintenance scan}
+  - {name: lsa-plan, description: Prepare LSA launch readiness}
+  - {name: optimization-plan, description: Draft approved-change candidates}
+  - {name: status, description: Report blockers, gates, and next actions}
+
+schedules:
+  - name: ads-maintenance-scan
+    cron: "0 15 * * 1-5"
+    message: "/ads-scan"
+    timezone: "America/Los_Angeles"
+    description: Read-only Google Ads and LSA maintenance scan
+
+metrics:
+  - {name: ads_blockers, type: gauge, label: "Ads Blockers"}
+  - {name: pending_paid_media_gates, type: gauge, label: "Paid Media Gates"}
+  - {name: tracked_accounts, type: gauge, label: "Tracked Accounts"}

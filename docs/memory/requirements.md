@@ -2888,40 +2888,29 @@ Standalone mobile-friendly admin page for managing agents on the go. Designed as
 
 ## 40. Trinity-Native Agency Client Onboarding System (AGENCY-001)
 
-### 40.1 End-to-End Client Onboarding Agent Fleet
+### 40.1 FlashCrafter Agency Operations Agent Fleet
 - **Status**: ✅ Implemented
 - **Requirement ID**: AGENCY-001
 - **Description**: Provide a bundled, Trinity-native multi-agent system for
-  onboarding a new agency client end to end. The system ports the portable
-  automation principles from fc-agency while staying inside Trinity's platform
-  boundary: Trinity owns deployment, schedules, permissions, credentials,
-  execution history, audit trail, shared folders, and operator queue;
-  agents own domain workflow state, client context, judgment, and runtime
-  pipeline files.
+  FlashCrafter agency operations. The system ports the portable automation
+  principles from fc-agency while staying inside Trinity's platform boundary:
+  Trinity owns deployment, schedules, permissions, credentials, execution
+  history, audit trail, shared folders, and operator queue; agents own domain
+  workflow state, client context, judgment, and runtime artifacts.
 - **Core agent roster**:
-  - `agency-orchestrator` — owns the onboarding pipeline definition, stage
-    transitions, drift detection, operator escalations, and final handoff.
-  - `agency-intake` — normalizes the client brief, service scope, evidence,
-    missing inputs, and initial onboarding record.
-  - `agency-comms` — drafts client-facing email/SMS updates, checks inbound
-    messages, and never sends externally without exact operator approval.
-  - `agency-access` — tracks required access grants for Google Ads, Google
-    Business Profile, Analytics/Search Console, site hosting, CRM, domains,
-    and billing/admin surfaces.
-  - `agency-ads-onboarding` — prepares Google Ads onboarding, tracking checks,
-    campaign readiness, dry-run plans, and launch gates.
-  - `agency-lsa-onboarding` — prepares LSA eligibility, verification, budget
-    readiness, and launch gates.
-  - `agency-website-seo-onboarding` — prepares website, landing page,
-    tracking, local SEO, GBP/reviews evidence, and launch readiness.
-  - `agency-ads-maintenance` — owns post-launch Google Ads and LSA monitoring,
-    read-only scans, and gated optimization plans.
-  - `agency-website-seo-maintenance` — owns post-launch website, local SEO,
-    GBP/reviews, content, and tracking maintenance.
-  - `agency-state-reconciliation` — detects drift between pipeline state,
-    shared projections, external evidence, and client-facing artifacts.
-  - `agency-reporting-qa` — audits evidence, compiles client-ready status,
-    verifies gates, and produces launch/readiness reports.
+  - `agency-orchestrator` — routes work, manages gates, reconciles drift, and
+    projects verified state.
+  - `client-onboarding-agent` — resolves paid-client identity, validates
+    intake/access, initializes durable client context, and prepares
+    service-track handoff.
+  - `agency-ads` — owns Google Ads and LSA onboarding plus maintenance
+    workflows.
+  - `agency-website-seo` — owns website, landing page, SEO, GBP/reviews, and
+    maintenance workflows.
+  - `agency-comms` — drafts client-facing messages, classifies replies, gates
+    outbound sends, and never sends externally without exact operator approval.
+  - `it-ai` — owns factory/runtime incident investigation, root-cause fixes,
+    and prevention.
 - **System manifest**: a deployable YAML recipe MUST instantiate the full
   fleet with explicit permissions, shared folder exposure/consumption,
   tags, system view metadata, and staggered schedules for coordination,

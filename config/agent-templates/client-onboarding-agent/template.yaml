@@ -1,0 +1,38 @@
+name: client-onboarding-agent
+display_name: "Client Onboarding"
+description: Resolves paid-client identity, validates intake, creates durable client context, and starts service-track work.
+tagline: Paid-client setup and service-track handoff
+version: "2.0.0"
+author: Trinity Platform
+
+resources:
+  cpu: "2"
+  memory: "4g"
+
+capabilities:
+  - client-intake
+  - business-identity
+  - business-repo-setup
+  - saas-sync
+  - access-readiness
+
+shared_folders:
+  expose: true
+  consume: true
+
+commands:
+  - {name: onboard-client, description: Start or continue paid-client onboarding}
+  - {name: validate-intake, description: Validate common setup and handoff readiness}
+  - {name: status, description: Report setup blockers and track readiness}
+
+schedules:
+  - name: onboarding-sweep
+    cron: "30 */3 * * *"
+    message: "/status"
+    timezone: "America/Los_Angeles"
+    description: Review active onboarding blockers and handoffs
+
+metrics:
+  - {name: active_onboardings, type: gauge, label: "Active Onboardings"}
+  - {name: missing_access_items, type: gauge, label: "Missing Access"}
+  - {name: ready_handoffs, type: gauge, label: "Ready Handoffs"}

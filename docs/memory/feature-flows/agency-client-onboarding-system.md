@@ -2,9 +2,11 @@
 
 ## Requirement
 
-AGENCY-001 defines a Trinity-native multi-agent system for end-to-end agency
-client onboarding. It ports fc-agency's portable operating principles without
-copying its bespoke runtime or domain-specific state surfaces.
+AGENCY-001 defines a Trinity-native agency operations system for end-to-end
+client setup, service-track execution, maintenance, communications, and
+incident response. It ports fc-agency's portable operating principles without
+copying its bespoke runtime or multiplying workflow phases into standing
+containers.
 
 ## Design Principles
 
@@ -27,52 +29,39 @@ copying its bespoke runtime or domain-specific state surfaces.
 
 | Agent | Responsibility | Primary Outputs |
 |---|---|---|
-| `agency-orchestrator` | Owns onboarding pipeline, assigns stages, reconciles drift, raises gates | `shared-out/pipeline/`, `shared-out/directives/`, `shared-out/status.json` |
-| `agency-intake` | Normalizes the client brief, service scope, contacts, missing inputs | `shared-out/client/client-brief.json`, `shared-out/evidence/` |
-| `agency-comms` | Drafts client updates and checks inbound communication context | `shared-out/drafts/`, `shared-out/comms/status.json` |
-| `agency-access` | Tracks access grants and admin-critical prerequisites | `shared-out/access/access-matrix.json` |
-| `agency-ads-onboarding` | Prepares Google Ads launch readiness, tracking, dry-run plans, and approval gates | `shared-out/ads/` |
-| `agency-lsa-onboarding` | Prepares Local Services Ads eligibility, verification, budget readiness, and approval gates | `shared-out/lsa/` |
-| `agency-website-seo-onboarding` | Prepares website, landing pages, tracking, local SEO, GBP/reviews evidence, QA, and deployment gates | `shared-out/website-seo/` |
-| `agency-ads-maintenance` | Runs post-launch read-only Google Ads and LSA monitoring and drafts gated optimizations | `shared-out/ads-maintenance/` |
-| `agency-website-seo-maintenance` | Runs post-launch website, local SEO, GBP/reviews, content, and tracking maintenance | `shared-out/website-seo-maintenance/` |
-| `agency-state-reconciliation` | Detects drift between pipeline state, shared projections, external evidence, and client artifacts | `shared-out/reconciliation/` |
-| `agency-reporting-qa` | Verifies evidence, compiles status/readiness reports, audits gates | `shared-out/reports/`, `shared-out/qa/` |
+| `agency-orchestrator` | Routes work, manages gates, reconciles drift, and projects verified state | `shared-out/status.json`, routing packets, gate packets |
+| `client-onboarding-agent` | Resolves paid-client identity, validates intake/access, prepares service-track handoff | client setup artifacts, handoff packets |
+| `agency-ads` | Owns Google Ads and LSA onboarding plus maintenance workflows | Ads/LSA plans, dry-run evidence, maintenance scans |
+| `agency-website-seo` | Owns website, landing page, SEO, GBP/reviews, and maintenance workflows | site/SEO plans, QA evidence, deploy readiness |
+| `agency-comms` | Owns drafts, reply classification, approval packets, and approved sends | comms summaries, drafts, send evidence |
+| `it-ai` | Owns factory runtime incidents and root-cause remediation | incident reports, fixes, validation evidence |
 
 ## Workflow
 
-1. **Intake** — normalize client identity, agreement/service scope, contacts,
-   locations, channels, and missing information.
-2. **Access Readiness** — determine required grants, record links/instructions,
-   and gate any admin-level access action.
-3. **Track Planning** — ads, local-presence, website/SEO agents produce
-   evidence-backed plans and blockers.
-4. **Implementation Readiness** — agents prepare draft actions and exact
-   operator approvals for any external send, launch, spend, or admin change.
-5. **QA and Launch Readiness** — reporting/QA verifies artifacts, identifies
-   drift, and compiles the launch/readiness report.
-6. **Client Handoff** — orchestrator summarizes state, open gates, evidence,
-   and next autonomous schedules.
+1. **Route** — orchestrator classifies the request and selects one owner.
+2. **Onboard** — client onboarding resolves identity, validates intake/access,
+   initializes durable client context, and creates track handoffs.
+3. **Execute Tracks** — Ads and website/SEO agents run their own launch or
+   maintenance workflows using OpenClaw skills and evidence gates.
+4. **Communicate** — comms agent drafts, gates, sends, and classifies client
+   communications when requested by any workflow.
+5. **Reconcile and QA** — owning agents run QA; orchestrator runs
+   reconciliation when surfaces disagree.
+6. **Incident Response** — `it-ai` handles factory/runtime failures separately
+   from client delivery.
 
 ## Shared File Contracts
 
 The system manifest enables shared folders for every agent. Each template
 documents its file ownership. Common contracts:
 
-- `client/client-brief.json` — owner: `agency-intake`; readers: all agents.
-- `pipeline/onboarding-state.json` — owner: `agency-orchestrator`; readers:
-  all agents.
-- `directives/current.json` — owner: `agency-orchestrator`; readers: all agents.
-- `access/access-matrix.json` — owner: `agency-access`; readers:
-  orchestrator, comms, reporting/QA, domain-track agents.
-- `drafts/*.json` — owner: `agency-comms`; readers: orchestrator,
-  reporting/QA.
-- `ads/*.json`, `lsa/*.json`, `website-seo/*.json` — owned by the
-  corresponding onboarding agent; readers: orchestrator and reporting/QA.
-- `ads-maintenance/*.json` and `website-seo-maintenance/*.json` — owned by
-  the corresponding maintenance agent; readers: orchestrator and reporting/QA.
-- `reports/*.md` and `qa/*.json` — owner: `agency-reporting-qa`; readers: all
-  agents.
+- Client setup artifacts are owned by `client-onboarding-agent`.
+- Routing, gate, and reconciliation packets are owned by `agency-orchestrator`.
+- Communication drafts and send evidence are owned by `agency-comms`.
+- Ads and LSA artifacts are owned by `agency-ads`.
+- Website, SEO, GBP/reviews, and deploy artifacts are owned by
+  `agency-website-seo`.
+- Incident reports and prevention artifacts are owned by `it-ai`.
 
 Files include `schema_version`, `client_slug`, `updated_at`, `writer`,
 `evidence[]`, `status`, and `next_action` where applicable.

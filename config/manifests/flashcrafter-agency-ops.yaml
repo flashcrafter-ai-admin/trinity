@@ -1,0 +1,140 @@
+# FlashCrafter Agency Ops System
+#
+# Deploy with:
+#   curl -sS -X POST http://localhost:8000/api/systems/deploy \
+#     -H "Authorization: Bearer <admin-token>" \
+#     -H "Content-Type: application/x-yaml" \
+#     --data-binary @config/manifests/flashcrafter-agency-ops.yaml
+
+name: flashcrafter-agency-ops
+description: Minimal FlashCrafter agency operations fleet
+
+prompt: |
+  You are part of the FlashCrafter Agency Ops system.
+
+  Division of labor:
+  - agency-orchestrator routes work, manages gates, reconciles drift, and projects verified state.
+  - client-onboarding-agent performs paid-client setup and service-track handoff.
+  - agency-ads owns Google Ads and LSA launch plus maintenance workflows.
+  - agency-website-seo owns website, landing page, SEO, GBP/reviews, and maintenance workflows.
+  - agency-comms owns all client-facing messages and approval gates.
+  - it-ai owns factory runtime incidents and root-cause remediation.
+
+  OpenClaw workflow state is canonical for workflow progress. Trello is a human-facing projection.
+  Business repos hold durable client memory. SAAS owns structured business identity. GHL owns raw
+  client communications. Do not create extra standing agents for workflow phases; use workflows and
+  skills until a separate credential boundary, trigger pattern, approval policy, or concurrency bottleneck
+  requires a split.
+
+default_tags:
+  - flashcrafter-agency
+  - client-ops
+  - gated-automation
+
+system_view:
+  name: "FlashCrafter Agency Ops"
+  icon: "briefcase"
+  color: "#2563eb"
+  shared: true
+
+agents:
+  orchestrator:
+    template: local:agency-orchestrator
+    resources: {cpu: "2", memory: "4g"}
+    folders: {expose: true, consume: true}
+    tags: [orchestrator, state, projection]
+    schedules:
+      - name: coordination-sweep
+        cron: "15 */2 * * *"
+        message: "/status"
+        timezone: America/Los_Angeles
+        description: Review active agency work and escalate blockers
+
+  client-onboarding:
+    template: local:client-onboarding-agent
+    resources: {cpu: "2", memory: "4g"}
+    folders: {expose: true, consume: true}
+    tags: [onboarding, intake, client-context]
+    schedules:
+      - name: onboarding-sweep
+        cron: "30 */3 * * *"
+        message: "/status"
+        timezone: America/Los_Angeles
+        description: Review active onboarding blockers and handoffs
+
+  ads:
+    template: local:agency-ads
+    resources: {cpu: "2", memory: "4g"}
+    folders: {expose: true, consume: true}
+    tags: [google-ads, lsa, paid-media]
+    schedules:
+      - name: ads-maintenance-scan
+        cron: "0 15 * * 1-5"
+        message: "/ads-scan"
+        timezone: America/Los_Angeles
+        description: Read-only Google Ads and LSA maintenance scan
+
+  website-seo:
+    template: local:agency-website-seo
+    resources: {cpu: "2", memory: "4g"}
+    folders: {expose: true, consume: true}
+    tags: [website, seo, local-seo]
+    schedules:
+      - name: website-seo-weekly-scan
+        cron: "30 15 * * 1"
+        message: "/web-seo-scan"
+        timezone: America/Los_Angeles
+        description: Weekly website, SEO, GBP, reviews, and tracking scan
+
+  comms:
+    template: local:agency-comms
+    resources: {cpu: "1", memory: "2g"}
+    folders: {expose: true, consume: true}
+    tags: [communications, approval-gate]
+    schedules:
+      - name: comms-check
+        cron: "20 */2 * * *"
+        message: "/status"
+        timezone: America/Los_Angeles
+        description: Check drafts, replies, and communication blockers
+
+  it-ai:
+    template: local:it-ai
+    resources: {cpu: "2", memory: "4g"}
+    folders: {expose: true, consume: true}
+    tags: [incident-response, factory-ops]
+    schedules:
+      - name: factory-health-check
+        cron: "*/30 * * * *"
+        message: "/health"
+        timezone: America/Los_Angeles
+        description: Check factory runtime health and escalate incidents
+
+permissions:
+  explicit:
+    orchestrator:
+      - client-onboarding
+      - ads
+      - website-seo
+      - comms
+      - it-ai
+    client-onboarding:
+      - orchestrator
+      - ads
+      - website-seo
+      - comms
+    ads:
+      - orchestrator
+      - website-seo
+      - comms
+    website-seo:
+      - orchestrator
+      - ads
+      - comms
+    comms:
+      - orchestrator
+      - client-onboarding
+      - ads
+      - website-seo
+    it-ai:
+      - orchestrator

@@ -1,0 +1,38 @@
+name: it-ai
+display_name: "IT AI"
+description: Owns factory runtime incident investigation, root-cause fixes, and prevention.
+tagline: Factory incident response and runtime health
+version: "1.0.0"
+author: Trinity Platform
+
+resources:
+  cpu: "2"
+  memory: "4g"
+
+capabilities:
+  - incident-response
+  - root-cause-analysis
+  - runtime-health
+  - deployment-verification
+  - prevention
+
+shared_folders:
+  expose: true
+  consume: true
+
+commands:
+  - {name: incident, description: Investigate a runtime incident}
+  - {name: health, description: Check factory runtime health}
+  - {name: resolve, description: Apply or propose a root-cause fix}
+
+schedules:
+  - name: factory-health-check
+    cron: "*/30 * * * *"
+    message: "/health"
+    timezone: "America/Los_Angeles"
+    description: Check factory runtime health and escalate incidents
+
+metrics:
+  - {name: open_incidents, type: gauge, label: "Open Incidents"}
+  - {name: failing_surfaces, type: gauge, label: "Failing Surfaces"}
+  - {name: resolved_incidents, type: counter, label: "Resolved Incidents"}

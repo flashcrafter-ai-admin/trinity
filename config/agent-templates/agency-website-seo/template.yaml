@@ -1,0 +1,40 @@
+name: agency-website-seo
+display_name: "Agency Website SEO"
+description: Owns website, landing page, local SEO, GBP/reviews, and maintenance workflows.
+tagline: Website and SEO launch plus maintenance
+version: "2.0.0"
+author: Trinity Platform
+
+resources:
+  cpu: "2"
+  memory: "4g"
+
+capabilities:
+  - website-onboarding
+  - website-maintenance
+  - local-seo
+  - pagespeed-qa
+  - deploy-readiness
+
+shared_folders:
+  expose: true
+  consume: true
+
+commands:
+  - {name: web-seo-plan, description: Prepare website or SEO plan}
+  - {name: web-seo-scan, description: Run read-only website/SEO maintenance scan}
+  - {name: content-plan, description: Draft content and SEO actions}
+  - {name: launch-readiness, description: Verify launch evidence and blockers}
+  - {name: status, description: Report blockers, gates, and next actions}
+
+schedules:
+  - name: website-seo-weekly-scan
+    cron: "30 15 * * 1"
+    message: "/web-seo-scan"
+    timezone: "America/Los_Angeles"
+    description: Weekly website, SEO, GBP, reviews, and tracking scan
+
+metrics:
+  - {name: website_blockers, type: gauge, label: "Website Blockers"}
+  - {name: pending_publish_gates, type: gauge, label: "Publish Gates"}
+  - {name: maintained_sites, type: gauge, label: "Maintained Sites"}
